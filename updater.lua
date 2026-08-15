@@ -1,4 +1,4 @@
--- Amazeballs CC updater: one-time tree setup, then pull selected files each run.
+-- Amazeballs CC updater: tree setup, then pull selected files each run.
 local REPO_BASE = "https://raw.githubusercontent.com/gleeglor/amazeballs-cc/main/"
 local CONFIG_PATH = "/cc_update.json"
 local CATALOG_URL = REPO_BASE .. "catalog.json"
@@ -159,25 +159,38 @@ local function isFileEntry(_, node)
     return true
 end
 
-local function selectionKey(src)
-    return src
+local function countSelected(selected)
+    local n = 0
+    for _ in pairs(selected) do
+        n = n + 1
+    end
+    return n
 end
 
-local function runSetup(catalog)
-    local tree = catalog.tree
-    local pathStack = {} -- list of names from root
-    local cursor = 1
-    local selected = {} -- src -> { src, dest, label }
+local function pathDisplay(pathStack)
+    if #pathStack == 0 then
+        return "/"
+    end
+    return "/" .. table.concat(pathStack, "/")
+end
 
-    local function currentNode()
-        local node = tree
-        for _, name in ipairs(pathStack) do
-            node = nodeChildren(node)[name] or node[name]
-            if not node then
-                return {}
+local function runSetup(catalog, existingCfg)
+    local tree = catalog.tree
+    local pathStack = {}
+    local cursor = 1
+    local selected = {}
+
+    -- Preload previous selections when reinstalling / reconfiguring
+    if type(existingCfg) == "table" and type(existingCfg.files) == "table" then
+        for _, entry in ipairs(existingCfg.files) do
+            if type(entry) == "table" and type(entry.src) == "string" then
+                selected[entry.src] = {
+                    src = entry.src,
+                    dest = entry.dest or basename(entry.src),
+                    label = entry.src,
+                }
             end
         end
-        return node
     end
 
     local function currentPath()
@@ -188,20 +201,12 @@ local function runSetup(catalog)
     end
 
     local function buildRows()
-        local node = currentNode()
-        local kids = nodeChildren(node)
-        -- If we're at a file-meta-only confusion, kids may be empty for empty dirs
-        if type(node) == "table" and next(kids) == nil and (node.dest or node.label) then
-            kids = {}
-        end
-        -- For root/dirs, catalog stores children directly on the node
+        local kids = {}
         if #pathStack == 0 then
-            kids = {}
             for k, v in pairs(tree) do
                 kids[k] = v
             end
         else
-            kids = {}
             local n = tree
             for _, name in ipairs(pathStack) do
                 n = n[name]
@@ -217,9 +222,8 @@ local function runSetup(catalog)
 
         local names = sortedKeys(kids)
         local rows = {}
-        rows[#rows + 1] = { kind = "done", label = "[Done — save selection]" }
         if #pathStack > 0 then
-            rows[#rows + 1] = { kind = "up", label = "[..]" }
+            rows[#rows + 1] = { kind = "up", label = ".." }
         end
         for _, name in ipairs(names) do
             local child = kids[name]
@@ -242,13 +246,11 @@ local function runSetup(catalog)
                 }
             end
         end
+        rows[#rows + 1] = { kind = "done", label = "[Done] save selection" }
         return rows
     end
 
-    term.setBackgroundColor(colors.black)
-    term.setTextColor(colors.white)
-
-    while true do
+    local function draw()
         local rows = buildRows()
         if cursor < 1 then
             cursor = 1
@@ -257,15 +259,19 @@ local function runSetup(catalog)
             cursor = #rows
         end
 
+        term.setBackgroundColor(colors.black)
+        term.setTextColor(colors.white)
         term.clear()
         term.setCursorPos(1, 1)
-        print("CC updater setup")
-        print("Path: /" .. currentPath())
-        print("Space=toggle  Enter=open/Done  Backspace=up")
-        print(string.rep("-", 40))
 
-        local w, h = term.getSize()
-        local maxShow = math.max(1, h - 6)
+        print("Script setup")
+        print(pathDisplay(pathStack) .. "  (" .. countSelected(selected) .. " selected)")
+        print("arrows move | space toggle | enter open/done")
+        print(string.rep("-", math.min(term.getSize())))
+
+        local _, h = term.getSize()
+        local headerLines = 4
+        local maxShow = math.max(1, h - headerLines)
         local start = math.max(1, cursor - maxShow + 1)
         local finish = math.min(#rows, start + maxShow - 1)
 
@@ -273,14 +279,40 @@ local function runSetup(catalog)
             local row = rows[i]
             local prefix = (i == cursor) and "> " or "  "
             if row.kind == "file" then
-                local mark = selected[selectionKey(row.src)] and "[x]" or "[ ]"
-                local destNote = row.dest ~= row.name and (" -> " .. row.dest) or ""
-                print(prefix .. mark .. " " .. row.label .. destNote)
+                local mark = selected[row.src] and "[x]" or "[ ]"
+                local destNote = ""
+                if row.dest ~= row.name then
+                    destNote = " -> " .. row.dest
+                end
+                local line = prefix .. mark .. " " .. row.label .. destNote
+                if i == cursor then
+                    term.setTextColor(colors.yellow)
+                else
+                    term.setTextColor(colors.white)
+                end
+                print(line)
+            elseif row.kind == "done" then
+                if i == cursor then
+                    term.setTextColor(colors.lime)
+                else
+                    term.setTextColor(colors.lightGray)
+                end
+                print(prefix .. row.label)
             else
+                if i == cursor then
+                    term.setTextColor(colors.yellow)
+                else
+                    term.setTextColor(colors.white)
+                end
                 print(prefix .. row.label)
             end
         end
+        term.setTextColor(colors.white)
+        return rows
+    end
 
+    while true do
+        local rows = draw()
         local _, key = os.pullEvent("key")
         if key == keys.up then
             cursor = math.max(1, cursor - 1)
@@ -295,19 +327,20 @@ local function runSetup(catalog)
             local row = rows[cursor]
             if row.kind == "file" then
                 if isProtectedDest(row.dest) then
-                    print("Protected dest: " .. row.dest)
-                    sleep(1.2)
+                    term.setCursorPos(1, term.getSize())
+                    term.clearLine()
+                    term.setTextColor(colors.red)
+                    write("Protected: " .. row.dest)
+                    term.setTextColor(colors.white)
+                    sleep(1)
+                elseif selected[row.src] then
+                    selected[row.src] = nil
                 else
-                    local k = selectionKey(row.src)
-                    if selected[k] then
-                        selected[k] = nil
-                    else
-                        selected[k] = {
-                            src = row.src,
-                            dest = row.dest,
-                            label = row.label,
-                        }
-                    end
+                    selected[row.src] = {
+                        src = row.src,
+                        dest = row.dest,
+                        label = row.label,
+                    }
                 end
             end
         elseif key == keys.enter then
@@ -321,13 +354,11 @@ local function runSetup(catalog)
                 pathStack[#pathStack + 1] = row.name
                 cursor = 1
             elseif row.kind == "file" then
-                -- Enter also toggles files for convenience
                 if not isProtectedDest(row.dest) then
-                    local k = selectionKey(row.src)
-                    if selected[k] then
-                        selected[k] = nil
+                    if selected[row.src] then
+                        selected[row.src] = nil
                     else
-                        selected[k] = {
+                        selected[row.src] = {
                             src = row.src,
                             dest = row.dest,
                             label = row.label,
@@ -346,14 +377,15 @@ local function runSetup(catalog)
         return a.src < b.src
     end)
 
+    term.clear()
+    term.setCursorPos(1, 1)
+    term.setTextColor(colors.white)
+
     if #files == 0 then
-        print("Nothing selected. Setup cancelled.")
+        print("Nothing selected. Keeping previous config (if any).")
         return false
     end
 
-    -- Ask which program to run on boot
-    term.clear()
-    term.setCursorPos(1, 1)
     print("Selected " .. #files .. " file(s).")
     print("Run on boot after update?")
     print("0) none")
@@ -366,12 +398,29 @@ local function runSetup(catalog)
         end
     end
     table.sort(dests)
-    for i, d in ipairs(dests) do
-        print(i .. ") " .. d)
+
+    local defaultRun = ""
+    if type(existingCfg) == "table" and type(existingCfg.run) == "string" then
+        defaultRun = existingCfg.run
     end
-    write("Choice [0]: ")
+    local defaultIndex = 0
+    for i, d in ipairs(dests) do
+        local mark = (d == defaultRun) and " *" or ""
+        print(i .. ") " .. d .. mark)
+        if d == defaultRun then
+            defaultIndex = i
+        end
+    end
+
+    local promptDefault = defaultIndex
+    write("Choice [" .. tostring(promptDefault) .. "]: ")
     local line = read()
-    local choice = tonumber(line) or 0
+    local choice
+    if line == nil or line == "" then
+        choice = promptDefault
+    else
+        choice = tonumber(line) or 0
+    end
     local run = ""
     if choice >= 1 and choice <= #dests then
         run = dests[choice]
@@ -408,7 +457,7 @@ local function pullFiles(cfg)
             failCount = failCount + 1
         else
             local url = base .. src
-            write("GET " .. src .. " -> " .. dest .. " ... ")
+            write(src .. " -> " .. dest .. " ... ")
             local body, err = httpGet(url)
             if not body then
                 print("FAIL (" .. tostring(err) .. ")")
@@ -426,12 +475,11 @@ local function pullFiles(cfg)
             end
         end
     end
-    print(string.format("Done: %d ok, %d failed", okCount, failCount))
+    print(okCount .. " ok, " .. failCount .. " failed")
     return failCount == 0
 end
 
 local function selfUpdate()
-    -- Download latest updater.lua into a temp name, then replace if different.
     local body, err = httpGet(UPDATER_URL)
     if not body then
         return false, err
@@ -447,14 +495,19 @@ local function selfUpdate()
     return true, "updated"
 end
 
-local function main(args)
-    args = args or {}
-    local forceSetup = false
+local function wantsSetup(args)
     for _, a in ipairs(args) do
-        if a == "--setup" or a == "setup" then
-            forceSetup = true
+        a = string.lower(tostring(a))
+        if a == "--setup" or a == "setup" or a == "reinstall" or a == "--reinstall" then
+            return true
         end
     end
+    return false
+end
+
+local function main(args)
+    args = args or {}
+    local forceSetup = wantsSetup(args)
 
     if not http then
         print("HTTP API is disabled on this server.")
@@ -468,19 +521,27 @@ local function main(args)
             print("Could not load catalog: " .. tostring(err))
             return
         end
-        if not runSetup(catalog) then
-            return
-        end
-        cfg = loadConfig()
-        if not cfg then
-            print("Config missing after setup.")
-            return
+        if not runSetup(catalog, cfg) then
+            -- Keep old config; still pull if we have one
+            cfg = loadConfig()
+            if not cfg then
+                return
+            end
+        else
+            cfg = loadConfig()
+            if not cfg then
+                print("Config missing after setup.")
+                return
+            end
         end
     end
 
-    local suOk, suMsg = selfUpdate()
-    if suOk and suMsg == "updated" then
-        print("Updater self-updated.")
+    -- Skip self-update when forcing setup so we don't race with a fresh install write
+    if not forceSetup then
+        local suOk, suMsg = selfUpdate()
+        if suOk and suMsg == "updated" then
+            print("Updater self-updated.")
+        end
     end
 
     pullFiles(cfg)

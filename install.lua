@@ -1,4 +1,7 @@
--- Bootstrap Amazeballs CC updater onto this computer.
+-- Bootstrap / reinstall Amazeballs CC updater onto this computer.
+-- Usage:
+--   install              -- install or reinstall (always reopens file setup)
+--   install pull         -- refresh updater + startup only, then pull (no setup UI)
 local REPO_BASE = "https://raw.githubusercontent.com/gleeglor/amazeballs-cc/main/"
 
 local function httpGet(url)
@@ -24,6 +27,15 @@ end
 if not http then
     print("HTTP API is disabled. Ask the server admin to enable ComputerCraft http.")
     return
+end
+
+local args = { ... }
+local skipSetup = false
+for _, a in ipairs(args) do
+    a = string.lower(tostring(a))
+    if a == "pull" or a == "--pull" then
+        skipSetup = true
+    end
 end
 
 print("Downloading updater.lua...")
@@ -65,5 +77,11 @@ if not writeFile("/startup.lua", startup) then
     return
 end
 print("Wrote /startup.lua")
-print("Running setup...")
-shell.run("/updater.lua")
+
+if skipSetup then
+    print("Pulling selected files...")
+    shell.run("/updater.lua")
+else
+    print("Opening file selection (reinstall ok)...")
+    shell.run("/updater.lua", "--setup")
+end

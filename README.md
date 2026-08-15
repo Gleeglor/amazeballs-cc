@@ -2,9 +2,9 @@
 
 Public script repo for the Amazeballs Minecraft pack. Computers on multiplayer pull selected files from here over HTTP on every reboot.
 
-Repo: [gleeglor/amazeballs-cc](https://github.com/gleeglor/amazeballs-cc)
+Repo: [gleeglor/amazeballs-cc](https://github.com/Gleeglor/amazeballs-cc)
 
-## Install on a computer (once)
+## Install on a computer
 
 In the ComputerCraft computer shell:
 
@@ -13,35 +13,44 @@ wget https://raw.githubusercontent.com/gleeglor/amazeballs-cc/main/install.lua i
 install
 ```
 
-That downloads `updater.lua`, writes a managed `startup.lua`, and starts first-time setup.
+That downloads `updater.lua`, writes a managed `startup.lua`, and opens file selection setup.
+
+### Reinstall / change selected files
+
+Run install again (or force setup on the updater). Previous selections are pre-checked so you can tweak them:
+
+```text
+install
+```
+
+Or without re-downloading install.lua:
+
+```text
+updater --setup
+```
+
+Aliases: `updater setup`, `updater reinstall`.
+
+Refresh updater files and pull only (no selection UI):
+
+```text
+install pull
+```
 
 ### Setup UI
-
-If `/cc_update.json` is missing, the updater shows the catalog folder tree (`cannon/`, `navigation/`, …):
 
 | Key | Action |
 |-----|--------|
 | Up / Down | Move cursor |
 | Space | Toggle select file |
-| Enter | Open folder, toggle file, or finish on **Done** |
+| Enter | Open folder, toggle file, or finish on **[Done] save selection** |
 | Backspace | Go up one folder |
 
-After you choose **Done**, pick which downloaded program to run on boot (or `0` for none). Selection is saved to `/cc_update.json`.
+After **Done**, pick which downloaded program to run on boot (or `0` for none). Selection is saved to `/cc_update.json`. Empty selection cancels and keeps the previous config.
 
 ### Every reboot
 
-`startup.lua` runs the updater (which re-downloads your selected files, and self-updates `updater.lua`), then runs the configured boot program (for example `autorun`).
-
-### Reset setup
-
-Delete the config and run setup again:
-
-```text
-delete cc_update.json
-updater --setup
-```
-
-Or reboot after deleting `cc_update.json` (startup will run the updater into setup).
+`startup.lua` runs the updater (re-downloads your selected files and self-updates `updater.lua`), then runs the configured boot program (for example `autorun`).
 
 ## Roles (cannon)
 
@@ -65,7 +74,7 @@ Local source of truth (this Cursor workspace):
 2. Commit and push to `gleeglor/amazeballs-cc` (`main`).
 3. In-game: reboot the computer, or run `updater`.
 
-No extra sync daemon — reboot (or `updater`) pulls the latest selected files from GitHub.
+No extra sync daemon. Reboot (or `updater`) pulls the latest selected files from GitHub.
 
 ## Server requirement
 
@@ -75,7 +84,7 @@ The **multiplayer server** must allow ComputerCraft HTTP to `raw.githubuserconte
 
 ```text
 catalog.json     # tree shown in setup
-install.lua      # wget bootstrap
+install.lua      # wget bootstrap / reinstall
 updater.lua      # setup + pull + self-update
 cannon/          # hub, fire, ammo scripts
 navigation/      # placeholder for future scripts
