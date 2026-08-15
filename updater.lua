@@ -58,7 +58,14 @@ local function writeFile(path, data)
 end
 
 local function httpGet(url)
-    local res, err = http.get(url)
+    -- Bust GitHub raw CDN cache (max-age=300) so new catalog files show up.
+    local sep = string.find(url, "?", 1, true) and "&" or "?"
+    local bust = sep .. "t=" .. tostring(os.epoch("utc"))
+    local res, err = http.get(url .. bust)
+    if not res then
+        -- Fallback without query (some proxies dislike ?)
+        res, err = http.get(url)
+    end
     if not res then
         return nil, err or "http.get failed"
     end
