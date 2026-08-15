@@ -16,7 +16,8 @@ local LEGACY_AXES = {
 }
 
 function drive.loadControl()
-    return drive.clampControlRpm(util.readJSON(CONTROL_PATH))
+    local control = drive.clampControlRpm(util.readJSON(CONTROL_PATH))
+    return drive.enrichControl(control)
 end
 
 function drive.saveControl(data)
@@ -545,6 +546,143 @@ function drive.isWrenchMode(control)
         and #control.thrusters > 0
 end
 
+local function facingToUnit(facing)
+    if facing == "forward" or facing == "surge" or facing == "main" then
+        return 1, 0
+    elseif facing == "back" or facing == "aft" or facing == "reverse" then
+        return -1, 0
+    elseif facing == "left" or facing == "port" then
+        return 0, -1
+    elseif facing == "right" or facing == "starboard" or facing == "stbd" then
+        return 0, 1
+    end
+    return nil, nil
+end
+
+--- Classify cardinal facing from wrench when facing/role missing.
+function drive.classifyFacing(t)
+    local fx = tonumber(t.fx) or 0
+    local fy = tonumber(t.fy) or 0
+    local af, ar = math.abs(fx), math.abs(fy)
+    local m = math.max(af, ar)
+    if m < 1e-6 then
+        return "mixed"
+    end
+    if af >= ar and af >= m * 0.55 then
+        return (fx >= 0) and "forward" or "back"
+    end
+    if ar >= af and ar >= m * 0.55 then
+        return (fy >= 0) and "right" or "left"
+    end
+    return "mixed"
+end
+
+--- Rebuild fx/fy from facing × max_force when geometry labels exist.
+-- Keeps measured tz (lever). Used so Reassembly matches cardinal thruster model.
+function drive.syncThrusterFacing(t)
+    if type(t) ~= "table" then
+        return t
+    end
+    local facing = t.facing or t.role
+    if not facing or facing == "mixed" then
+        facing = drive.classifyFacing(t)
+        if facing ~= "mixed" then
+            t.facing = facing
+            t.role = facing
+        end
+    end
+    local ux, uy = facingToUnit(facing)
+    if not ux then
+        return t
+    end
+    local strength = tonumber(t.max_force) or tonumber(t.strength)
+    if not strength or strength < 1e-6 then
+        strength = math.sqrt((tonumber(t.fx) or 0) ^ 2 + (tonumber(t.fy) or 0) ^ 2)
+        if strength < 1e-6 then
+            strength = 0.5
+        end
+        t.max_force = strength
+    end
+    t.facing = facing
+    t.role = facing
+    t.fx = strength * ux
+    t.fy = strength * uy
+    if facing == "left" then
+        t.side_score = -1
+    elseif facing == "right" then
+        t.side_score = 1
+    elseif t.side_score == nil then
+        t.side_score = 0
+    end
+    t.mag = math.sqrt((t.fx or 0) ^ 2 + (t.fy or 0) ^ 2 + (t.tz or 0) ^ 2)
+    return t
+end
+
+function drive.enrichControl(control)
+    if not control or type(control.thrusters) ~= "table" then
+        return control
+    end
+    for _, t in ipairs(control.thrusters) do
+        local facing = t.facing or t.role
+        if facing and facing ~= "mixed" then
+            drive.syncThrusterFacing(t)
+        elseif not facing then
+            facing = drive.classifyFacing(t)
+            t.facing = facing
+            t.role = facing
+            if facing ~= "mixed" and (t.max_force or t.strength) then
+                drive.syncThrusterFacing(t)
+            end
+        end
+    end
+    return control
+end
+
+--- Prefer Reassembly when alloc_mode says so or when facings are present.
+function drive.preferReassembly(control)
+    if not control then
+        return true
+    end
+    local mode = control.alloc_mode or control.teleop_mode
+    if mode == "teleop" or mode == "direct" then
+        return false
+    end
+    if mode == "reassembly" or mode == "wrench_ls" then
+        return true
+    end
+    -- Default: Reassembly when any thruster has a cardinal facing label
+    if type(control.thrusters) == "table" then
+        for _, t in ipairs(control.thrusters) do
+            local f = t.facing or t.role
+            if f == "forward" or f == "back" or f == "left" or f == "right" then
+                return true
+            end
+        end
+    end
+    return true -- Reassembly-like default (sim + tests)
+end
+
+--- Allocate command; Reassembly primary, teleop fallback on failure / near-CoM flag.
+function drive.applyCommand(control, fx, fy, tz)
+    control = control or drive.loadControl()
+    drive.enrichControl(control)
+    if drive.preferReassembly(control) then
+        local ok = drive.applyReassembly(control, fx, fy, tz)
+        if ok then
+            return true, "reassembly"
+        end
+        -- Singular LS → teleop mixer
+        if drive.applyTeleop(control, fx, fy, tz) then
+            return true, "teleop_fallback"
+        end
+        return false, "failed"
+    end
+    if drive.applyTeleop(control, fx, fy, tz) then
+        return true, "teleop"
+    end
+    return false, "failed"
+end
+
 function drive.allOff(control, opts)
     control = control or drive.loadControl()
     opts = opts or {}
@@ -665,6 +803,7 @@ function drive.applyReassembly(control, fx, fy, tz)
     if not drive.isWrenchMode(control) then
         return false
     end
+    drive.enrichControl(control)
 
     fx, fy, tz = fx or 0, fy or 0, tz or 0
     local cmdMag = math.sqrt(fx * fx + fy * fy + tz * tz)
@@ -815,10 +954,16 @@ function drive.flushMotorsAll(maxCalls)
     return n
 end
 
---- Physical side score: +starboard / -port (from calib, not peripheral list order).
+--- Physical side score: +starboard / -port (from facing, calib, not name order).
 function drive.thrusterSide(t)
     if type(t) ~= "table" then
         return 0
+    end
+    local facing = t.facing or t.role
+    if facing == "left" or facing == "port" then
+        return -1
+    elseif facing == "right" or facing == "starboard" or facing == "stbd" then
+        return 1
     end
     if t.side_score ~= nil then
         return tonumber(t.side_score) or 0
@@ -1361,6 +1506,7 @@ function drive.manualLoop(control, opts)
     }
 
     drive.clampControlRpm(control)
+    drive.enrichControl(control)
     local healedYaw = wrenchMode and drive.healYawThrusters(control)
     drive.hardStopThrusters(control)
 
@@ -1373,11 +1519,17 @@ function drive.manualLoop(control, opts)
         end
     end
 
-    print("Manual control (teleop mixer):")
+    local useReassembly = wrenchMode and drive.preferReassembly(control)
+    print("Manual control (" .. (useReassembly and "Reassembly LS" or "teleop mixer") .. "):")
     print("  W/S surge | A/D or arrows or J/L yaw | Z/C strafe")
     print("  X panic-stop | Q quit")
     if wrenchMode then
         print("  Thrusters: " .. #control.thrusters .. " (" .. nMotor .. " motors)")
+        local facings = {}
+        for _, t in ipairs(control.thrusters) do
+            facings[#facings + 1] = tostring(t.facing or t.role or "?")
+        end
+        print("  Facing: " .. table.concat(facings, ", "))
     end
     if healedYaw then
         print("  (side-aware yaw levers assigned)")
@@ -1445,8 +1597,8 @@ function drive.manualLoop(control, opts)
         end
         lastCmdSig = sig
         if wrenchMode then
-            -- Teleop mixer: equal/fx surge (no invented turn), side-aware A/D yaw
-            drive.applyTeleop(control, cmd.fx, cmd.fy, cmd.tz)
+            -- Reassembly LS over facing/wrench thrusters; teleop if alloc_mode=teleop
+            drive.applyCommand(control, cmd.fx, cmd.fy, cmd.tz)
         else
             drive.setAxis(control, "thrust_forward", cmd.fx > 0)
             drive.setAxis(control, "thrust_reverse", cmd.fx < 0)

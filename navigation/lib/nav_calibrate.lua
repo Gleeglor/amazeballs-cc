@@ -114,6 +114,66 @@ function calibrate.describe(w)
     return "mixed"
 end
 
+--- Cardinal facing from dominant force axis (axis-aligned thrusters).
+-- Returns "forward"|"back"|"left"|"right"|"mixed".
+function calibrate.classifyFacing(w)
+    local fx = tonumber(w.fx) or 0
+    local fy = tonumber(w.fy) or 0
+    local af, ar = math.abs(fx), math.abs(fy)
+    local m = math.max(af, ar)
+    if m < 1e-6 then
+        return "mixed"
+    end
+    if af >= ar and af >= m * 0.55 then
+        if fx >= 0 then
+            return "forward"
+        end
+        return "back"
+    end
+    if ar >= af and ar >= m * 0.55 then
+        if fy >= 0 then
+            return "right"
+        end
+        return "left"
+    end
+    return "mixed"
+end
+
+--- Relative thrust magnitude for allocation / size (uses horiz force).
+function calibrate.facingMagnitude(w)
+    local fx = tonumber(w.fx) or 0
+    local fy = tonumber(w.fy) or 0
+    return math.sqrt(fx * fx + fy * fy)
+end
+
+--- Optional: snap force to cardinal unit × magnitude; keep measured tz lever.
+function calibrate.applyFacingLabels(t)
+    local facing = calibrate.classifyFacing(t)
+    t.facing = facing
+    t.role = facing
+    local mag = calibrate.facingMagnitude(t)
+    if facing ~= "mixed" and mag >= 0.02 then
+        t.max_force = mag
+        if facing == "forward" then
+            t.fx, t.fy = mag, 0
+            t.side_score = 0
+        elseif facing == "back" then
+            t.fx, t.fy = -mag, 0
+            t.side_score = 0
+        elseif facing == "left" then
+            t.fx, t.fy = 0, -mag
+            t.side_score = -1
+        elseif facing == "right" then
+            t.fx, t.fy = 0, mag
+            t.side_score = 1
+        end
+        t.mag = math.sqrt((t.fx or 0) ^ 2 + (t.fy or 0) ^ 2 + (t.tz or 0) ^ 2)
+    elseif mag >= 0.02 then
+        t.max_force = mag
+    end
+    return t
+end
+
 --- Parse CLI / boat-menu args: invert, rpm N, power N, fe N
 function calibrate.parseArgs(args)
     args = args or {}
@@ -165,9 +225,10 @@ function calibrate.printReport(control)
     for _, t in ipairs(control.thrusters) do
         local kind = t.kind or "?"
         print(string.format(
-            "  [%s] %s  fx=%.3f fy=%.3f tz=%.3f  [%s]",
+            "  [%s] %s  facing=%s  fx=%.3f fy=%.3f tz=%.3f  [%s]",
             kind,
             t.name,
+            tostring(t.facing or t.role or "?"),
             t.fx,
             t.fy,
             t.tz,
@@ -353,17 +414,19 @@ function calibrate.run(opts)
             w.lever_est = w.tz / fHoriz
         end
 
-        local role = calibrate.describe(w)
         if w.mag < linFloor and math.abs(w.tz) < yawFloor then
             unused[#unused + 1] = a.name
             print(string.format("  -> unused  fx=%.3f fy=%.3f tz=%.3f", w.fx, w.fy, w.tz))
         else
             thrusters[#thrusters + 1] = w
+            calibrate.applyFacingLabels(w)
             local lever = w.lever_est and string.format(" lever~%.2f", w.lever_est) or ""
             local rev = w.reversible and " reversible" or ""
+            local face = w.facing and (" facing=" .. w.facing) or ""
             print(string.format(
-                "  -> thruster [%s] fx=%.3f fy=%.3f tz=%.3f%s%s",
-                role,
+                "  -> thruster [%s]%s fx=%.3f fy=%.3f tz=%.3f%s%s",
+                calibrate.describe(w),
+                face,
                 w.fx,
                 w.fy,
                 w.tz,
@@ -392,8 +455,9 @@ function calibrate.run(opts)
     end
 
     local control = {
-        version = 5,
+        version = 6,
         mode = "wrench",
+        alloc_mode = "reassembly",
         invert_analog = invert,
         default_motor_rpm = probeRpm,
         power_budget_rf = powerBudget,
