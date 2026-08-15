@@ -205,18 +205,15 @@ function drive.hardStopThrusters(control)
     end
     for _, name in ipairs(names) do
         motorDesired[name] = 0
-        motorSent[name] = nil -- force setRPM(0) even if we thought it was already 0
-        local m = getMotor(name)
-        if m then
-            pcall(function()
-                if m.setRPM then
-                    m.setRPM(0)
-                end
-                if m.stop then
-                    m.stop()
-                end
-            end)
-            motorSent[name] = 0
+        -- Must NOT mark sent=0 unless write succeeds (anti-spam used to fake-success)
+        motorSent[name] = nil
+    end
+    -- Stops first; retry once with gap if CCA anti-spam rejects
+    table.sort(names)
+    for _, name in ipairs(names) do
+        if not writeMotorRpm(name, 0) then
+            sleep(MOTOR_FLUSH_GAP)
+            writeMotorRpm(name, 0)
         end
     end
 end
@@ -1221,7 +1218,7 @@ function drive.manualLoop(control, opts)
     local stop = false
     local wrenchMode = drive.isWrenchMode(control)
     local lastIdleStopAt = 0
-    local KEY_UP_GRACE = 0.06
+    local KEY_UP_GRACE = 0.08 -- only when another MOVE key is still held (chords)
 
     local YAW_L = { [keys.a] = true, [keys.left] = true, [keys.j] = true }
     local YAW_R = { [keys.d] = true, [keys.right] = true, [keys.l] = true }
@@ -1298,6 +1295,15 @@ function drive.manualLoop(control, opts)
         end
     end
 
+    local function otherMoveDown(exceptKey)
+        for k, _ in pairs(down) do
+            if k ~= exceptKey and MOVE[k] and not pendingUp[k] then
+                return true
+            end
+        end
+        return false
+    end
+
     local function applyThrust()
         local cmd = commandFromKeys()
         if cmd.fx == 0 and cmd.fy == 0 and cmd.tz == 0 then
@@ -1333,6 +1339,20 @@ function drive.manualLoop(control, opts)
         end
     end
 
+    local function onKeyUp(key)
+        if not MOVE[key] then
+            return
+        end
+        -- Solo release: stop immediately. Chord: brief grace so spurious ups don't drop the chord.
+        if otherMoveDown(key) then
+            pendingUp[key] = os.clock() + KEY_UP_GRACE
+        else
+            down[key] = nil
+            pendingUp[key] = nil
+            applyThrust()
+        end
+    end
+
     while not stop do
         local timerId = os.startTimer(tick)
         while true do
@@ -1361,10 +1381,7 @@ function drive.manualLoop(control, opts)
                     lastIdleStopAt = os.clock()
                 end
             elseif ev[1] == "key_up" then
-                if MOVE[ev[2]] then
-                    -- Grace so pressing a second key doesn't drop the first
-                    pendingUp[ev[2]] = os.clock() + KEY_UP_GRACE
-                end
+                onKeyUp(ev[2])
             elseif ev[1] == "timer" and ev[2] == timerId then
                 break
             end
@@ -1374,8 +1391,21 @@ function drive.manualLoop(control, opts)
         flushPendingUps()
 
         if not anyDown() then
-            if (os.clock() - lastIdleStopAt) >= 0.15 then
-                drive.hardStopThrusters(control)
+            -- Retry failed setRPM(0) without full staggered hardStop every tick
+            if drive.motorsPending() then
+                drive.commitMotorsNow()
+                lastIdleStopAt = os.clock()
+            elseif (os.clock() - lastIdleStopAt) >= 0.25 then
+                if type(control.thrusters) == "table" then
+                    for _, t in ipairs(control.thrusters) do
+                        if t.name then
+                            motorDesired[t.name] = 0
+                            if motorSent[t.name] ~= 0 then
+                                motorSent[t.name] = nil
+                            end
+                        end
+                    end
+                end
                 drive.commitMotorsNow()
                 lastIdleStopAt = os.clock()
             end
