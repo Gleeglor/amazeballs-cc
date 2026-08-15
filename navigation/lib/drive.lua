@@ -173,57 +173,49 @@ function drive.setMotorRpm(name, rpm)
     return true
 end
 
---- Immediately zero EVERY electric_motor on the network (not just calibrated thrusters).
--- Orphan/unused motors were staying at 1 RPM because X only stopped the thruster list.
+--- Fast stop: only calibrated thrusters / queued motors (no network scan).
+-- Full getNames()+getRPM scan was freezing input for 1–2s on every key release.
 function drive.hardStopThrusters(control)
     control = control or drive.loadControl()
-    if type(control) == "table" and type(control.thrusters) == "table" then
-        for _, t in ipairs(control.thrusters) do
-            if t.name then
-                motorDesired[t.name] = 0
-            end
-            if t.kind ~= "motor" and t.name then
-                drive.setActuator(control, t, 0)
+    local names = {}
+    local seen = {}
+    local function add(name)
+        if name and not seen[name] then
+            seen[name] = true
+            names[#names + 1] = name
+        end
+    end
+    if type(control) == "table" then
+        if type(control.thrusters) == "table" then
+            for _, t in ipairs(control.thrusters) do
+                add(t.name)
+                if t.kind ~= "motor" then
+                    drive.setActuator(control, t, 0)
+                end
             end
         end
         if type(control.unused) == "table" then
             for _, name in ipairs(control.unused) do
-                motorDesired[name] = 0
+                add(name)
             end
         end
     end
     for name, _ in pairs(motorDesired) do
+        add(name)
+    end
+    for _, name in ipairs(names) do
         motorDesired[name] = 0
         motorSent[name] = nil
-        motorWrapCache[name] = nil
-    end
-    -- Stop every electric_motor, and verify via getRPM when available
-    for _, name in ipairs(peripheral.getNames()) do
-        if peripheral.hasType(name, "electric_motor") then
-            motorDesired[name] = 0
-            local m = peripheral.wrap(name)
-            if m then
-                pcall(function()
-                    if m.setRPM then
-                        m.setRPM(0)
-                    end
-                    if m.setSpeed then
-                        m.setSpeed(0)
-                    end
-                    if m.stop then
-                        m.stop()
-                    end
-                    -- Second shot if still spinning
-                    if m.getRPM and math.abs(m.getRPM() or 0) >= 1 then
-                        if m.setRPM then
-                            m.setRPM(0)
-                        end
-                        if m.stop then
-                            m.stop()
-                        end
-                    end
-                end)
-            end
+        local m = getMotor(name)
+        if m then
+            pcall(function()
+                if m.setRPM then
+                    m.setRPM(0)
+                end
+                if m.stop then
+                    m.stop()
+                end
+            end)
             motorSent[name] = 0
         end
     end
@@ -618,6 +610,132 @@ local function dutyToLevel(u)
     return math.max(1, math.floor(u * 15 + 0.5))
 end
 
+--- Teleop mixer: surge + strafe + differential yaw (needs 2+ motors for turn).
+function drive.applyManualChord(control, fx, fy, tz)
+    control = control or drive.loadControl()
+    if not drive.isWrenchMode(control) then
+        return drive.applyWrench(control, fx, fy, tz)
+    end
+
+    fx, fy, tz = fx or 0, fy or 0, tz or 0
+    if math.abs(fx) + math.abs(fy) + math.abs(tz) < 1e-4 then
+        drive.hardStopThrusters(control)
+        return true
+    end
+
+    local motors = {}
+    for _, t in ipairs(control.thrusters) do
+        if t.kind == "motor" then
+            motors[#motors + 1] = t
+        end
+    end
+    if #motors == 0 then
+        return false
+    end
+
+    -- Side from calib lateral (fy) so port/starboard oppose for yaw
+    if not control._yaw_side then
+        control._yaw_side = {}
+        table.sort(motors, function(a, b)
+            local ay, by = a.fy or 0, b.fy or 0
+            if math.abs(ay - by) > 1e-4 then
+                return ay < by
+            end
+            return tostring(a.name) < tostring(b.name)
+        end)
+        if #motors == 1 then
+            control._yaw_side[motors[1].name] = 1
+            control._yaw_warn = true
+        else
+            local mid = math.ceil(#motors / 2)
+            for i, t in ipairs(motors) do
+                control._yaw_side[t.name] = (i <= mid) and -1 or 1
+            end
+        end
+    end
+
+    for _, t in ipairs(motors) do
+        local d = 0
+        if math.abs(fx) > 0.01 then
+            local s = t.fx or 0
+            if math.abs(s) < 0.01 then
+                s = 1
+            end
+            d = d + fx * (s >= 0 and 1 or -1)
+        end
+        if math.abs(fy) > 0.01 then
+            local s = t.fy or 0
+            if math.abs(s) < 0.01 then
+                s = control._yaw_side[t.name] or 1
+            end
+            d = d + fy * (s >= 0 and 1 or -1)
+        end
+        if math.abs(tz) > 0.01 then
+            d = d + tz * (control._yaw_side[t.name] or 1)
+        end
+        d = util.clamp(d, -1, 1)
+        if math.abs(d) < 0.08 then
+            d = 0
+        end
+        drive.setActuator(control, t, d)
+    end
+
+    for _, t in ipairs(control.thrusters) do
+        if t.kind ~= "motor" then
+            local d = util.clamp(
+                fx * (t.fx or 0) + fy * (t.fy or 0) + tz * (t.tz or 0),
+                0,
+                1
+            )
+            drive.setActuator(control, t, d)
+        end
+    end
+
+    -- Don't power-budget pure yaw (would collapse opposite motors unevenly)
+    if not (math.abs(tz) > 0.5 and math.abs(fx) < 0.1 and math.abs(fy) < 0.1) then
+        drive.applyPowerBudget(control)
+    end
+    -- Push all motor targets now (yaw needs both sides in the same frame)
+    drive.commitMotorsNow()
+    return true
+end
+
+--- Write every pending motor RPM now (retries once on anti-spam).
+function drive.commitMotorsNow()
+    local pending = {}
+    for name, want in pairs(motorDesired) do
+        if motorSent[name] ~= want then
+            pending[#pending + 1] = name
+        end
+    end
+    -- Stops first
+    table.sort(pending, function(a, b)
+        local da, db = motorDesired[a] or 0, motorDesired[b] or 0
+        if (da == 0) ~= (db == 0) then
+            return da == 0
+        end
+        return tostring(a) < tostring(b)
+    end)
+    for _, name in ipairs(pending) do
+        if not writeMotorRpm(name, motorDesired[name] or 0) then
+            sleep(0.05)
+            writeMotorRpm(name, motorDesired[name] or 0)
+        end
+    end
+end
+
+function drive.flushMotorsAll(maxCalls)
+    maxCalls = maxCalls or 12
+    local n = 0
+    while n < maxCalls and drive.motorsPending() do
+        if drive.flushMotors(1) < 1 then
+            break
+        end
+        n = n + 1
+    end
+    return n
+end
+
 --- Direct (non-greedy) allocation for teleop — more predictable yaw/strafe.
 -- Maps command (-1..1) onto thrusters by wrench projection, then normalizes.
 function drive.applyDirect(control, fx, fy, tz)
@@ -1008,29 +1126,24 @@ function drive.manualLoop(control, opts)
     local interval = opts.interval or 0.25
     local tick = opts.tick or 0.05
     local recordName = opts.recordName
-    local down = {} -- keycode -> true while physically held (from key/key_up only)
+    local down = {}
+    local pendingUp = {}
     local waypoints = {}
     local t0 = os.clock()
     local lastSample = 0
     local stop = false
     local wrenchMode = drive.isWrenchMode(control)
     local lastIdleStopAt = 0
-    local lastApplyAt = 0
+    local KEY_UP_GRACE = 0.1
 
-    -- Yaw: A/D, arrows, and J/L (A/D are flaky on some setups)
     local YAW_L = { [keys.a] = true, [keys.left] = true, [keys.j] = true }
     local YAW_R = { [keys.d] = true, [keys.right] = true, [keys.l] = true }
     local MOVE = {
-        [keys.w] = true,
-        [keys.s] = true,
-        [keys.a] = true,
-        [keys.d] = true,
-        [keys.z] = true,
-        [keys.c] = true,
-        [keys.left] = true,
-        [keys.right] = true,
-        [keys.j] = true,
-        [keys.l] = true,
+        [keys.w] = true, [keys.s] = true,
+        [keys.a] = true, [keys.d] = true,
+        [keys.z] = true, [keys.c] = true,
+        [keys.left] = true, [keys.right] = true,
+        [keys.j] = true, [keys.l] = true,
     }
 
     if wrenchMode then
@@ -1049,37 +1162,25 @@ function drive.manualLoop(control, opts)
     end
 
     print("Manual control:")
-    print("  W/S forward/back | A/D or arrows or J/L turn | Z/C strafe")
-    print("  X = panic stop all motors | Q = quit")
+    print("  W/S surge | A/D or arrows or J/L turn | Z/C strafe")
+    print("  X panic-stop | Q quit")
     if wrenchMode then
-        print("  Thrusters: " .. #control.thrusters .. (nMotor > 0 and (" (" .. nMotor .. " motors)") or ""))
-    end
-    print("  (key-repeat ignored; release must send key_up)")
-    print()
-
-    local function anyDown()
-        for _, v in pairs(down) do
-            if v then
-                return true
-            end
+        print("  Motors: " .. tostring(nMotor) .. "  (turn needs 2+)")
+        if control._yaw_warn or nMotor < 2 then
+            print("  WARN: fewer than 2 motors — A/D will feel like forward/back")
         end
-        return false
     end
+    print()
 
     local function yawLeft()
         for k, _ in pairs(YAW_L) do
-            if down[k] then
-                return true
-            end
+            if down[k] then return true end
         end
         return false
     end
-
     local function yawRight()
         for k, _ in pairs(YAW_R) do
-            if down[k] then
-                return true
-            end
+            if down[k] then return true end
         end
         return false
     end
@@ -1091,34 +1192,23 @@ function drive.manualLoop(control, opts)
         return { fx = fx, fy = fy, tz = tz }
     end
 
-    local function clearOpposites(key)
-        if key == keys.w then
-            down[keys.s] = nil
-        elseif key == keys.s then
-            down[keys.w] = nil
-        elseif YAW_L[key] then
-            for k, _ in pairs(YAW_R) do
-                down[k] = nil
-            end
-        elseif YAW_R[key] then
-            for k, _ in pairs(YAW_L) do
-                down[k] = nil
-            end
-        elseif key == keys.z then
-            down[keys.c] = nil
-        elseif key == keys.c then
-            down[keys.z] = nil
+    local function anyDown()
+        for _, v in pairs(down) do
+            if v then return true end
         end
+        return false
     end
 
-    local function doIdleStop(panic)
-        down = {}
-        if panic then
-            drive.panicStop(control)
-        else
-            drive.hardStopThrusters(control)
+    local function clearOpposites(key)
+        if key == keys.w then down[keys.s] = nil
+        elseif key == keys.s then down[keys.w] = nil
+        elseif YAW_L[key] then
+            for k, _ in pairs(YAW_R) do down[k] = nil; pendingUp[k] = nil end
+        elseif YAW_R[key] then
+            for k, _ in pairs(YAW_L) do down[k] = nil; pendingUp[k] = nil end
+        elseif key == keys.z then down[keys.c] = nil
+        elseif key == keys.c then down[keys.z] = nil
         end
-        lastIdleStopAt = os.clock()
     end
 
     local function applyThrust()
@@ -1129,7 +1219,7 @@ function drive.manualLoop(control, opts)
             return
         end
         if wrenchMode then
-            drive.applyDirect(control, cmd.fx, cmd.fy, cmd.tz)
+            drive.applyManualChord(control, cmd.fx, cmd.fy, cmd.tz)
         else
             drive.setAxis(control, "thrust_forward", cmd.fx > 0)
             drive.setAxis(control, "thrust_reverse", cmd.fx < 0)
@@ -1138,7 +1228,21 @@ function drive.manualLoop(control, opts)
             drive.setAxis(control, "strafe_left", cmd.fy < 0)
             drive.setAxis(control, "strafe_right", cmd.fy > 0)
         end
-        lastApplyAt = os.clock()
+    end
+
+    local function flushPendingUps()
+        local now = os.clock()
+        local changed = false
+        for key, at in pairs(pendingUp) do
+            if now >= at then
+                down[key] = nil
+                pendingUp[key] = nil
+                changed = true
+            end
+        end
+        if changed then
+            applyThrust()
+        end
     end
 
     while not stop do
@@ -1146,52 +1250,49 @@ function drive.manualLoop(control, opts)
         while true do
             local ev = { os.pullEventRaw() }
             if ev[1] == "terminate" then
-                doIdleStop(true)
+                drive.hardStopThrusters(control)
                 error("Terminated", 0)
             elseif ev[1] == "key" then
                 local key, isRepeat = ev[2], ev[3] and true or false
-                -- IGNORE key-repeat entirely (root of sticky + "yaw dies while held")
-                if isRepeat then
-                    -- ignore
-                elseif MOVE[key] then
+                if MOVE[key] then
+                    pendingUp[key] = nil
                     down[key] = true
-                    clearOpposites(key)
-                    applyThrust()
-                elseif key == quitKey then
+                    if not isRepeat then
+                        clearOpposites(key)
+                        applyThrust()
+                    end
+                    -- repeats keep chord alive (cancel pending key_up from other key)
+                elseif (not isRepeat) and key == quitKey then
                     stop = true
                     break
-                elseif key == keys.x then
-                    print("Panic stop — all motors")
-                    doIdleStop(true)
+                elseif (not isRepeat) and key == keys.x then
+                    print("Panic stop")
+                    down = {}
+                    pendingUp = {}
+                    drive.panicStop(control)
+                    lastIdleStopAt = os.clock()
                 end
             elseif ev[1] == "key_up" then
-                local key = ev[2]
-                if MOVE[key] then
-                    down[key] = nil
-                    applyThrust()
+                if MOVE[ev[2]] then
+                    -- Grace so pressing a second key doesn't drop the first
+                    pendingUp[ev[2]] = os.clock() + KEY_UP_GRACE
                 end
             elseif ev[1] == "timer" and ev[2] == timerId then
                 break
             end
         end
-        if stop then
-            break
-        end
+        if stop then break end
 
-        -- Every tick: if no keys, keep forcing motors off (CCA forgets setRPM(0))
+        flushPendingUps()
+
         if not anyDown() then
-            if (os.clock() - lastIdleStopAt) >= 0.15 then
+            if (os.clock() - lastIdleStopAt) >= 0.2 then
                 drive.hardStopThrusters(control)
                 lastIdleStopAt = os.clock()
             end
-        else
-            -- Re-apply while held so turn doesn't die after first packet
-            if (os.clock() - lastApplyAt) >= 0.12 then
-                applyThrust()
-            else
-                drive.flushMotors(2)
-            end
         end
+        -- Finish any remaining motor RPM pushes without blocking the next keys long
+        drive.flushMotors(3)
 
         if recordName then
             local now = os.clock()
@@ -1200,15 +1301,13 @@ function drive.manualLoop(control, opts)
                 local ok, wp = pcall(path.sampleWaypoint, t0)
                 if ok and wp then
                     waypoints[#waypoints + 1] = wp
-                    if #waypoints % 20 == 0 then
-                        print("  recorded #" .. #waypoints)
-                    end
                 end
             end
         end
     end
 
-    doIdleStop(true)
+    down = {}
+    drive.hardStopThrusters(control)
 
     if recordName then
         if #waypoints < 2 then
