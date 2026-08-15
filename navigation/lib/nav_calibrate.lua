@@ -192,8 +192,8 @@ function calibrate.run(opts)
     end
     local powerBudget = opts.power_budget_rf or 45
     local fePerRpm = opts.fe_per_rpm or 1
-    local linFloor = (opts.thresholds and opts.thresholds.linear) or 0.04
-    local yawFloor = (opts.thresholds and opts.thresholds.yaw) or 0.025
+    local linFloor = (opts.thresholds and opts.thresholds.linear) or 0.03
+    local yawFloor = (opts.thresholds and opts.thresholds.yaw) or 0.008
 
     local prev = drive.loadControl() or {}
     local invert = opts.invert_analog

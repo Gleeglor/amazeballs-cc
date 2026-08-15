@@ -610,92 +610,144 @@ local function dutyToLevel(u)
     return math.max(1, math.floor(u * 15 + 0.5))
 end
 
---- Teleop mixer: surge + strafe + differential yaw (needs 2+ motors for turn).
-function drive.applyManualChord(control, fx, fy, tz)
+--- Invert 3x3 matrix * vector (Gaussian elimination). Returns nil if singular.
+local function solve3x3(A, b)
+    local m = {
+        { A[1][1], A[1][2], A[1][3], b[1] },
+        { A[2][1], A[2][2], A[2][3], b[2] },
+        { A[3][1], A[3][2], A[3][3], b[3] },
+    }
+    for col = 1, 3 do
+        local pivot = col
+        for r = col + 1, 3 do
+            if math.abs(m[r][col]) > math.abs(m[pivot][col]) then
+                pivot = r
+            end
+        end
+        if math.abs(m[pivot][col]) < 1e-12 then
+            return nil
+        end
+        m[col], m[pivot] = m[pivot], m[col]
+        local div = m[col][col]
+        for c = col, 4 do
+            m[col][c] = m[col][c] / div
+        end
+        for r = 1, 3 do
+            if r ~= col then
+                local f = m[r][col]
+                for c = col, 4 do
+                    m[r][c] = m[r][c] - f * m[col][c]
+                end
+            end
+        end
+    end
+    return { m[1][4], m[2][4], m[3][4] }
+end
+
+--- Reassembly-style: solve thruster duties from calibrated force+torque wrenches.
+-- Near-CoM strafe thrusters get small tz; combinations (diagonals) produce turn.
+function drive.applyReassembly(control, fx, fy, tz)
     control = control or drive.loadControl()
     if not drive.isWrenchMode(control) then
-        return drive.applyWrench(control, fx, fy, tz)
+        return false
     end
 
     fx, fy, tz = fx or 0, fy or 0, tz or 0
-    if math.abs(fx) + math.abs(fy) + math.abs(tz) < 1e-4 then
+    local cmdMag = math.sqrt(fx * fx + fy * fy + tz * tz)
+    if cmdMag < 1e-4 then
         drive.hardStopThrusters(control)
         return true
     end
 
-    local motors = {}
-    for _, t in ipairs(control.thrusters) do
-        if t.kind == "motor" then
-            motors[#motors + 1] = t
-        end
-    end
-    if #motors == 0 then
+    local thrusters = control.thrusters
+    local n = #thrusters
+    if n == 0 then
         return false
     end
 
-    -- Side from calib lateral (fy) so port/starboard oppose for yaw
-    if not control._yaw_side then
-        control._yaw_side = {}
-        table.sort(motors, function(a, b)
-            local ay, by = a.fy or 0, b.fy or 0
-            if math.abs(ay - by) > 1e-4 then
-                return ay < by
+    -- Desired wrench in calibration units (norm ≈ response at probe RPM)
+    local gain = (control.gains and control.gains.norm) or 1
+    if gain < 1e-6 then
+        gain = 1
+    end
+    -- Axis emphasis: pure yaw trusts tiny CoM-offset tz components
+    local axW = { 1.0, 1.0, 1.0 }
+    if math.abs(tz) >= 0.5 and math.abs(fx) + math.abs(fy) < 0.25 then
+        axW = { 0.25, 0.25, 1.0 }
+    elseif math.abs(fy) >= 0.5 and math.abs(fx) + math.abs(tz) < 0.25 then
+        axW = { 0.25, 1.0, 0.25 }
+    end
+
+    local function dutiesFor(scale)
+        local Fd = {
+            (fx / cmdMag) * gain * scale * axW[1],
+            (fy / cmdMag) * gain * scale * axW[2],
+            (tz / cmdMag) * gain * scale * axW[3],
+        }
+        -- G = W W^T with weighted columns: use wi' = (axW[k]*wi[k])
+        local G = {
+            { 1e-8, 0, 0 },
+            { 0, 1e-8, 0 },
+            { 0, 0, 1e-8 },
+        }
+        for _, t in ipairs(thrusters) do
+            local w1 = (t.fx or 0) * axW[1]
+            local w2 = (t.fy or 0) * axW[2]
+            local w3 = (t.tz or 0) * axW[3]
+            G[1][1] = G[1][1] + w1 * w1
+            G[1][2] = G[1][2] + w1 * w2
+            G[1][3] = G[1][3] + w1 * w3
+            G[2][1] = G[2][1] + w2 * w1
+            G[2][2] = G[2][2] + w2 * w2
+            G[2][3] = G[2][3] + w2 * w3
+            G[3][1] = G[3][1] + w3 * w1
+            G[3][2] = G[3][2] + w3 * w2
+            G[3][3] = G[3][3] + w3 * w3
+        end
+        local lambda = solve3x3(G, Fd)
+        if not lambda then
+            return nil
+        end
+        local u = {}
+        local maxAbs = 0
+        for i, t in ipairs(thrusters) do
+            local wi1 = (t.fx or 0) * axW[1]
+            local wi2 = (t.fy or 0) * axW[2]
+            local wi3 = (t.tz or 0) * axW[3]
+            local ui = wi1 * lambda[1] + wi2 * lambda[2] + wi3 * lambda[3]
+            if t.kind ~= "motor" then
+                ui = math.max(0, ui)
             end
-            return tostring(a.name) < tostring(b.name)
-        end)
-        if #motors == 1 then
-            control._yaw_side[motors[1].name] = 1
-            control._yaw_warn = true
-        else
-            local mid = math.ceil(#motors / 2)
-            for i, t in ipairs(motors) do
-                control._yaw_side[t.name] = (i <= mid) and -1 or 1
-            end
+            u[i] = ui
+            maxAbs = math.max(maxAbs, math.abs(ui))
+        end
+        return u, maxAbs
+    end
+
+    local u, maxAbs = dutiesFor(1.0)
+    if not u then
+        -- Fallback: greedy wrench alloc
+        return drive.applyWrench(control, fx, fy, tz)
+    end
+    if maxAbs > 1 then
+        local u2, m2 = dutiesFor(1.0 / maxAbs)
+        if u2 then
+            u, maxAbs = u2, m2
         end
     end
 
-    for _, t in ipairs(motors) do
-        local d = 0
-        if math.abs(fx) > 0.01 then
-            local s = t.fx or 0
-            if math.abs(s) < 0.01 then
-                s = 1
-            end
-            d = d + fx * (s >= 0 and 1 or -1)
+    for i, t in ipairs(thrusters) do
+        local duty = util.clamp(u[i] or 0, (t.kind == "motor") and -1 or 0, 1)
+        if math.abs(duty) < 0.06 then
+            duty = 0
         end
-        if math.abs(fy) > 0.01 then
-            local s = t.fy or 0
-            if math.abs(s) < 0.01 then
-                s = control._yaw_side[t.name] or 1
-            end
-            d = d + fy * (s >= 0 and 1 or -1)
-        end
-        if math.abs(tz) > 0.01 then
-            d = d + tz * (control._yaw_side[t.name] or 1)
-        end
-        d = util.clamp(d, -1, 1)
-        if math.abs(d) < 0.08 then
-            d = 0
-        end
-        drive.setActuator(control, t, d)
+        drive.setActuator(control, t, duty)
     end
 
-    for _, t in ipairs(control.thrusters) do
-        if t.kind ~= "motor" then
-            local d = util.clamp(
-                fx * (t.fx or 0) + fy * (t.fy or 0) + tz * (t.tz or 0),
-                0,
-                1
-            )
-            drive.setActuator(control, t, d)
-        end
-    end
-
-    -- Don't power-budget pure yaw (would collapse opposite motors unevenly)
-    if not (math.abs(tz) > 0.5 and math.abs(fx) < 0.1 and math.abs(fy) < 0.1) then
+    -- Keep combinations intact for yaw (don't unevenly shrink one diagonal)
+    if not (math.abs(tz) >= 0.5 and math.abs(fx) + math.abs(fy) < 0.25) then
         drive.applyPowerBudget(control)
     end
-    -- Push all motor targets now (yaw needs both sides in the same frame)
     drive.commitMotorsNow()
     return true
 end
@@ -931,7 +983,7 @@ function drive.applyWrench(control, fx, fy, tz)
         end
     end
     drive.applyPowerBudget(control)
-    drive.flushMotors(1)
+    drive.commitMotorsNow()
     return true
 end
 
@@ -1147,9 +1199,11 @@ function drive.manualLoop(control, opts)
     }
 
     if wrenchMode then
-        drive.healYawThrusters(control)
+        -- Keep real calib wrenches (do NOT invent left/right groups)
+        drive.clampControlRpm(control)
+    else
+        drive.clampControlRpm(control)
     end
-    drive.clampControlRpm(control)
     drive.hardStopThrusters(control)
 
     local nMotor = 0
@@ -1161,14 +1215,12 @@ function drive.manualLoop(control, opts)
         end
     end
 
-    print("Manual control:")
-    print("  W/S surge | A/D or arrows or J/L turn | Z/C strafe")
+    print("Manual control (Reassembly wrench alloc):")
+    print("  W/S surge | A/D or arrows or J/L yaw | Z/C strafe")
     print("  X panic-stop | Q quit")
     if wrenchMode then
-        print("  Motors: " .. tostring(nMotor) .. "  (turn needs 2+)")
-        if control._yaw_warn or nMotor < 2 then
-            print("  WARN: fewer than 2 motors — A/D will feel like forward/back")
-        end
+        print("  Thrusters: " .. #control.thrusters .. " (" .. nMotor .. " motors)")
+        print("  Uses calib fx/fy/tz — diagonals turn even if each thruster looks like strafe")
     end
     print()
 
@@ -1219,7 +1271,7 @@ function drive.manualLoop(control, opts)
             return
         end
         if wrenchMode then
-            drive.applyManualChord(control, cmd.fx, cmd.fy, cmd.tz)
+            drive.applyReassembly(control, cmd.fx, cmd.fy, cmd.tz)
         else
             drive.setAxis(control, "thrust_forward", cmd.fx > 0)
             drive.setAxis(control, "thrust_reverse", cmd.fx < 0)
