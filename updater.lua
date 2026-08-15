@@ -159,12 +159,34 @@ local function isFileEntry(_, node)
     return true
 end
 
-local function countSelected(selected)
-    local n = 0
-    for _ in pairs(selected) do
-        n = n + 1
+local function selectedList(selected)
+    local list = {}
+    for src in pairs(selected) do
+        list[#list + 1] = src
     end
-    return n
+    table.sort(list)
+    return list
+end
+
+local function formatSelectedLine(selected, maxWidth)
+    local list = selectedList(selected)
+    if #list == 0 then
+        return "Selected: (none)"
+    end
+    local line = "Selected: " .. table.concat(list, ", ")
+    if #line <= maxWidth then
+        return line
+    end
+    local out = "Selected: "
+    for i, src in ipairs(list) do
+        local piece = (i == 1) and src or (", " .. src)
+        if #out + #piece + 8 > maxWidth then
+            out = out .. " +" .. (#list - i + 1) .. " more"
+            break
+        end
+        out = out .. piece
+    end
+    return out
 end
 
 local function pathDisplay(pathStack)
@@ -174,13 +196,23 @@ local function pathDisplay(pathStack)
     return "/" .. table.concat(pathStack, "/")
 end
 
+local function folderPickCount(selected, folderName)
+    local prefix = folderName .. "/"
+    local n = 0
+    for src in pairs(selected) do
+        if src == folderName or string.sub(src, 1, #prefix) == prefix then
+            n = n + 1
+        end
+    end
+    return n
+end
+
 local function runSetup(catalog, existingCfg)
     local tree = catalog.tree
     local pathStack = {}
     local cursor = 1
     local selected = {}
 
-    -- Preload previous selections when reinstalling / reconfiguring
     if type(existingCfg) == "table" and type(existingCfg.files) == "table" then
         for _, entry in ipairs(existingCfg.files) do
             if type(entry) == "table" and type(entry.src) == "string" then
@@ -239,14 +271,19 @@ local function runSetup(catalog, existingCfg)
                     label = label,
                 }
             else
+                local picks = folderPickCount(selected, src)
+                local label = name .. "/"
+                if picks > 0 then
+                    label = label .. " [" .. picks .. " selected]"
+                end
                 rows[#rows + 1] = {
                     kind = "dir",
                     name = name,
-                    label = name .. "/",
+                    label = label,
                 }
             end
         end
-        rows[#rows + 1] = { kind = "done", label = "[Done] save selection" }
+        rows[#rows + 1] = { kind = "done", label = "[DONE] save and continue" }
         return rows
     end
 
@@ -259,17 +296,17 @@ local function runSetup(catalog, existingCfg)
             cursor = #rows
         end
 
+        local w, h = term.getSize()
         term.setBackgroundColor(colors.black)
         term.setTextColor(colors.white)
         term.clear()
         term.setCursorPos(1, 1)
 
-        print("Script setup")
-        print(pathDisplay(pathStack) .. "  (" .. countSelected(selected) .. " selected)")
-        print("arrows move | space toggle | enter open/done")
-        print(string.rep("-", math.min(term.getSize())))
+        print("Script setup  " .. pathDisplay(pathStack))
+        print("move=arrows  toggle=space  open/done=enter")
+        print(formatSelectedLine(selected, w))
+        print(string.rep("-", w))
 
-        local _, h = term.getSize()
         local headerLines = 4
         local maxShow = math.max(1, h - headerLines)
         local start = math.max(1, cursor - maxShow + 1)
@@ -277,36 +314,40 @@ local function runSetup(catalog, existingCfg)
 
         for i = start, finish do
             local row = rows[i]
-            local prefix = (i == cursor) and "> " or "  "
+            local onCursor = (i == cursor)
+            local prefix = onCursor and "> " or "  "
+            local line
+
             if row.kind == "file" then
-                local mark = selected[row.src] and "[x]" or "[ ]"
-                -- Only show dest when it differs from the file basename (rare).
+                local isOn = selected[row.src] ~= nil
+                local mark = isOn and "[X]" or "[ ]"
                 local destNote = ""
                 if row.dest ~= row.name and row.dest ~= basename(row.src) then
                     destNote = " (as " .. row.dest .. ")"
                 end
-                local line = prefix .. mark .. " " .. row.label .. destNote
-                if i == cursor then
+                line = prefix .. mark .. " " .. row.label .. destNote
+                if onCursor then
                     term.setTextColor(colors.yellow)
-                else
-                    term.setTextColor(colors.white)
-                end
-                print(line)
-            elseif row.kind == "done" then
-                if i == cursor then
+                elseif isOn then
+                    -- Checked items: bright green so picks stand out
                     term.setTextColor(colors.lime)
                 else
-                    term.setTextColor(colors.lightGray)
+                    term.setTextColor(colors.white)
                 end
-                print(prefix .. row.label)
             else
-                if i == cursor then
+                -- Folders, .., and DONE: white (not gray), yellow when focused
+                line = prefix .. row.label
+                if onCursor then
                     term.setTextColor(colors.yellow)
                 else
                     term.setTextColor(colors.white)
                 end
-                print(prefix .. row.label)
             end
+
+            if #line > w then
+                line = string.sub(line, 1, w)
+            end
+            print(line)
         end
         term.setTextColor(colors.white)
         return rows
@@ -328,7 +369,8 @@ local function runSetup(catalog, existingCfg)
             local row = rows[cursor]
             if row.kind == "file" then
                 if isProtectedDest(row.dest) then
-                    term.setCursorPos(1, term.getSize())
+                    local _, th = term.getSize()
+                    term.setCursorPos(1, th)
                     term.clearLine()
                     term.setTextColor(colors.red)
                     write("Protected: " .. row.dest)
@@ -523,7 +565,6 @@ local function main(args)
             return
         end
         if not runSetup(catalog, cfg) then
-            -- Keep old config; still pull if we have one
             cfg = loadConfig()
             if not cfg then
                 return
@@ -537,7 +578,6 @@ local function main(args)
         end
     end
 
-    -- Skip self-update when forcing setup so we don't race with a fresh install write
     if not forceSetup then
         local suOk, suMsg = selfUpdate()
         if suOk and suMsg == "updated" then
