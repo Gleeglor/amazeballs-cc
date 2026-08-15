@@ -218,4 +218,126 @@ function drive.followPath(control, waypoints, opts)
     end
 end
 
+--- Keyboard teleop until quitKey (default keys.q). Held keys drive axes.
+-- opts.recordName = if set, also sample waypoints and save on exit
+-- opts.interval = record sample interval (default 0.25)
+-- @return waypoints table or nil, reason string
+function drive.manualLoop(control, opts)
+    opts = opts or {}
+    control = control or drive.loadControl()
+    if not control or type(control.relays) ~= "table" then
+        return nil, "no boat_control.json (run calibrate first)"
+    end
+
+    local quitKey = opts.quit_key or keys.q
+    local interval = opts.interval or 0.25
+    local recordName = opts.recordName
+    local held = {}
+    local waypoints = {}
+    local t0 = os.clock()
+    local lastSample = 0
+    local stop = false
+
+    print("Manual control (hold keys):")
+    print("  W/S  forward / reverse")
+    print("  A/D  steer left / right")
+    print("  Z/C  strafe left / right")
+    print("  X    all stop")
+    print("  Q    quit" .. (recordName and (" + save path '" .. recordName .. "'") or ""))
+    print()
+
+    local function refreshAxes()
+        drive.setAxis(control, "thrust_forward", held[keys.w] == true)
+        drive.setAxis(control, "thrust_reverse", held[keys.s] == true)
+        drive.setAxis(control, "steer_left", held[keys.a] == true)
+        drive.setAxis(control, "steer_right", held[keys.d] == true)
+        drive.setAxis(control, "strafe_left", held[keys.z] == true)
+        drive.setAxis(control, "strafe_right", held[keys.c] == true)
+    end
+
+    local function onKey(key, isHeld)
+        if key == quitKey then
+            stop = true
+            return
+        end
+        if key == keys.x then
+            held = {}
+            drive.allOff(control)
+            return
+        end
+        if key == keys.w or key == keys.s or key == keys.a or key == keys.d
+            or key == keys.z or key == keys.c then
+            held[key] = isHeld or nil
+            -- mutually exclusive pairs
+            if key == keys.w and isHeld then
+                held[keys.s] = nil
+            elseif key == keys.s and isHeld then
+                held[keys.w] = nil
+            elseif key == keys.a and isHeld then
+                held[keys.d] = nil
+            elseif key == keys.d and isHeld then
+                held[keys.a] = nil
+            elseif key == keys.z and isHeld then
+                held[keys.c] = nil
+            elseif key == keys.c and isHeld then
+                held[keys.z] = nil
+            end
+            refreshAxes()
+        end
+    end
+
+    while not stop do
+        local timerId = os.startTimer(recordName and interval or 0.1)
+        while true do
+            local ev = { os.pullEvent() }
+            if ev[1] == "key" then
+                onKey(ev[2], true)
+                if stop then
+                    break
+                end
+            elseif ev[1] == "key_up" then
+                onKey(ev[2], false)
+            elseif ev[1] == "timer" and ev[2] == timerId then
+                break
+            end
+        end
+        if stop then
+            break
+        end
+        if recordName then
+            local now = os.clock()
+            if now - lastSample >= interval * 0.9 then
+                lastSample = now
+                local ok, wp = pcall(path.sampleWaypoint, t0)
+                if ok and wp then
+                    waypoints[#waypoints + 1] = wp
+                    if #waypoints % 20 == 0 then
+                        print("  recorded #" .. #waypoints)
+                    end
+                end
+            end
+        end
+    end
+
+    drive.allOff(control)
+
+    if recordName then
+        if #waypoints < 2 then
+            return waypoints, "too few waypoints"
+        end
+        local last = waypoints[#waypoints]
+        local ok, err = path.save(recordName, waypoints, {
+            samples = #waypoints,
+            duration = os.clock() - t0,
+            end_pose = { x = last.x, y = last.y, z = last.z, yaw = last.yaw },
+            recorded_with = "manual",
+        })
+        if not ok then
+            return waypoints, tostring(err)
+        end
+        return waypoints, "saved"
+    end
+    return nil, "ok"
+end
+
 return drive

@@ -169,7 +169,7 @@ end
 
 local function menu(cfg)
     print("Boat " .. cfg.boat_id)
-    print("Commands: run | follow <path> | dock <port_id> | list | quit")
+    print("Commands: control | record <name> | run | follow <path> | dock <port> | list | pose | quit")
     while true do
         write("> ")
         local line = read()
@@ -178,12 +178,25 @@ local function menu(cfg)
         end
         local cmd, a = string.match(line, "^(%S+)%s*(.*)$")
         cmd = cmd and string.lower(cmd) or ""
+        a = a and string.match(a, "^%s*(.-)%s*$") or ""
         if cmd == "quit" or cmd == "exit" then
             drive.allOff()
             break
         elseif cmd == "list" then
             for _, n in ipairs(path.list()) do
                 print("  " .. n)
+            end
+        elseif cmd == "control" or cmd == "manual" then
+            local _, reason = drive.manualLoop(drive.loadControl(), {})
+            print("Control ended (" .. tostring(reason) .. ")")
+        elseif cmd == "record" then
+            local name = (a ~= "" and a) or "route"
+            print("Recording '" .. name .. "' while you drive...")
+            local wps, reason = drive.manualLoop(drive.loadControl(), { recordName = name })
+            if reason == "saved" then
+                print("Saved " .. #wps .. " waypoints to " .. path.file(name))
+            else
+                print("Record ended: " .. tostring(reason))
             end
         elseif cmd == "follow" and a ~= "" then
             followNamed(a)
@@ -195,23 +208,38 @@ local function menu(cfg)
             local p = pose.get()
             print(string.format("pos=%.2f,%.2f,%.2f yaw=%.1fdeg", p.position.x, p.position.y, p.position.z, pose.yawDeg(p.yaw)))
         else
-            print("Unknown. run | follow <path> | dock <port> | list | pose | quit")
+            print("Unknown. control | record <name> | run | follow <path> | dock <port> | list | pose | quit")
         end
     end
 end
 
 -- main
 local cfg = loadConfig()
-if not protocol.open() then
-    print("No wireless modem")
-    return
+local hasModem = protocol.open()
+if hasModem then
+    protocol.host(cfg.boat_id)
+    print("Boat host: " .. cfg.boat_id)
+else
+    print("No wireless modem (ok for control/record/follow; needed for docks)")
 end
-protocol.host(cfg.boat_id)
-print("Boat host: " .. cfg.boat_id)
 
 local args = { ... }
 if args[1] == "run" then
+    if not hasModem then
+        print("Wireless modem required for run")
+        return
+    end
     runRoute(cfg)
+elseif args[1] == "control" or args[1] == "manual" then
+    drive.manualLoop(drive.loadControl(), {})
+elseif args[1] == "record" then
+    local name = args[2] or "route"
+    local wps, reason = drive.manualLoop(drive.loadControl(), { recordName = name })
+    if reason == "saved" then
+        print("Saved " .. #wps .. " waypoints to " .. path.file(name))
+    else
+        print("Record ended: " .. tostring(reason))
+    end
 else
     menu(cfg)
 end
