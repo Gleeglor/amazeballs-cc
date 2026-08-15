@@ -154,13 +154,18 @@ local function writeMotorRpm(name, rpm)
     end)
     if ok then
         motorSent[name] = rpm
-        lastMotorFlushAt = os.clock()
+        -- Stops do not advance the non-zero anti-spam clock (burst zero all thrusters)
+        if math.abs(rpm) >= 1 then
+            lastMotorFlushAt = os.clock()
+        end
         return true
     end
     if err and not string.find(tostring(err), "Anti Spam") then
         motorWrapCache[name] = nil
     end
-    lastMotorFlushAt = os.clock()
+    if math.abs(rpm) >= 1 then
+        lastMotorFlushAt = os.clock()
+    end
     return false
 end
 
@@ -173,10 +178,7 @@ function drive.setMotorRpm(name, rpm)
     return true
 end
 
---- Fast stop: only calibrated thrusters / queued motors (no network scan).
--- Full getNames()+getRPM scan was freezing input for 1–2s on every key release.
-function drive.hardStopThrusters(control)
-    control = control or drive.loadControl()
+local function collectThrusterMotorNames(control)
     local names = {}
     local seen = {}
     local function add(name)
@@ -189,9 +191,6 @@ function drive.hardStopThrusters(control)
         if type(control.thrusters) == "table" then
             for _, t in ipairs(control.thrusters) do
                 add(t.name)
-                if t.kind ~= "motor" then
-                    drive.setActuator(control, t, 0)
-                end
             end
         end
         if type(control.unused) == "table" then
@@ -203,41 +202,50 @@ function drive.hardStopThrusters(control)
     for name, _ in pairs(motorDesired) do
         add(name)
     end
-    for _, name in ipairs(names) do
-        motorDesired[name] = 0
-        -- Must NOT mark sent=0 unless write succeeds (anti-spam used to fake-success)
-        motorSent[name] = nil
-    end
-    -- Non-blocking: sleep() uses pullEvent("timer") and DISCARDS key/key_up (sticky tap bug).
-    -- Prefer stops; remaining zeros are finished by flushMotors on the teleop tick.
-    drive.flushMotors(8)
+    return names
 end
 
---- Panic stop for X: zero known thrusters hard, no sleeps (sleep drops key events).
+--- Zero every known thruster motor immediately (bypass flush gap for stops).
+-- Fixes W-release leaving yaw-cancel “stabilizer” motors spinning.
+function drive.forceStopAllThrusters(control)
+    control = control or drive.loadControl()
+    if type(control) == "table" and type(control.thrusters) == "table" then
+        for _, t in ipairs(control.thrusters) do
+            if t.kind ~= "motor" then
+                drive.setActuator(control, t, 0)
+            end
+        end
+    end
+    local names = collectThrusterMotorNames(control)
+    table.sort(names)
+    for _, name in ipairs(names) do
+        motorDesired[name] = 0
+        motorSent[name] = nil
+        writeMotorRpm(name, 0)
+    end
+end
+
+--- Fast stop: calibrated thrusters / queued motors (no network scan).
+function drive.hardStopThrusters(control)
+    drive.forceStopAllThrusters(control)
+end
+
+--- Panic stop for X: same force-stop + clear wrap cache for retries.
 function drive.panicStop(control)
-    drive.hardStopThrusters(control)
-    -- One more forced pass: invalidate sent cache so zeros retry on next flushes
+    control = control or drive.loadControl()
     if type(control) == "table" and type(control.thrusters) == "table" then
         for _, t in ipairs(control.thrusters) do
             if t.name then
-                motorDesired[t.name] = 0
-                motorSent[t.name] = nil
                 motorWrapCache[t.name] = nil
             end
         end
     end
     if type(control) == "table" and type(control.unused) == "table" then
         for _, name in ipairs(control.unused) do
-            motorDesired[name] = 0
-            motorSent[name] = nil
             motorWrapCache[name] = nil
         end
     end
-    for _ = 1, 16 do
-        if drive.flushMotors(1) < 1 then
-            break
-        end
-    end
+    drive.forceStopAllThrusters(control)
 end
 
 --- Cap control file RPM fields to the hard max (mutates in-memory config).
@@ -343,15 +351,17 @@ function drive.flushMotors(budget)
         if sent >= budget then
             return false
         end
-        if (now - lastMotorFlushAt) < MOTOR_FLUSH_GAP and sent == 0 then
-            -- need to wait globally; caller should retry next tick
-            return false
-        end
-        -- After first success in this flush, still respect gap via lastMotorFlushAt
-        if sent > 0 and (os.clock() - lastMotorFlushAt) < MOTOR_FLUSH_GAP then
-            return false
-        end
         local want = motorDesired[name]
+        local isStop = (want or 0) == 0
+        -- Stops bypass anti-spam gap so all stabilizer motors zero on release
+        if not isStop then
+            if (now - lastMotorFlushAt) < MOTOR_FLUSH_GAP and sent == 0 then
+                return false
+            end
+            if sent > 0 and (os.clock() - lastMotorFlushAt) < MOTOR_FLUSH_GAP then
+                return false
+            end
+        end
         if writeMotorRpm(name, want) then
             sent = sent + 1
             now = os.clock()
@@ -663,12 +673,14 @@ function drive.applyReassembly(control, fx, fy, tz)
     -- Cost weights (sqrt applied below): boost nulling of uncommanded axes
     -- only for pure-axis commands so surge (W) isn't crushed by yaw-coupling.
     local axW = { 1.0, 1.0, 1.0 }
+    local dutyDeadband = 0.06
     if math.abs(fy) >= 0.5 and math.abs(fx) + math.abs(tz) < 0.25 then
         -- Strafe: kill CoM yaw couple (and leftover surge)
         axW = { 2.8, 1.0, 5.5 }
     elseif math.abs(fx) >= 0.5 and math.abs(fy) + math.abs(tz) < 0.25 then
-        -- Surge: modest yaw null so W still pushes hard
-        axW = { 1.0, 2.5, 3.0 }
+        -- Surge: prefer strong fx thrusters; harder deadband drops tiny cancel duties
+        axW = { 1.0, 2.8, 3.5 }
+        dutyDeadband = 0.10
     elseif math.abs(tz) >= 0.5 and math.abs(fx) + math.abs(fy) < 0.25 then
         -- Yaw: kill leftover translation
         axW = { 2.8, 2.8, 1.0 }
@@ -738,7 +750,7 @@ function drive.applyReassembly(control, fx, fy, tz)
 
     for i, t in ipairs(thrusters) do
         local duty = util.clamp(u[i] or 0, (t.kind == "motor") and -1 or 0, 1)
-        if math.abs(duty) < 0.06 then
+        if math.abs(duty) < dutyDeadband then
             duty = 0
         end
         drive.setActuator(control, t, duty)
@@ -1189,7 +1201,6 @@ function drive.manualLoop(control, opts)
     local stop = false
     local wrenchMode = drive.isWrenchMode(control)
     local lastIdleStopAt = 0
-    local lastApplyAt = 0
     local CHORD_GRACE = 0.15
 
     local YAW_L = { [keys.a] = true, [keys.left] = true, [keys.j] = true }
@@ -1263,17 +1274,13 @@ function drive.manualLoop(control, opts)
     end
 
     local lastCmd = { fx = 0, fy = 0, tz = 0 }
-    local function cmdEqual(a, b)
-        return a.fx == b.fx and a.fy == b.fy and a.tz == b.tz
-    end
 
     local function applyThrust()
         local cmd = commandFromKeys()
         if cmd.fx == 0 and cmd.fy == 0 and cmd.tz == 0 then
-            drive.hardStopThrusters(control)
+            drive.forceStopAllThrusters(control)
             lastIdleStopAt = os.clock()
             lastCmd = { fx = 0, fy = 0, tz = 0 }
-            lastApplyAt = os.clock()
             return
         end
         if wrenchMode then
@@ -1287,15 +1294,19 @@ function drive.manualLoop(control, opts)
             drive.setAxis(control, "strafe_right", cmd.fy > 0)
         end
         lastCmd = { fx = cmd.fx, fy = cmd.fy, tz = cmd.tz }
-        lastApplyAt = os.clock()
     end
 
     local function flushPendingUps()
         local now = os.clock()
+        local changed = false
         for key, at in pairs(pendingUp) do
             if now >= at then
                 forgetKey(key)
+                changed = true
             end
+        end
+        if changed then
+            applyThrust()
         end
     end
 
@@ -1304,7 +1315,7 @@ function drive.manualLoop(control, opts)
         while true do
             local ev = { os.pullEventRaw() }
             if ev[1] == "terminate" then
-                drive.hardStopThrusters(control)
+                drive.forceStopAllThrusters(control)
                 error("Terminated", 0)
             elseif ev[1] == "key" then
                 local key, isRepeat = ev[2], ev[3] and true or false
@@ -1316,6 +1327,7 @@ function drive.manualLoop(control, opts)
                         down[key] = true
                         if not isRepeat then
                             clearOpposites(key)
+                            applyThrust() -- snappy press
                         end
                     end
                 elseif (not isRepeat) and key == quitKey then
@@ -1332,11 +1344,12 @@ function drive.manualLoop(control, opts)
             elseif ev[1] == "key_up" then
                 local key = ev[2]
                 if MOVE[key] then
-                    -- Chord: defer clear (CC spuriously ups held keys). Solo: clear now.
+                    -- Chord: defer clear (CC spuriously ups held keys). Solo: clear + stop now.
                     if otherMoveDown(key) then
                         pendingUp[key] = os.clock() + CHORD_GRACE
                     else
                         forgetKey(key)
+                        applyThrust() -- snappy release / full force-stop when idle
                     end
                 end
             elseif ev[1] == "timer" and ev[2] == timerId then
@@ -1345,22 +1358,17 @@ function drive.manualLoop(control, opts)
         end
         if stop then break end
 
+        -- Tick: chord grace + drain any pending stop/thrust writes (no full realloc while held)
         flushPendingUps()
 
         local cmd = commandFromKeys()
         local idle = cmd.fx == 0 and cmd.fy == 0 and cmd.tz == 0
         if idle then
-            if not cmdEqual(cmd, lastCmd) or drive.motorsPending()
-                or (os.clock() - lastIdleStopAt) >= 0.2 then
-                applyThrust()
+            if drive.motorsPending() or (os.clock() - lastIdleStopAt) >= 0.25 then
+                drive.forceStopAllThrusters(control)
+                lastIdleStopAt = os.clock()
+                lastCmd = { fx = 0, fy = 0, tz = 0 }
             end
-        elseif not cmdEqual(cmd, lastCmd) or (os.clock() - lastApplyAt) >= 0.25 then
-            -- Re-assert while held so X / anti-spam can't leave motors dead
-            applyThrust()
-        end
-
-        if idle then
-            drive.flushMotors(8)
         else
             drive.flushMotors(4)
         end
@@ -1378,7 +1386,7 @@ function drive.manualLoop(control, opts)
     end
 
     down = {}
-    drive.hardStopThrusters(control)
+    drive.forceStopAllThrusters(control)
 
     if recordName then
         if #waypoints < 2 then
