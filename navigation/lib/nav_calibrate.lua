@@ -186,7 +186,7 @@ function calibrate.run(opts)
             print("  +RPM ...")
             local wPlus = measureActuator(a, pulse, probeControl, probeRpm)
             print(string.format("    +  fx=%.3f fy=%.3f tz=%.3f", wPlus.fx, wPlus.fy, wPlus.tz))
-            sleep(0.15)
+            sleep(math.max(0.45, settle)) -- let yaw rate die before reverse probe
             print("  -RPM ...")
             local wMinus = measureActuator(a, pulse, probeControl, -probeRpm)
             print(string.format("    -  fx=%.3f fy=%.3f tz=%.3f", wMinus.fx, wMinus.fy, wMinus.tz))
@@ -195,20 +195,22 @@ function calibrate.run(opts)
             local minusOk = wMinus.mag >= linFloor or math.abs(wMinus.tz) >= yawFloor
 
             if plusOk and minusOk then
-                -- Best estimate of +1 duty effect: average of +rpm and opposite of -rpm
+                -- Use +RPM wrench as the +duty map. Averaging with -RPM was
+                -- cancelling yaw (tz) when the hull was still spinning from the
+                -- forward pulse — that made A/D "do nothing".
                 w = {
                     name = a.name,
                     kind = "motor",
                     max_rpm = a.max_rpm or probeRpm,
                     rpm_sign = 1,
                     reversible = true,
-                    fx = 0.5 * (wPlus.fx - wMinus.fx),
-                    fy = 0.5 * (wPlus.fy - wMinus.fy),
-                    tz = 0.5 * (wPlus.tz - wMinus.tz),
+                    fx = wPlus.fx,
+                    fy = wPlus.fy,
+                    tz = wPlus.tz,
                 }
                 local dot = wPlus.fx * wMinus.fx + wPlus.fy * wMinus.fy + wPlus.tz * wMinus.tz
                 local revOk = dot < -0.2 * (wPlus.mag * wMinus.mag + 1e-6)
-                print(revOk and "  reverse: OK (opposes forward)" or "  reverse: weak/asymmetric (still usable)")
+                print(revOk and "  reverse: OK (opposes forward)" or "  reverse: weak/asymmetric (signed duty still allowed)")
             elseif plusOk then
                 w = {
                     name = a.name,

@@ -703,12 +703,13 @@ function drive.manualLoop(control, opts)
     local lastSample = 0
     local stop = false
     local wrenchMode = drive.isWrenchMode(control)
-    local lastCmdKey = "000"
-    local KEY_UP_DEBOUNCE = 0.14
+    local lastCmdKey = "0,0,0"
+    local KEY_UP_DEBOUNCE = 0.18
 
     local function isMoveKey(key)
         return key == keys.w or key == keys.s or key == keys.a or key == keys.d
             or key == keys.z or key == keys.c
+            or key == keys.left or key == keys.right
     end
 
     local function clearOpposite(key)
@@ -718,12 +719,16 @@ function drive.manualLoop(control, opts)
         elseif key == keys.s then
             held[keys.w] = nil
             pendingUp[keys.w] = nil
-        elseif key == keys.a then
+        elseif key == keys.a or key == keys.left then
             held[keys.d] = nil
+            held[keys.right] = nil
             pendingUp[keys.d] = nil
-        elseif key == keys.d then
+            pendingUp[keys.right] = nil
+        elseif key == keys.d or key == keys.right then
             held[keys.a] = nil
+            held[keys.left] = nil
             pendingUp[keys.a] = nil
+            pendingUp[keys.left] = nil
         elseif key == keys.z then
             held[keys.c] = nil
             pendingUp[keys.c] = nil
@@ -746,7 +751,7 @@ function drive.manualLoop(control, opts)
 
     print("Manual control (hold keys):")
     print("  W/S  forward / reverse")
-    print("  A/D  yaw left / right")
+    print("  A/D or arrows  yaw left / right")
     print("  Z/C  strafe left / right")
     print("  X    all stop")
     print("  Q    quit" .. (recordName and (" + save path '" .. recordName .. "'") or ""))
@@ -762,13 +767,16 @@ function drive.manualLoop(control, opts)
     local function commandFromKeys()
         local fx = (held[keys.w] and 1 or 0) + (held[keys.s] and -1 or 0)
         local fy = (held[keys.c] and 1 or 0) + (held[keys.z] and -1 or 0)
-        local tz = (held[keys.a] and 1 or 0) + (held[keys.d] and -1 or 0)
+        local yawL = (held[keys.a] or held[keys.left]) and 1 or 0
+        local yawR = (held[keys.d] or held[keys.right]) and 1 or 0
+        local tz = yawL - yawR
         return { fx = fx, fy = fy, tz = tz }
     end
 
     local function applyCommand()
         local cmd = commandFromKeys()
-        local cmdKey = string.format("%d%d%d", cmd.fx, cmd.fy, cmd.tz)
+        -- Commas avoid ambiguous keys like "00-1"
+        local cmdKey = string.format("%d,%d,%d", cmd.fx, cmd.fy, cmd.tz)
         if cmdKey == lastCmdKey then
             return
         end
@@ -810,7 +818,7 @@ function drive.manualLoop(control, opts)
             pendingUp = {}
             lastCmdKey = "xxx"
             drive.allOff(control)
-            lastCmdKey = "000"
+            lastCmdKey = "0,0,0"
         end
     end
 
