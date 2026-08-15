@@ -4,25 +4,13 @@
   "tree": {
     "cannon": {
       "hub.lua": {
-        "label": "hub (command computer)"
+        "label": "hub - command computer"
       },
       "fire.lua": {
-        "label": "fire (cannon fire computer)"
+        "label": "fire - fire computer"
       },
       "ammo.lua": {
-        "label": "ammo (reload turtle)"
-      },
-      "startup_hub.lua": {
-        "dest": "autorun.lua",
-        "label": "hub boot -> autorun.lua"
-      },
-      "startup_fire.lua": {
-        "dest": "autorun.lua",
-        "label": "fire boot -> autorun.lua"
-      },
-      "startup_ammo.lua": {
-        "dest": "autorun.lua",
-        "label": "ammo boot -> autorun.lua"
+        "label": "ammo - reload turtle"
       }
     },
     "navigation": {}

@@ -54,15 +54,15 @@ After **Done**, pick which downloaded program to run on boot (or `0` for none). 
 
 ## Roles (cannon)
 
-Typical selections:
+The `cannon/` folder lists **3 scripts** (one per computer role). Pick the script for that machine, then choose it as the boot program:
 
 | Computer | Select | Boot program |
 |----------|--------|--------------|
-| Hub | `cannon/hub.lua` + `cannon/startup_hub.lua` | `autorun` |
-| Fire | `cannon/fire.lua` + `cannon/startup_fire.lua` | `autorun` |
-| Ammo turtle | `cannon/ammo.lua` + `cannon/startup_ammo.lua` | `autorun` |
+| Hub | `hub.lua` | `hub` |
+| Fire | `fire.lua` | `fire` |
+| Ammo turtle | `ammo.lua` | `ammo` |
 
-Role startups install as **`autorun.lua`**, never as `startup.lua`, so they cannot overwrite the updater boot chain.
+`startup.lua` is owned by the installer (updater chain). Your role program is started via the boot choice in setup (`run` in `/cc_update.json`), not by separate autorun helper files.
 
 ## Keep scripts up to date (author)
 

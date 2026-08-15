@@ -280,9 +280,10 @@ local function runSetup(catalog, existingCfg)
             local prefix = (i == cursor) and "> " or "  "
             if row.kind == "file" then
                 local mark = selected[row.src] and "[x]" or "[ ]"
+                -- Only show dest when it differs from the file basename (rare).
                 local destNote = ""
-                if row.dest ~= row.name then
-                    destNote = " -> " .. row.dest
+                if row.dest ~= row.name and row.dest ~= basename(row.src) then
+                    destNote = " (as " .. row.dest .. ")"
                 end
                 local line = prefix .. mark .. " " .. row.label .. destNote
                 if i == cursor then
