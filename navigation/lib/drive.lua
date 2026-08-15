@@ -1,4 +1,4 @@
--- Drive relays from /boat_control.json using pose errors (cruise + dock-assist).
+-- Drive: Reassembly-style wrench allocation over calibrated thrusters.
 local util = require("util")
 local pose = require("pose")
 local path = require("path")
@@ -6,7 +6,7 @@ local path = require("path")
 local drive = {}
 local CONTROL_PATH = "/boat_control.json"
 
-local AXES = {
+local LEGACY_AXES = {
     "thrust_forward",
     "thrust_reverse",
     "strafe_left",
@@ -24,8 +24,12 @@ function drive.saveControl(data)
 end
 
 local function setRelay(name, on)
-    if not peripheral.isPresent(name) then
+    if not name or not peripheral.isPresent(name) then
         return false
+    end
+    if string.sub(name, 1, 5) == "side:" then
+        rs.setAnalogOutput(string.sub(name, 6), on and 15 or 0)
+        return true
     end
     local r = peripheral.wrap(name)
     if not r then
@@ -52,16 +56,31 @@ local function setRelay(name, on)
     return false
 end
 
+function drive.isWrenchMode(control)
+    control = control or drive.loadControl()
+    return control
+        and (control.mode == "wrench" or control.version == 2)
+        and type(control.thrusters) == "table"
+        and #control.thrusters > 0
+end
+
 function drive.allOff(control)
     control = control or drive.loadControl()
-    if not control or type(control.relays) ~= "table" then
+    if not control then
         return
     end
-    for _, axis in ipairs(AXES) do
-        local list = control.relays[axis]
-        if type(list) == "table" then
-            for _, name in ipairs(list) do
-                setRelay(name, false)
+    if type(control.thrusters) == "table" then
+        for _, t in ipairs(control.thrusters) do
+            setRelay(t.name, false)
+        end
+    end
+    if type(control.relays) == "table" then
+        for _, axis in ipairs(LEGACY_AXES) do
+            local list = control.relays[axis]
+            if type(list) == "table" then
+                for _, name in ipairs(list) do
+                    setRelay(name, false)
+                end
             end
         end
     end
@@ -94,6 +113,76 @@ function drive.applySigned(control, posAxis, negAxis, cmd, deadband)
     end
 end
 
+local function dotW(weights, a, b)
+    local wx = (weights and weights.fx) or 1
+    local wy = (weights and weights.fy) or 1
+    local wz = (weights and weights.tz) or 1
+    return wx * a.fx * b.fx + wy * a.fy * b.fy + wz * a.tz * b.tz
+end
+
+local function wrenchLen2(weights, w)
+    return dotW(weights, w, w)
+end
+
+--- Greedy allocate thrusters for desired wrench (Reassembly-like).
+-- Activates a combination: e.g. two side props for pure strafe (torques cancel).
+function drive.applyWrench(control, fx, fy, tz)
+    control = control or drive.loadControl()
+    if not drive.isWrenchMode(control) then
+        return false
+    end
+
+    local desired = { fx = fx or 0, fy = fy or 0, tz = tz or 0 }
+    local desMag = math.sqrt(desired.fx ^ 2 + desired.fy ^ 2 + desired.tz ^ 2)
+    if desMag < 1e-4 then
+        drive.allOff(control)
+        return true
+    end
+
+    local weights = control.weights or { fx = 1, fy = 1, tz = 1.4 }
+    local threshold = control.alloc_threshold or 0.12
+    local rounds = control.alloc_rounds or math.min(8, #control.thrusters)
+    local remaining = { fx = desired.fx, fy = desired.fy, tz = desired.tz }
+    local chosen = {}
+    local used = {}
+
+    for _ = 1, rounds do
+        local bestI, bestScore = nil, threshold
+        for i, t in ipairs(control.thrusters) do
+            if not used[i] then
+                local score = dotW(weights, remaining, t)
+                -- Prefer thrusters aligned with what we still need
+                local tMag = t.mag or math.sqrt(t.fx * t.fx + t.fy * t.fy + t.tz * t.tz)
+                if tMag > 1e-6 then
+                    score = score / (0.35 + tMag)
+                end
+                if score > bestScore then
+                    bestScore = score
+                    bestI = i
+                end
+            end
+        end
+        if not bestI then
+            break
+        end
+        used[bestI] = true
+        chosen[bestI] = true
+        local t = control.thrusters[bestI]
+        local denom = wrenchLen2(weights, t)
+        if denom > 1e-8 then
+            local alpha = util.clamp(dotW(weights, remaining, t) / denom, 0, 1.5)
+            remaining.fx = remaining.fx - alpha * t.fx
+            remaining.fy = remaining.fy - alpha * t.fy
+            remaining.tz = remaining.tz - alpha * t.tz
+        end
+    end
+
+    for i, t in ipairs(control.thrusters) do
+        setRelay(t.name, chosen[i] == true)
+    end
+    return true
+end
+
 local function simplePid(state, err, kp, ki, kd, dt, outMin, outMax)
     state.integral = (state.integral or 0) + err * dt
     local deriv = (err - (state.prev or 0)) / math.max(dt, 1e-3)
@@ -106,7 +195,6 @@ function drive.newPidStates()
     return { forward = {}, yaw = {}, right = {} }
 end
 
---- One control step toward a waypoint. mode = "cruise" | "dock".
 function drive.stepToward(control, target, mode, pidStates, dt)
     control = control or drive.loadControl()
     pidStates = pidStates or drive.newPidStates()
@@ -142,14 +230,17 @@ function drive.stepToward(control, target, mode, pidStates, dt)
         strafeCmd = 0
     end
 
-    drive.applySigned(control, "thrust_forward", "thrust_reverse", fwdCmd)
-    drive.applySigned(control, "steer_left", "steer_right", yawCmd)
-    if mode == "dock" then
-        -- err.right > 0 → target is to craft-right → strafe_right
-        drive.applySigned(control, "strafe_right", "strafe_left", strafeCmd)
+    if drive.isWrenchMode(control) then
+        drive.applyWrench(control, fwdCmd, strafeCmd, yawCmd)
     else
-        drive.setAxis(control, "strafe_left", false)
-        drive.setAxis(control, "strafe_right", false)
+        drive.applySigned(control, "thrust_forward", "thrust_reverse", fwdCmd)
+        drive.applySigned(control, "steer_left", "steer_right", yawCmd)
+        if mode == "dock" then
+            drive.applySigned(control, "strafe_right", "strafe_left", strafeCmd)
+        else
+            drive.setAxis(control, "strafe_left", false)
+            drive.setAxis(control, "strafe_right", false)
+        end
     end
 
     local tolPos = dock.tol_pos or 0.35
@@ -167,7 +258,6 @@ function drive.stepToward(control, target, mode, pidStates, dt)
     return err, arrived
 end
 
---- Follow waypoints; near last point use dock-assist.
 function drive.followPath(control, waypoints, opts)
     opts = opts or {}
     control = control or drive.loadControl()
@@ -218,14 +308,13 @@ function drive.followPath(control, waypoints, opts)
     end
 end
 
---- Keyboard teleop until quitKey (default keys.q). Held keys drive axes.
--- opts.recordName = if set, also sample waypoints and save on exit
--- opts.interval = record sample interval (default 0.25)
--- @return waypoints table or nil, reason string
 function drive.manualLoop(control, opts)
     opts = opts or {}
     control = control or drive.loadControl()
-    if not control or type(control.relays) ~= "table" then
+    if not control then
+        return nil, "no boat_control.json (run calibrate first)"
+    end
+    if not drive.isWrenchMode(control) and type(control.relays) ~= "table" then
         return nil, "no boat_control.json (run calibrate first)"
     end
 
@@ -237,22 +326,34 @@ function drive.manualLoop(control, opts)
     local t0 = os.clock()
     local lastSample = 0
     local stop = false
+    local wrenchMode = drive.isWrenchMode(control)
 
     print("Manual control (hold keys):")
     print("  W/S  forward / reverse")
-    print("  A/D  steer left / right")
+    print("  A/D  yaw left / right")
     print("  Z/C  strafe left / right")
     print("  X    all stop")
     print("  Q    quit" .. (recordName and (" + save path '" .. recordName .. "'") or ""))
+    if wrenchMode then
+        print("  Mode: Reassembly wrench (" .. #control.thrusters .. " thrusters)")
+        print("  Strafe/turn = combination of props, not single labels")
+    end
     print()
 
-    local function refreshAxes()
-        drive.setAxis(control, "thrust_forward", held[keys.w] == true)
-        drive.setAxis(control, "thrust_reverse", held[keys.s] == true)
-        drive.setAxis(control, "steer_left", held[keys.a] == true)
-        drive.setAxis(control, "steer_right", held[keys.d] == true)
-        drive.setAxis(control, "strafe_left", held[keys.z] == true)
-        drive.setAxis(control, "strafe_right", held[keys.c] == true)
+    local function refresh()
+        local fx = (held[keys.w] and 1 or 0) + (held[keys.s] and -1 or 0)
+        local fy = (held[keys.c] and 1 or 0) + (held[keys.z] and -1 or 0)
+        local tz = (held[keys.a] and 1 or 0) + (held[keys.d] and -1 or 0)
+        if wrenchMode then
+            drive.applyWrench(control, fx, fy, tz)
+        else
+            drive.setAxis(control, "thrust_forward", fx > 0)
+            drive.setAxis(control, "thrust_reverse", fx < 0)
+            drive.setAxis(control, "steer_left", tz > 0)
+            drive.setAxis(control, "steer_right", tz < 0)
+            drive.setAxis(control, "strafe_left", fy < 0)
+            drive.setAxis(control, "strafe_right", fy > 0)
+        end
     end
 
     local function onKey(key, isHeld)
@@ -268,7 +369,6 @@ function drive.manualLoop(control, opts)
         if key == keys.w or key == keys.s or key == keys.a or key == keys.d
             or key == keys.z or key == keys.c then
             held[key] = isHeld or nil
-            -- mutually exclusive pairs
             if key == keys.w and isHeld then
                 held[keys.s] = nil
             elseif key == keys.s and isHeld then
@@ -282,7 +382,7 @@ function drive.manualLoop(control, opts)
             elseif key == keys.c and isHeld then
                 held[keys.z] = nil
             end
-            refreshAxes()
+            refresh()
         end
     end
 

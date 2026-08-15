@@ -1,11 +1,11 @@
--- Auto-map all redstone_relay peripherals by pulsing and reading CC:Sable motion.
--- Writes /boat_control.json — no manual axis assignment.
+-- Auto-map all redstone_relay peripherals (Reassembly / wrench mode).
+-- Writes /boat_control.json — thruster force+torque, not axis labels.
 package.path = package.path .. ";/lib/?.lua;/lib/?/init.lua"
 local calibrate = require("nav_calibrate")
 
-print("=== Boat relay calibrate ===")
+print("=== Boat thruster calibrate (Reassembly-style) ===")
 print("Open water, props submerged, kinetics on.")
-print("Pulsing every redstone_relay on the modem network...")
+print("Each relay is one thruster; we measure push + yaw torque.")
 print()
 
 local control, err = calibrate.run({
@@ -20,20 +20,20 @@ if not control then
 end
 
 print()
-print("Saved /boat_control.json")
-print("Axes:")
-for axis, list in pairs(control.relays) do
-    if type(list) == "table" and #list > 0 then
-        print("  " .. axis .. ": " .. table.concat(list, ", "))
-    end
+print("Saved /boat_control.json  (version " .. tostring(control.version) .. ", mode=" .. tostring(control.mode) .. ")")
+print("Thrusters (" .. #control.thrusters .. "):")
+for _, t in ipairs(control.thrusters) do
+    print(string.format(
+        "  %s  fx=%.3f fy=%.3f tz=%.3f  [%s]",
+        t.name,
+        t.fx,
+        t.fy,
+        t.tz,
+        calibrate.describe(t)
+    ))
 end
-if #control.unused > 0 then
+if control.unused and #control.unused > 0 then
     print("Unused: " .. table.concat(control.unused, ", "))
 end
-if #control.ambiguous > 0 then
-    print("Ambiguous (not driven): " .. table.concat(control.ambiguous, ", "))
-end
-print("Gains: forward=" .. control.gains.forward
-    .. " strafe=" .. control.gains.strafe
-    .. " yaw=" .. control.gains.yaw)
-print("Done. Re-run after rewiring.")
+print("Control will combine thrusters for strafe/turn (not 1 prop = 1 axis).")
+print("Re-run after rewiring. Then: boat -> control")

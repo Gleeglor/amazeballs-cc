@@ -1,4 +1,5 @@
--- Auto-discover redstone_relay peripherals and classify by craft motion.
+-- Reassembly-style thruster ID: pulse each relay, store force/torque wrench.
+-- Modems do NOT expose block position in CC — we infer effect from motion vs CoM.
 local util = require("util")
 local pose = require("pose")
 local drive = require("drive")
@@ -55,8 +56,7 @@ local function allOff(names)
         if string.sub(name, 1, 5) ~= "side:" then
             setRelay(name, false)
         else
-            local side = string.sub(name, 6)
-            rs.setAnalogOutput(side, 0)
+            rs.setAnalogOutput(string.sub(name, 6), 0)
         end
     end
 end
@@ -79,7 +79,6 @@ local function sampleMotion()
     local vel = pose.getVelocity()
     local ang = pose.getAngularVelocity()
     local localV = pose.worldToLocal(vel, craft)
-    -- yaw rate: angular velocity about craft up
     local yawRate = ang.x * craft.up.x + ang.y * craft.up.y + ang.z * craft.up.z
     return {
         forward = localV.forward,
@@ -90,60 +89,27 @@ local function sampleMotion()
     }
 end
 
---- Classify a single probe result into an axis label.
-function calibrate.classify(delta, thresholds)
-    thresholds = thresholds or {}
-    local lin = thresholds.linear or 0.08
-    local yaw = thresholds.yaw or 0.05
-    local ratio = thresholds.mix_ratio or 0.55
+local function wrenchMag(w)
+    return math.sqrt(w.fx * w.fx + w.fy * w.fy + w.tz * w.tz)
+end
 
-    local af = math.abs(delta.forward)
-    local ar = math.abs(delta.right)
-    local ay = math.abs(delta.yaw)
-    local maxLin = math.max(af, ar)
-
-    if maxLin < lin and ay < yaw then
-        return "unused", delta
+--- Describe dominant role for humans (not used for control).
+function calibrate.describe(w)
+    local af, ar, ay = math.abs(w.fx), math.abs(w.fy), math.abs(w.tz)
+    local m = math.max(af, ar, ay)
+    if m < 1e-6 then
+        return "dead"
     end
-
-    -- Ambiguous if strong linear and strong yaw both significant
-    if maxLin >= lin and ay >= yaw and math.min(maxLin, ay) / math.max(maxLin, ay, 1e-6) > ratio then
-        return "ambiguous", delta
+    if ay >= m * 0.55 and ay >= af * 0.8 and ay >= ar * 0.8 then
+        return w.tz > 0 and "mostly yaw+" or "mostly yaw-"
     end
-
-    if ay >= yaw and ay >= maxLin * 0.9 then
-        if delta.yaw > 0 then
-            return "steer_left", delta
-        else
-            return "steer_right", delta
-        end
+    if ar >= m * 0.55 and ar >= af then
+        return w.fy > 0 and "mostly +strafe" or "mostly -strafe"
     end
-
-    if ar >= af and ar >= lin then
-        if delta.right > 0 then
-            return "strafe_right", delta
-        else
-            return "strafe_left", delta
-        end
+    if af >= m * 0.55 then
+        return w.fx > 0 and "mostly +thrust" or "mostly -thrust"
     end
-
-    if af >= lin then
-        if delta.forward > 0 then
-            return "thrust_forward", delta
-        else
-            return "thrust_reverse", delta
-        end
-    end
-
-    if ay >= yaw then
-        if delta.yaw > 0 then
-            return "steer_left", delta
-        else
-            return "steer_right", delta
-        end
-    end
-
-    return "unused", delta
+    return "mixed"
 end
 
 function calibrate.run(opts)
@@ -151,34 +117,35 @@ function calibrate.run(opts)
     local pulse = opts.pulse or 0.6
     local settle = opts.settle or 0.35
     local useSides = opts.use_sides == true
+    local linFloor = (opts.thresholds and opts.thresholds.linear) or 0.05
+    local yawFloor = (opts.thresholds and opts.thresholds.yaw) or 0.03
 
-    print("Calibrate: scanning redstone_relay peripherals...")
+    print("Calibrate (Reassembly / wrench mode)")
+    print("Each relay = one thruster. Motion vs CoM → force + torque.")
+    print("(Modems cannot report block position; we measure effect instead.)")
+    print()
+
     local names = calibrate.listRelays(useSides)
     if #names == 0 then
         return nil, "no redstone_relay peripherals found"
     end
     print("Found " .. #names .. " candidates")
 
-    -- Ensure we can read pose
     local ok, err = pcall(pose.get)
     if not ok then
         return nil, tostring(err)
     end
 
+    local comOk, com = pcall(sublevel.getCenterOfMass)
+    if comOk and com then
+        print(string.format("CoM (world): %.2f, %.2f, %.2f", com.x, com.y, com.z))
+    end
+
     allOff(names)
     sleep(0.2)
 
-    local relays = {
-        thrust_forward = {},
-        thrust_reverse = {},
-        strafe_left = {},
-        strafe_right = {},
-        steer_left = {},
-        steer_right = {},
-    }
+    local thrusters = {}
     local unused = {}
-    local ambiguous = {}
-    local gainsAcc = { forward = {}, strafe = {}, yaw = {} }
 
     for _, name in ipairs(names) do
         print("Probing " .. name .. " ...")
@@ -190,60 +157,73 @@ function calibrate.run(opts)
         local after = sampleMotion()
         allOff(names)
 
-        local delta = {
-            forward = after.forward - before.forward,
-            right = after.right - before.right,
-            up = after.up - before.up,
-            yaw = after.yaw - before.yaw,
+        -- Wrench proxy: Δv_local ≈ force direction; Δω_yaw ≈ torque about CoM
+        local w = {
+            name = name,
+            fx = after.forward - before.forward,
+            fy = after.right - before.right,
+            tz = after.yaw - before.yaw,
         }
-        local label = calibrate.classify(delta, opts.thresholds)
-        print(string.format(
-            "  -> %s  df=%.3f dr=%.3f dyaw=%.3f",
-            label,
-            delta.forward,
-            delta.right,
-            delta.yaw
-        ))
+        w.mag = wrenchMag(w)
 
-        if label == "unused" then
-            unused[#unused + 1] = name
-        elseif label == "ambiguous" then
-            ambiguous[#ambiguous + 1] = name
+        -- Rough lever-arm hint (blocks-ish): τ ≈ r × F → r_perp ≈ tz / |F_horiz|
+        local fHoriz = math.sqrt(w.fx * w.fx + w.fy * w.fy)
+        if fHoriz > linFloor then
+            w.lever_est = w.tz / fHoriz
         else
-            relays[label][#relays[label] + 1] = name
-            if label == "thrust_forward" or label == "thrust_reverse" then
-                gainsAcc.forward[#gainsAcc.forward + 1] = math.abs(delta.forward)
-            elseif label == "strafe_left" or label == "strafe_right" then
-                gainsAcc.strafe[#gainsAcc.strafe + 1] = math.abs(delta.right)
-            elseif label == "steer_left" or label == "steer_right" then
-                gainsAcc.yaw[#gainsAcc.yaw + 1] = math.abs(delta.yaw)
-            end
+            w.lever_est = nil
+        end
+
+        local role = calibrate.describe(w)
+        if w.mag < linFloor and math.abs(w.tz) < yawFloor then
+            unused[#unused + 1] = name
+            print(string.format("  -> unused  fx=%.3f fy=%.3f tz=%.3f", w.fx, w.fy, w.tz))
+        else
+            thrusters[#thrusters + 1] = w
+            local lever = w.lever_est and string.format(" lever~%.2f", w.lever_est) or ""
+            print(string.format(
+                "  -> thruster [%s] fx=%.3f fy=%.3f tz=%.3f%s",
+                role,
+                w.fx,
+                w.fy,
+                w.tz,
+                lever
+            ))
         end
         sleep(0.15)
     end
 
     allOff(names)
 
-    local function avg(t)
-        if #t == 0 then
-            return 1.0
+    if #thrusters == 0 then
+        return nil, "no thrusters responded (props dry / no RPM / clutches open?)"
+    end
+
+    -- Normalize scores so allocation is scale-stable across craft masses
+    local maxMag = 0
+    for _, t in ipairs(thrusters) do
+        if t.mag > maxMag then
+            maxMag = t.mag
         end
-        local s = 0
-        for _, v in ipairs(t) do
-            s = s + v
-        end
-        return s / #t
+    end
+    if maxMag < 1e-6 then
+        maxMag = 1
     end
 
     local control = {
-        version = 1,
-        relays = relays,
+        version = 2,
+        mode = "wrench",
+        thrusters = thrusters,
         unused = unused,
-        ambiguous = ambiguous,
+        -- Prefer yaw a bit so turn commands aren't drowned by big main thrusters
+        weights = { fx = 1.0, fy = 1.0, tz = 1.4 },
+        alloc_threshold = 0.12,
+        alloc_rounds = 8,
         gains = {
-            forward = util.clamp(avg(gainsAcc.forward), 0.2, 3.0),
-            strafe = util.clamp(avg(gainsAcc.strafe), 0.2, 3.0),
-            yaw = util.clamp(avg(gainsAcc.yaw), 0.2, 3.0),
+            forward = 1.0,
+            strafe = 1.0,
+            yaw = 1.0,
+            norm = maxMag,
         },
         dock_assist = {
             engage_distance = 12,
@@ -252,6 +232,15 @@ function calibrate.run(opts)
             tol_yaw_deg = 5,
         },
         calibrated_at = tostring(util.now()),
+        -- legacy empty map so old code paths no-op cleanly
+        relays = {
+            thrust_forward = {},
+            thrust_reverse = {},
+            strafe_left = {},
+            strafe_right = {},
+            steer_left = {},
+            steer_right = {},
+        },
     }
 
     local wrote, werr = drive.saveControl(control)
