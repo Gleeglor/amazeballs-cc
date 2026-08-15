@@ -1,4 +1,4 @@
--- Drive: Reassembly-style wrench allocation over calibrated thrusters.
+-- Drive: Reassembly-style wrench allocation with analog (1-15) + live trim.
 local util = require("util")
 local pose = require("pose")
 local path = require("path")
@@ -23,20 +23,24 @@ function drive.saveControl(data)
     return util.writeJSON(CONTROL_PATH, data)
 end
 
-local function setRelay(name, on)
-    if not name or not peripheral.isPresent(name) then
+--- Set relay analog level 0-15 (0 = off).
+function drive.setRelayLevel(name, level)
+    if not name then
         return false
     end
+    level = math.floor(util.clamp(tonumber(level) or 0, 0, 15) + 0.5)
     if string.sub(name, 1, 5) == "side:" then
-        rs.setAnalogOutput(string.sub(name, 6), on and 15 or 0)
+        rs.setAnalogOutput(string.sub(name, 6), level)
         return true
+    end
+    if not peripheral.isPresent(name) then
+        return false
     end
     local r = peripheral.wrap(name)
     if not r then
         return false
     end
     local sides = { "top", "bottom", "left", "right", "front", "back" }
-    local level = on and 15 or 0
     if r.setAnalogOutput then
         for _, side in ipairs(sides) do
             pcall(function()
@@ -46,6 +50,7 @@ local function setRelay(name, on)
         return true
     end
     if r.setOutput then
+        local on = level > 0
         for _, side in ipairs(sides) do
             pcall(function()
                 r.setOutput(side, on)
@@ -56,10 +61,14 @@ local function setRelay(name, on)
     return false
 end
 
+local function setRelay(name, on)
+    return drive.setRelayLevel(name, on and 15 or 0)
+end
+
 function drive.isWrenchMode(control)
     control = control or drive.loadControl()
     return control
-        and (control.mode == "wrench" or control.version == 2)
+        and (control.mode == "wrench" or (control.version or 0) >= 2)
         and type(control.thrusters) == "table"
         and #control.thrusters > 0
 end
@@ -71,7 +80,7 @@ function drive.allOff(control)
     end
     if type(control.thrusters) == "table" then
         for _, t in ipairs(control.thrusters) do
-            setRelay(t.name, false)
+            drive.setRelayLevel(t.name, 0)
         end
     end
     if type(control.relays) == "table" then
@@ -79,7 +88,7 @@ function drive.allOff(control)
             local list = control.relays[axis]
             if type(list) == "table" then
                 for _, name in ipairs(list) do
-                    setRelay(name, false)
+                    drive.setRelayLevel(name, 0)
                 end
             end
         end
@@ -95,7 +104,7 @@ function drive.setAxis(control, axis, on)
         return
     end
     for _, name in ipairs(list) do
-        setRelay(name, on and true or false)
+        drive.setRelayLevel(name, on and 15 or 0)
     end
 end
 
@@ -124,8 +133,17 @@ local function wrenchLen2(weights, w)
     return dotW(weights, w, w)
 end
 
---- Greedy allocate thrusters for desired wrench (Reassembly-like).
--- Activates a combination: e.g. two side props for pure strafe (torques cancel).
+local function dutyToLevel(u)
+    u = util.clamp(u or 0, 0, 1)
+    if u < 0.04 then
+        return 0
+    end
+    -- Map (0,1] → 1..15 so weak trim still fires a little
+    return math.max(1, math.floor(u * 15 + 0.5))
+end
+
+--- Continuous greedy allocation → analog levels 0-15 per thruster.
+-- Off-center main thrust leaves residual yaw; later thrusters cancel it at partial strength.
 function drive.applyWrench(control, fx, fy, tz)
     control = control or drive.loadControl()
     if not drive.isWrenchMode(control) then
@@ -139,22 +157,33 @@ function drive.applyWrench(control, fx, fy, tz)
         return true
     end
 
-    local weights = control.weights or { fx = 1, fy = 1, tz = 1.4 }
-    local threshold = control.alloc_threshold or 0.12
-    local rounds = control.alloc_rounds or math.min(8, #control.thrusters)
+    -- Scale command magnitude into calibrated wrench units (norm ≈ max thruster mag)
+    local norm = (control.gains and control.gains.norm) or 1
+    if norm < 1e-6 then
+        norm = 1
+    end
+    local scale = desMag * norm
+    desired.fx = (desired.fx / desMag) * scale
+    desired.fy = (desired.fy / desMag) * scale
+    desired.tz = (desired.tz / desMag) * scale
+
+    local weights = control.weights or { fx = 1, fy = 1, tz = 1.6 }
+    local threshold = control.alloc_threshold or 0.08
+    local rounds = control.alloc_rounds or math.min(12, #control.thrusters * 2)
     local remaining = { fx = desired.fx, fy = desired.fy, tz = desired.tz }
-    local chosen = {}
-    local used = {}
+    local u = {}
+    for i = 1, #control.thrusters do
+        u[i] = 0
+    end
 
     for _ = 1, rounds do
         local bestI, bestScore = nil, threshold
         for i, t in ipairs(control.thrusters) do
-            if not used[i] then
+            if u[i] < 0.999 then
                 local score = dotW(weights, remaining, t)
-                -- Prefer thrusters aligned with what we still need
                 local tMag = t.mag or math.sqrt(t.fx * t.fx + t.fy * t.fy + t.tz * t.tz)
                 if tMag > 1e-6 then
-                    score = score / (0.35 + tMag)
+                    score = score / (0.25 + tMag)
                 end
                 if score > bestScore then
                     bestScore = score
@@ -165,22 +194,68 @@ function drive.applyWrench(control, fx, fy, tz)
         if not bestI then
             break
         end
-        used[bestI] = true
-        chosen[bestI] = true
         local t = control.thrusters[bestI]
         local denom = wrenchLen2(weights, t)
-        if denom > 1e-8 then
-            local alpha = util.clamp(dotW(weights, remaining, t) / denom, 0, 1.5)
-            remaining.fx = remaining.fx - alpha * t.fx
-            remaining.fy = remaining.fy - alpha * t.fy
-            remaining.tz = remaining.tz - alpha * t.tz
+        if denom <= 1e-8 then
+            break
         end
+        local alpha = dotW(weights, remaining, t) / denom
+        alpha = util.clamp(alpha, 0, 1 - u[bestI])
+        if alpha < 0.02 then
+            break
+        end
+        u[bestI] = u[bestI] + alpha
+        remaining.fx = remaining.fx - alpha * t.fx
+        remaining.fy = remaining.fy - alpha * t.fy
+        remaining.tz = remaining.tz - alpha * t.tz
     end
 
     for i, t in ipairs(control.thrusters) do
-        setRelay(t.name, chosen[i] == true)
+        drive.setRelayLevel(t.name, dutyToLevel(u[i]))
     end
     return true
+end
+
+--- Live trim: cancel unwanted yaw/strafe rate when command doesn't ask for them.
+-- command = {fx,fy,tz} in -1..1 from keys/PID; returns trimmed wrench command.
+function drive.trimCommand(control, command, trimState, dt)
+    command = command or { fx = 0, fy = 0, tz = 0 }
+    trimState = trimState or {}
+    dt = dt or 0.1
+    control = control or drive.loadControl()
+
+    local fb = (control and control.feedback) or {}
+    local kpYaw = fb.kp_yaw or 1.2
+    local kpLat = fb.kp_lat or 0.8
+    local maxTrim = fb.max_trim or 1.0
+
+    local ok, craft = pcall(pose.get)
+    if not ok then
+        return command, trimState
+    end
+    local vel = pose.getVelocity()
+    local ang = pose.getAngularVelocity()
+    local localV = pose.worldToLocal(vel, craft)
+    local yawRate = ang.x * craft.up.x + ang.y * craft.up.y + ang.z * craft.up.z
+
+    local fx = command.fx or 0
+    local fy = command.fy or 0
+    local tz = command.tz or 0
+
+    -- If pilot/autopilot isn't commanding yaw, kill measured yaw rate
+    if math.abs(tz) < 0.08 then
+        local corr = -kpYaw * yawRate
+        tz = util.clamp(corr, -maxTrim, maxTrim)
+    end
+    -- If not commanding strafe, kill sideways velocity
+    if math.abs(fy) < 0.08 then
+        local corr = -kpLat * localV.right
+        fy = util.clamp(corr, -maxTrim, maxTrim)
+    end
+
+    trimState.yaw_rate = yawRate
+    trimState.lat_vel = localV.right
+    return { fx = fx, fy = fy, tz = tz }, trimState
 end
 
 local function simplePid(state, err, kp, ki, kd, dt, outMin, outMax)
@@ -192,7 +267,7 @@ local function simplePid(state, err, kp, ki, kd, dt, outMin, outMax)
 end
 
 function drive.newPidStates()
-    return { forward = {}, yaw = {}, right = {} }
+    return { forward = {}, yaw = {}, right = {}, trim = {} }
 end
 
 function drive.stepToward(control, target, mode, pidStates, dt)
@@ -231,7 +306,16 @@ function drive.stepToward(control, target, mode, pidStates, dt)
     end
 
     if drive.isWrenchMode(control) then
-        drive.applyWrench(control, fwdCmd, strafeCmd, yawCmd)
+        local cmd = { fx = fwdCmd, fy = strafeCmd, tz = yawCmd }
+        -- Cruise: allow live cancel of unwanted yaw from off-center thrust
+        if mode == "cruise" then
+            cmd, pidStates.trim = drive.trimCommand(control, cmd, pidStates.trim, dt)
+            -- Keep path yaw command if we were actively steering toward bearing
+            if math.abs(yawCmd) >= 0.08 then
+                cmd.tz = yawCmd
+            end
+        end
+        drive.applyWrench(control, cmd.fx, cmd.fy, cmd.tz)
     else
         drive.applySigned(control, "thrust_forward", "thrust_reverse", fwdCmd)
         drive.applySigned(control, "steer_left", "steer_right", yawCmd)
@@ -318,14 +402,21 @@ function drive.manualLoop(control, opts)
         return nil, "no boat_control.json (run calibrate first)"
     end
 
+    -- Defaults for trim (persist into config memory only; optional write)
+    if drive.isWrenchMode(control) and not control.feedback then
+        control.feedback = { kp_yaw = 1.2, kp_lat = 0.8, max_trim = 1.0 }
+    end
+
     local quitKey = opts.quit_key or keys.q
     local interval = opts.interval or 0.25
+    local tick = opts.tick or 0.1
     local recordName = opts.recordName
     local held = {}
     local waypoints = {}
     local t0 = os.clock()
     local lastSample = 0
     local stop = false
+    local trimState = {}
     local wrenchMode = drive.isWrenchMode(control)
 
     print("Manual control (hold keys):")
@@ -335,24 +426,38 @@ function drive.manualLoop(control, opts)
     print("  X    all stop")
     print("  Q    quit" .. (recordName and (" + save path '" .. recordName .. "'") or ""))
     if wrenchMode then
-        print("  Mode: Reassembly wrench (" .. #control.thrusters .. " thrusters)")
-        print("  Strafe/turn = combination of props, not single labels")
+        print("  Analog 1-15 + live yaw/strafe trim (off-center CoM cancel)")
+        print("  Thrusters: " .. #control.thrusters)
     end
     print()
 
-    local function refresh()
+    local function commandFromKeys()
         local fx = (held[keys.w] and 1 or 0) + (held[keys.s] and -1 or 0)
         local fy = (held[keys.c] and 1 or 0) + (held[keys.z] and -1 or 0)
         local tz = (held[keys.a] and 1 or 0) + (held[keys.d] and -1 or 0)
+        return { fx = fx, fy = fy, tz = tz }
+    end
+
+    local function refresh(dt)
+        local cmd = commandFromKeys()
         if wrenchMode then
-            drive.applyWrench(control, fx, fy, tz)
+            local trimmed
+            trimmed, trimState = drive.trimCommand(control, cmd, trimState, dt)
+            -- Keep manual yaw/strafe authority when keys held
+            if math.abs(cmd.tz) >= 0.08 then
+                trimmed.tz = cmd.tz
+            end
+            if math.abs(cmd.fy) >= 0.08 then
+                trimmed.fy = cmd.fy
+            end
+            drive.applyWrench(control, trimmed.fx, trimmed.fy, trimmed.tz)
         else
-            drive.setAxis(control, "thrust_forward", fx > 0)
-            drive.setAxis(control, "thrust_reverse", fx < 0)
-            drive.setAxis(control, "steer_left", tz > 0)
-            drive.setAxis(control, "steer_right", tz < 0)
-            drive.setAxis(control, "strafe_left", fy < 0)
-            drive.setAxis(control, "strafe_right", fy > 0)
+            drive.setAxis(control, "thrust_forward", cmd.fx > 0)
+            drive.setAxis(control, "thrust_reverse", cmd.fx < 0)
+            drive.setAxis(control, "steer_left", cmd.tz > 0)
+            drive.setAxis(control, "steer_right", cmd.tz < 0)
+            drive.setAxis(control, "strafe_left", cmd.fy < 0)
+            drive.setAxis(control, "strafe_right", cmd.fy > 0)
         end
     end
 
@@ -382,12 +487,11 @@ function drive.manualLoop(control, opts)
             elseif key == keys.c and isHeld then
                 held[keys.z] = nil
             end
-            refresh()
         end
     end
 
     while not stop do
-        local timerId = os.startTimer(recordName and interval or 0.1)
+        local timerId = os.startTimer(tick)
         while true do
             local ev = { os.pullEvent() }
             if ev[1] == "key" then
@@ -404,6 +508,9 @@ function drive.manualLoop(control, opts)
         if stop then
             break
         end
+
+        refresh(tick)
+
         if recordName then
             local now = os.clock()
             if now - lastSample >= interval * 0.9 then

@@ -231,6 +231,11 @@ function calibrate.run(opts)
             tol_pos = 0.35,
             tol_yaw_deg = 5,
         },
+        feedback = {
+            kp_yaw = 1.2,
+            kp_lat = 0.8,
+            max_trim = 1.0,
+        },
         calibrated_at = tostring(util.now()),
         -- legacy empty map so old code paths no-op cleanly
         relays = {
