@@ -50,9 +50,9 @@ end
 
 local function pulseOne(actuator, duration, control, probeRpm)
     if actuator.kind == "motor" then
-        drive.setMotorRpm(actuator.name, probeRpm or actuator.max_rpm or 128)
+        drive.setMotorRpmNow(actuator.name, probeRpm or actuator.max_rpm or 128)
         sleep(duration)
-        drive.setMotorRpm(actuator.name, 0)
+        drive.setMotorRpmNow(actuator.name, 0)
     else
         drive.setActuator(control, actuator, 1)
         sleep(duration)
