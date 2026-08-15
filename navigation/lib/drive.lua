@@ -78,9 +78,108 @@ function drive.setRelayPhysical(name, level)
 end
 
 --- Set thruster by logical strength 0=off .. 15=full (honors invert_analog).
+-- For thruster tables prefer drive.setActuator.
 function drive.setThrustLevel(control, name, logicalLevel)
     local invert = drive.isInvert(control)
+    -- Motor names look like "electric_motor_N"
+    if peripheral.isPresent(name) and peripheral.hasType(name, "electric_motor") then
+        local maxRpm = (control and control.default_motor_rpm) or 256
+        local u = util.clamp((tonumber(logicalLevel) or 0) / 15, 0, 1)
+        return drive.setMotorRpm(name, u * maxRpm)
+    end
     return drive.setRelayPhysical(name, drive.logicalToPhysical(logicalLevel, invert))
+end
+
+local motorRpmCache = {}
+local motorRpmLastSet = {}
+
+function drive.setMotorRpm(name, rpm)
+    if not name or not peripheral.isPresent(name) then
+        return false
+    end
+    if not peripheral.hasType(name, "electric_motor") then
+        return false
+    end
+    rpm = math.floor((tonumber(rpm) or 0) + 0.5)
+    -- Anti-spam: skip tiny changes / too-frequent updates
+    local now = os.clock()
+    local lastT = motorRpmLastSet[name] or 0
+    local lastR = motorRpmCache[name]
+    if lastR ~= nil and math.abs(lastR - rpm) < 1 and (now - lastT) < 0.12 then
+        return true
+    end
+    local m = peripheral.wrap(name)
+    if not m then
+        return false
+    end
+    local ok, err = pcall(function()
+        if math.abs(rpm) < 1 and m.stop then
+            m.stop()
+        elseif m.setRPM then
+            m.setRPM(rpm)
+        elseif m.setSpeed then
+            m.setSpeed(rpm)
+        else
+            error("no setRPM")
+        end
+    end)
+    if ok then
+        motorRpmCache[name] = rpm
+        motorRpmLastSet[name] = now
+    else
+        -- still record attempt time so we don't spam errors
+        motorRpmLastSet[name] = now
+        if err and not string.find(tostring(err), "Anti Spam") then
+            -- silent for anti-spam; others ignored during control loop
+        end
+    end
+    return ok
+end
+
+function drive.stopAllMotors()
+    for _, name in ipairs(peripheral.getNames()) do
+        if peripheral.hasType(name, "electric_motor") then
+            drive.setMotorRpm(name, 0)
+            -- also try stop()
+            local m = peripheral.wrap(name)
+            if m and m.stop then
+                pcall(m.stop)
+            end
+            motorRpmCache[name] = 0
+        end
+    end
+end
+
+--- duty in [-1,1] for motors (signed RPM), [0,1] for relays.
+function drive.setActuator(control, thruster, duty)
+    if type(thruster) == "string" then
+        thruster = { name = thruster, kind = "relay" }
+    end
+    local name = thruster.name
+    local kind = thruster.kind
+    if not kind then
+        if peripheral.isPresent(name) and peripheral.hasType(name, "electric_motor") then
+            kind = "motor"
+        else
+            kind = "relay"
+        end
+    end
+
+    if kind == "motor" then
+        local maxRpm = thruster.max_rpm or (control and control.default_motor_rpm) or 256
+        duty = util.clamp(tonumber(duty) or 0, -1, 1)
+        if math.abs(duty) < 0.03 then
+            return drive.setMotorRpm(name, 0)
+        end
+        return drive.setMotorRpm(name, duty * maxRpm)
+    end
+
+    duty = util.clamp(tonumber(duty) or 0, 0, 1)
+    local level = 0
+    if duty >= 0.04 then
+        level = math.max(1, math.floor(duty * 15 + 0.5))
+    end
+    return drive.setThrustLevel(control, name, level)
 end
 
 --- Back-compat name: treats boolean/"level" as logical (full or off) unless number given.
@@ -105,16 +204,12 @@ end
 
 function drive.allOff(control)
     control = control or drive.loadControl()
-    if not control then
-        return
-    end
-    -- Logical off → physical 15 when inverted (transmission disengaged / prop stopped)
-    if type(control.thrusters) == "table" then
+    if type(control) == "table" and type(control.thrusters) == "table" then
         for _, t in ipairs(control.thrusters) do
-            drive.setThrustLevel(control, t.name, 0)
+            drive.setActuator(control, t, 0)
         end
     end
-    if type(control.relays) == "table" then
+    if type(control) == "table" and type(control.relays) == "table" then
         for _, axis in ipairs(LEGACY_AXES) do
             local list = control.relays[axis]
             if type(list) == "table" then
@@ -124,6 +219,7 @@ function drive.allOff(control)
             end
         end
     end
+    drive.stopAllMotors()
 end
 
 function drive.setAxis(control, axis, on)
@@ -169,12 +265,10 @@ local function dutyToLevel(u)
     if u < 0.04 then
         return 0
     end
-    -- Map (0,1] → 1..15 so weak trim still fires a little
     return math.max(1, math.floor(u * 15 + 0.5))
 end
 
---- Continuous greedy allocation → analog levels 0-15 per thruster.
--- Off-center main thrust leaves residual yaw; later thrusters cancel it at partial strength.
+--- Continuous greedy allocation. Motors get signed RPM; relays get 0-15.
 function drive.applyWrench(control, fx, fy, tz)
     control = control or drive.loadControl()
     if not drive.isWrenchMode(control) then
@@ -188,7 +282,6 @@ function drive.applyWrench(control, fx, fy, tz)
         return true
     end
 
-    -- Scale command magnitude into calibrated wrench units (norm ≈ max thruster mag)
     local norm = (control.gains and control.gains.norm) or 1
     if norm < 1e-6 then
         norm = 1
@@ -210,13 +303,21 @@ function drive.applyWrench(control, fx, fy, tz)
     for _ = 1, rounds do
         local bestI, bestScore = nil, threshold
         for i, t in ipairs(control.thrusters) do
-            if u[i] < 0.999 then
+            local reversible = (t.kind == "motor")
+            local room = reversible and (1 - math.abs(u[i])) or (1 - u[i])
+            if room > 0.02 then
                 local score = dotW(weights, remaining, t)
                 local tMag = t.mag or math.sqrt(t.fx * t.fx + t.fy * t.fy + t.tz * t.tz)
                 if tMag > 1e-6 then
                     score = score / (0.25 + tMag)
                 end
-                if score > bestScore then
+                -- Motors may run reverse (negative score); relays only forward duty
+                if reversible then
+                    if math.abs(score) > bestScore then
+                        bestScore = math.abs(score)
+                        bestI = i
+                    end
+                elseif score > bestScore then
                     bestScore = score
                     bestI = i
                 end
@@ -231,8 +332,14 @@ function drive.applyWrench(control, fx, fy, tz)
             break
         end
         local alpha = dotW(weights, remaining, t) / denom
-        alpha = util.clamp(alpha, 0, 1 - u[bestI])
-        if alpha < 0.02 then
+        local reversible = (t.kind == "motor")
+        if reversible then
+            local maxStep = 1 - math.abs(u[bestI])
+            alpha = util.clamp(alpha, -maxStep, maxStep)
+        else
+            alpha = util.clamp(alpha, 0, 1 - u[bestI])
+        end
+        if math.abs(alpha) < 0.02 then
             break
         end
         u[bestI] = u[bestI] + alpha
@@ -242,7 +349,11 @@ function drive.applyWrench(control, fx, fy, tz)
     end
 
     for i, t in ipairs(control.thrusters) do
-        drive.setThrustLevel(control, t.name, dutyToLevel(u[i]))
+        if t.kind == "motor" then
+            drive.setActuator(control, t, u[i])
+        else
+            drive.setActuator(control, t, math.max(0, u[i]))
+        end
     end
     return true
 end
@@ -450,6 +561,17 @@ function drive.manualLoop(control, opts)
     local trimState = {}
     local wrenchMode = drive.isWrenchMode(control)
 
+    drive.allOff(control)
+
+    local nMotor = 0
+    if wrenchMode then
+        for _, t in ipairs(control.thrusters) do
+            if t.kind == "motor" then
+                nMotor = nMotor + 1
+            end
+        end
+    end
+
     print("Manual control (hold keys):")
     print("  W/S  forward / reverse")
     print("  A/D  yaw left / right")
@@ -457,11 +579,16 @@ function drive.manualLoop(control, opts)
     print("  X    all stop")
     print("  Q    quit" .. (recordName and (" + save path '" .. recordName .. "'") or ""))
     if wrenchMode then
-        print("  Analog 1-15 + live yaw/strafe trim (off-center CoM cancel)")
-        if drive.isInvert(control) then
-            print("  invert_analog: ON  (logical full→RS 0, off→RS 15)")
+        if nMotor > 0 then
+            print("  Electric motors: signed RPM (idle = 0), max "
+                .. tostring(control.default_motor_rpm or 256))
+        else
+            print("  Analog 1-15 + live yaw/strafe trim (off-center CoM cancel)")
+            if drive.isInvert(control) then
+                print("  invert_analog: ON  (logical full→RS 0, off→RS 15)")
+            end
         end
-        print("  Thrusters: " .. #control.thrusters)
+        print("  Thrusters: " .. #control.thrusters .. (nMotor > 0 and (" (" .. nMotor .. " motors)") or ""))
     end
     print()
 

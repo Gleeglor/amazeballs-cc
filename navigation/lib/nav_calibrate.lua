@@ -1,38 +1,63 @@
--- Reassembly-style thruster ID: pulse each relay, store force/torque wrench.
--- Modems do NOT expose block position in CC — we infer effect from motion vs CoM.
+-- Reassembly-style thruster ID: pulse relays + Create Addition electric motors.
 local util = require("util")
 local pose = require("pose")
 local drive = require("drive")
 
 local calibrate = {}
 
-function calibrate.listRelays(useSides)
-    local names = {}
-    for _, name in ipairs(peripheral.getNames()) do
-        if peripheral.hasType(name, "redstone_relay") then
-            names[#names + 1] = name
+--- Discover actuators: electric_motor first, then redstone_relay.
+-- @return list of { name, kind, max_rpm? }
+function calibrate.listActuators(useSides)
+    local list = {}
+    local names = peripheral.getNames()
+    table.sort(names)
+    for _, name in ipairs(names) do
+        if peripheral.hasType(name, "electric_motor") then
+            list[#list + 1] = { name = name, kind = "motor", max_rpm = 256 }
         end
     end
-    table.sort(names)
+    for _, name in ipairs(names) do
+        if peripheral.hasType(name, "redstone_relay") then
+            list[#list + 1] = { name = name, kind = "relay" }
+        end
+    end
     if useSides then
         for _, side in ipairs({ "top", "bottom", "left", "right", "front", "back" }) do
-            names[#names + 1] = "side:" .. side
+            list[#list + 1] = { name = "side:" .. side, kind = "relay" }
+        end
+    end
+    return list
+end
+
+-- back-compat
+function calibrate.listRelays(useSides)
+    local names = {}
+    for _, a in ipairs(calibrate.listActuators(useSides)) do
+        if a.kind == "relay" then
+            names[#names + 1] = a.name
         end
     end
     return names
 end
 
-local function allOff(names, control)
-    for _, name in ipairs(names) do
-        drive.setThrustLevel(control, name, 0)
+local function allOff(actuators, control)
+    for _, a in ipairs(actuators) do
+        drive.setActuator(control, a, 0)
     end
+    -- Also stop any motors not yet in the list (user just wired them)
+    drive.stopAllMotors()
 end
 
-local function pulseOne(name, duration, control)
-    -- Logical full thrust (physical 0 if inverted)
-    drive.setThrustLevel(control, name, 15)
-    sleep(duration)
-    drive.setThrustLevel(control, name, 0)
+local function pulseOne(actuator, duration, control, probeRpm)
+    if actuator.kind == "motor" then
+        drive.setMotorRpm(actuator.name, probeRpm or actuator.max_rpm or 128)
+        sleep(duration)
+        drive.setMotorRpm(actuator.name, 0)
+    else
+        drive.setActuator(control, actuator, 1)
+        sleep(duration)
+        drive.setActuator(control, actuator, 0)
+    end
 end
 
 local function sampleMotion()
@@ -54,7 +79,6 @@ local function wrenchMag(w)
     return math.sqrt(w.fx * w.fx + w.fy * w.fy + w.tz * w.tz)
 end
 
---- Describe dominant role for humans (not used for control).
 function calibrate.describe(w)
     local af, ar, ay = math.abs(w.fx), math.abs(w.fy), math.abs(w.tz)
     local m = math.max(af, ar, ay)
@@ -75,13 +99,13 @@ end
 
 function calibrate.run(opts)
     opts = opts or {}
-    local pulse = opts.pulse or 0.6
-    local settle = opts.settle or 0.35
+    local pulse = opts.pulse or 0.7
+    local settle = opts.settle or 0.4
     local useSides = opts.use_sides == true
-    local linFloor = (opts.thresholds and opts.thresholds.linear) or 0.05
-    local yawFloor = (opts.thresholds and opts.thresholds.yaw) or 0.03
+    local probeRpm = opts.probe_rpm or 128
+    local linFloor = (opts.thresholds and opts.thresholds.linear) or 0.04
+    local yawFloor = (opts.thresholds and opts.thresholds.yaw) or 0.025
 
-    -- Invert: preserve from existing config unless opts override
     local prev = drive.loadControl() or {}
     local invert = opts.invert_analog
     if invert == nil then
@@ -91,20 +115,34 @@ function calibrate.run(opts)
     local probeControl = { invert_analog = invert }
 
     print("Calibrate (Reassembly / wrench mode)")
-    print("Each relay = one thruster. Motion vs CoM → force + torque.")
-    print("(Modems cannot report block position; we measure effect instead.)")
+    print("Actuators: Create Addition electric_motor + redstone_relay")
+    print("Motion vs CoM → force + torque (no modem GPS needed).")
     if invert then
-        print("invert_analog ON: full thrust = RS 0, off = RS 15 (analog transmission)")
-    else
-        print("invert_analog OFF: full thrust = RS 15, off = RS 0")
+        print("Relay invert ON (motors ignore this — 0 RPM is always off)")
     end
+    print("Motor probe RPM: " .. tostring(probeRpm))
     print()
 
-    local names = calibrate.listRelays(useSides)
-    if #names == 0 then
-        return nil, "no redstone_relay peripherals found"
+    -- Stop everything first so props aren't stuck "all on"
+    print("Stopping all electric motors...")
+    drive.stopAllMotors()
+    sleep(0.3)
+
+    local actuators = calibrate.listActuators(useSides)
+    if #actuators == 0 then
+        return nil, "no electric_motor or redstone_relay peripherals found"
     end
-    print("Found " .. #names .. " candidates")
+
+    local nMotor, nRelay = 0, 0
+    for _, a in ipairs(actuators) do
+        if a.kind == "motor" then
+            nMotor = nMotor + 1
+            a.max_rpm = probeRpm
+        else
+            nRelay = nRelay + 1
+        end
+    end
+    print(string.format("Found %d motor(s), %d relay(s)", nMotor, nRelay))
 
     local ok, err = pcall(pose.get)
     if not ok then
@@ -116,42 +154,40 @@ function calibrate.run(opts)
         print(string.format("CoM (world): %.2f, %.2f, %.2f", com.x, com.y, com.z))
     end
 
-    allOff(names, probeControl)
+    allOff(actuators, probeControl)
     sleep(0.2)
 
     local thrusters = {}
     local unused = {}
 
-    for _, name in ipairs(names) do
-        print("Probing " .. name .. " ...")
-        allOff(names, probeControl)
+    for _, a in ipairs(actuators) do
+        print("Probing " .. a.name .. " (" .. a.kind .. ") ...")
+        allOff(actuators, probeControl)
         sleep(settle)
         local before = sampleMotion()
-        pulseOne(name, pulse, probeControl)
+        pulseOne(a, pulse, probeControl, probeRpm)
         sleep(settle)
         local after = sampleMotion()
-        allOff(names, probeControl)
+        allOff(actuators, probeControl)
 
-        -- Wrench proxy: Δv_local ≈ force direction; Δω_yaw ≈ torque about CoM
         local w = {
-            name = name,
+            name = a.name,
+            kind = a.kind,
+            max_rpm = a.max_rpm or probeRpm,
             fx = after.forward - before.forward,
             fy = after.right - before.right,
             tz = after.yaw - before.yaw,
         }
         w.mag = wrenchMag(w)
 
-        -- Rough lever-arm hint (blocks-ish): τ ≈ r × F → r_perp ≈ tz / |F_horiz|
         local fHoriz = math.sqrt(w.fx * w.fx + w.fy * w.fy)
         if fHoriz > linFloor then
             w.lever_est = w.tz / fHoriz
-        else
-            w.lever_est = nil
         end
 
         local role = calibrate.describe(w)
         if w.mag < linFloor and math.abs(w.tz) < yawFloor then
-            unused[#unused + 1] = name
+            unused[#unused + 1] = a.name
             print(string.format("  -> unused  fx=%.3f fy=%.3f tz=%.3f", w.fx, w.fy, w.tz))
         else
             thrusters[#thrusters + 1] = w
@@ -165,16 +201,16 @@ function calibrate.run(opts)
                 lever
             ))
         end
-        sleep(0.15)
+        sleep(0.2) -- motor setRPM anti-spam
     end
 
-    allOff(names, probeControl)
+    allOff(actuators, probeControl)
+    drive.stopAllMotors()
 
     if #thrusters == 0 then
-        return nil, "no thrusters responded (props dry / no RPM / wrong invert mode?)"
+        return nil, "no thrusters responded (no FE? props not connected? not on sublevel?)"
     end
 
-    -- Normalize scores so allocation is scale-stable across craft masses
     local maxMag = 0
     for _, t in ipairs(thrusters) do
         if t.mag > maxMag then
@@ -186,15 +222,15 @@ function calibrate.run(opts)
     end
 
     local control = {
-        version = 2,
+        version = 3,
         mode = "wrench",
         invert_analog = invert,
+        default_motor_rpm = probeRpm,
         thrusters = thrusters,
         unused = unused,
-        -- Prefer yaw a bit so turn commands aren't drowned by big main thrusters
-        weights = { fx = 1.0, fy = 1.0, tz = 1.4 },
-        alloc_threshold = 0.12,
-        alloc_rounds = 8,
+        weights = { fx = 1.0, fy = 1.0, tz = 1.5 },
+        alloc_threshold = 0.08,
+        alloc_rounds = 12,
         gains = {
             forward = 1.0,
             strafe = 1.0,
@@ -213,7 +249,6 @@ function calibrate.run(opts)
             max_trim = 1.0,
         },
         calibrated_at = tostring(util.now()),
-        -- legacy empty map so old code paths no-op cleanly
         relays = {
             thrust_forward = {},
             thrust_reverse = {},

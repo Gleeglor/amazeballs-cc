@@ -169,7 +169,7 @@ end
 
 local function menu(cfg)
     print("Boat " .. cfg.boat_id)
-    print("Commands: control | record <name> | run | follow <path> | dock <port> | list | pose | quit")
+    print("Commands: control | record <name> | stop | run | follow <path> | dock <port> | list | pose | quit")
     while true do
         write("> ")
         local line = read()
@@ -182,6 +182,9 @@ local function menu(cfg)
         if cmd == "quit" or cmd == "exit" then
             drive.allOff()
             break
+        elseif cmd == "stop" or cmd == "halt" then
+            drive.allOff()
+            print("All thrusters / motors stopped")
         elseif cmd == "list" then
             for _, n in ipairs(path.list()) do
                 print("  " .. n)
@@ -208,13 +211,16 @@ local function menu(cfg)
             local p = pose.get()
             print(string.format("pos=%.2f,%.2f,%.2f yaw=%.1fdeg", p.position.x, p.position.y, p.position.z, pose.yawDeg(p.yaw)))
         else
-            print("Unknown. control | record <name> | run | follow <path> | dock <port> | list | pose | quit")
+            print("Unknown. control | record <name> | stop | run | follow <path> | dock <port> | list | pose | quit")
         end
     end
 end
 
 -- main
 local cfg = loadConfig()
+-- Kill runaway motors as soon as the boat computer boots
+drive.stopAllMotors()
+
 local hasModem = protocol.open()
 if hasModem then
     protocol.host(cfg.boat_id)
@@ -224,7 +230,10 @@ else
 end
 
 local args = { ... }
-if args[1] == "run" then
+if args[1] == "stop" or args[1] == "halt" then
+    drive.allOff()
+    print("All thrusters / motors stopped")
+elseif args[1] == "run" then
     if not hasModem then
         print("Wireless modem required for run")
         return

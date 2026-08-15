@@ -27,7 +27,7 @@
         "dest": "recorder.lua"
       },
       "calibrate.lua": {
-        "label": "calibrate - auto-map redstone relays",
+        "label": "calibrate - auto-map motors + relays",
         "dest": "calibrate.lua"
       },
       "lib": {
@@ -64,7 +64,7 @@
           "dest": "lib/drive.lua"
         },
         "nav_calibrate.lua": {
-          "label": "lib relay calibrate",
+          "label": "lib motor+relay calibrate",
           "dest": "lib/nav_calibrate.lua"
         }
       }
