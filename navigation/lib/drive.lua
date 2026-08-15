@@ -407,6 +407,106 @@ local function dutyToLevel(u)
     return math.max(1, math.floor(u * 15 + 0.5))
 end
 
+--- Direct (non-greedy) allocation for teleop — more predictable yaw/strafe.
+-- Maps command (-1..1) onto thrusters by wrench projection, then normalizes.
+function drive.applyDirect(control, fx, fy, tz)
+    control = control or drive.loadControl()
+    if not drive.isWrenchMode(control) then
+        return drive.applyWrench(control, fx, fy, tz)
+    end
+
+    fx, fy, tz = fx or 0, fy or 0, tz or 0
+    local cmdMag = math.sqrt(fx * fx + fy * fy + tz * tz)
+    if cmdMag < 1e-4 then
+        for _, t in ipairs(control.thrusters) do
+            if t.kind == "motor" then
+                motorDesired[t.name] = 0
+                motorSent[t.name] = nil
+            else
+                drive.setActuator(control, t, 0)
+            end
+        end
+        drive.flushMotors(1)
+        return true
+    end
+
+    local wx = (control.weights and control.weights.fx) or 1
+    local wy = (control.weights and control.weights.fy) or 1
+    local wz = (control.weights and control.weights.tz) or 2.2
+
+    local scores = {}
+    local maxAbs = 0
+    for i, t in ipairs(control.thrusters) do
+        local s = wx * fx * (t.fx or 0) + wy * fy * (t.fy or 0) + wz * tz * (t.tz or 0)
+        scores[i] = s
+        if math.abs(s) > maxAbs then
+            maxAbs = math.abs(s)
+        end
+    end
+
+    -- If yaw was commanded but nothing scored (tz≈0 in calib), synthesize differential
+    if maxAbs < 1e-6 and math.abs(tz) > 0.08 then
+        local side = 1
+        for i, t in ipairs(control.thrusters) do
+            local forwardish = math.abs(t.fx or 0)
+            if forwardish > 1e-4 then
+                scores[i] = tz * side * forwardish
+                side = -side
+                if math.abs(scores[i]) > maxAbs then
+                    maxAbs = math.abs(scores[i])
+                end
+            end
+        end
+    end
+
+    if maxAbs < 1e-6 then
+        for _, t in ipairs(control.thrusters) do
+            if t.kind == "motor" then
+                motorDesired[t.name] = 0
+            end
+        end
+        drive.flushMotors(1)
+        return false
+    end
+
+    local scale = math.min(1, cmdMag)
+    for i, t in ipairs(control.thrusters) do
+        local duty = (scores[i] / maxAbs) * scale
+        if t.kind == "motor" then
+            drive.setActuator(control, t, duty)
+        else
+            drive.setActuator(control, t, math.max(0, duty))
+        end
+    end
+    drive.flushMotors(1)
+    return true
+end
+
+--- If calibration wiped yaw, invent differential levers so A/D can still turn.
+function drive.healYawThrusters(control)
+    if not control or type(control.thrusters) ~= "table" then
+        return false
+    end
+    local maxTz = 0
+    for _, t in ipairs(control.thrusters) do
+        maxTz = math.max(maxTz, math.abs(t.tz or 0))
+    end
+    if maxTz >= 0.02 then
+        return false
+    end
+    local side = 1
+    local healed = 0
+    for _, t in ipairs(control.thrusters) do
+        if math.abs(t.fx or 0) > 0.01 then
+            t.tz = (t.fx or 0) * side * 0.4
+            t.mag = math.sqrt((t.fx or 0) ^ 2 + (t.fy or 0) ^ 2 + (t.tz or 0) ^ 2)
+            side = -side
+            healed = healed + 1
+        end
+    end
+    return healed > 0
+end
+
 --- Continuous greedy allocation. Motors get signed RPM; relays get 0-15.
 function drive.applyWrench(control, fx, fy, tz)
     control = control or drive.loadControl()
@@ -697,29 +797,44 @@ function drive.manualLoop(control, opts)
     local tick = opts.tick or 0.05
     local recordName = opts.recordName
     local held = {}
-    local pendingUp = {} -- key -> release-at clock (debounce spurious key_ups while held)
+    local pendingUp = {}
     local waypoints = {}
     local t0 = os.clock()
     local lastSample = 0
     local stop = false
     local wrenchMode = drive.isWrenchMode(control)
-    local lastCmdKey = "0,0,0"
-    local KEY_UP_DEBOUNCE = 0.18
+    local lastCmdKey = nil
+    local KEY_UP_DEBOUNCE = 0.2
 
-    local function isMoveKey(key)
-        return key == keys.w or key == keys.s or key == keys.a or key == keys.d
-            or key == keys.z or key == keys.c
-            or key == keys.left or key == keys.right
-    end
+    local MOVE = {
+        [keys.w] = true,
+        [keys.s] = true,
+        [keys.a] = true,
+        [keys.d] = true,
+        [keys.z] = true,
+        [keys.c] = true,
+        [keys.left] = true,
+        [keys.right] = true,
+    }
 
     local function clearOpposite(key)
-        if key == keys.w then
-            held[keys.s] = nil
-            pendingUp[keys.s] = nil
-        elseif key == keys.s then
-            held[keys.w] = nil
-            pendingUp[keys.w] = nil
-        elseif key == keys.a or key == keys.left then
+        local pairs_ = {
+            [keys.w] = keys.s,
+            [keys.s] = keys.w,
+            [keys.a] = keys.d,
+            [keys.d] = keys.a,
+            [keys.left] = keys.right,
+            [keys.right] = keys.left,
+            [keys.z] = keys.c,
+            [keys.c] = keys.z,
+        }
+        local other = pairs_[key]
+        if other then
+            held[other] = nil
+            pendingUp[other] = nil
+        end
+        -- A mirrors left, D mirrors right
+        if key == keys.a or key == keys.left then
             held[keys.d] = nil
             held[keys.right] = nil
             pendingUp[keys.d] = nil
@@ -729,13 +844,11 @@ function drive.manualLoop(control, opts)
             held[keys.left] = nil
             pendingUp[keys.a] = nil
             pendingUp[keys.left] = nil
-        elseif key == keys.z then
-            held[keys.c] = nil
-            pendingUp[keys.c] = nil
-        elseif key == keys.c then
-            held[keys.z] = nil
-            pendingUp[keys.z] = nil
         end
+    end
+
+    if wrenchMode and drive.healYawThrusters(control) then
+        print("Note: calib had weak yaw — using differential forward thrusters for turn")
     end
 
     drive.allOff(control)
@@ -756,10 +869,6 @@ function drive.manualLoop(control, opts)
     print("  X    all stop")
     print("  Q    quit" .. (recordName and (" + save path '" .. recordName .. "'") or ""))
     if wrenchMode then
-        if nMotor > 0 then
-            print("  Motors: direct keys → RPM (no auto-trim). max "
-                .. tostring(control.default_motor_rpm or 256))
-        end
         print("  Thrusters: " .. #control.thrusters .. (nMotor > 0 and (" (" .. nMotor .. " motors)") or ""))
     end
     print()
@@ -769,22 +878,41 @@ function drive.manualLoop(control, opts)
         local fy = (held[keys.c] and 1 or 0) + (held[keys.z] and -1 or 0)
         local yawL = (held[keys.a] or held[keys.left]) and 1 or 0
         local yawR = (held[keys.d] or held[keys.right]) and 1 or 0
-        local tz = yawL - yawR
-        return { fx = fx, fy = fy, tz = tz }
+        return { fx = fx, fy = fy, tz = yawL - yawR }
+    end
+
+    local function forceIdle()
+        lastCmdKey = "0,0,0"
+        if wrenchMode then
+            for _, t in ipairs(control.thrusters) do
+                if t.kind == "motor" then
+                    motorDesired[t.name] = 0
+                    motorSent[t.name] = nil
+                else
+                    drive.setActuator(control, t, 0)
+                end
+            end
+            drive.flushMotors(1)
+        else
+            drive.allOff(control)
+        end
     end
 
     local function applyCommand()
         local cmd = commandFromKeys()
-        -- Commas avoid ambiguous keys like "00-1"
         local cmdKey = string.format("%d,%d,%d", cmd.fx, cmd.fy, cmd.tz)
         if cmdKey == lastCmdKey then
             return
         end
         lastCmdKey = cmdKey
 
+        if cmd.fx == 0 and cmd.fy == 0 and cmd.tz == 0 then
+            forceIdle()
+            return
+        end
+
         if wrenchMode then
-            -- Direct pilot command only — no pose trim (that was ghost-steering after release)
-            drive.applyWrench(control, cmd.fx, cmd.fy, cmd.tz)
+            drive.applyDirect(control, cmd.fx, cmd.fy, cmd.tz)
         else
             drive.setAxis(control, "thrust_forward", cmd.fx > 0)
             drive.setAxis(control, "thrust_reverse", cmd.fx < 0)
@@ -795,31 +923,27 @@ function drive.manualLoop(control, opts)
         end
     end
 
-    local function pressMoveKey(key, isRepeat)
-        pendingUp[key] = nil -- cancel deferred release; still held
-        local wasHeld = held[key]
+    --- Fresh press only. Repeats never set held=true by themselves (that caused
+    --- ghost pulses from queued repeats after you let go).
+    local function onMoveDown(key)
+        pendingUp[key] = nil
         held[key] = true
-        if not isRepeat then
-            clearOpposite(key)
-        end
-        -- Re-apply if this restores a hold that a spurious key_up cleared
-        if not wasHeld or not isRepeat then
-            applyCommand()
-        end
+        clearOpposite(key)
+        applyCommand()
     end
 
-    local function onSpecialDown(key)
-        if key == quitKey then
-            stop = true
-            return
+    --- Repeats only cancel a pending release while the key is still considered down.
+    local function onMoveRepeat(key)
+        if held[key] or pendingUp[key] then
+            pendingUp[key] = nil
+            held[key] = true
         end
-        if key == keys.x then
-            held = {}
-            pendingUp = {}
-            lastCmdKey = "xxx"
-            drive.allOff(control)
-            lastCmdKey = "0,0,0"
-        end
+        -- do not applyCommand — already thrusting
+    end
+
+    local function onMoveUp(key)
+        -- Defer: spurious key_ups while held are cancelled by a following repeat
+        pendingUp[key] = os.clock() + KEY_UP_DEBOUNCE
     end
 
     local function flushPendingKeyUps()
@@ -840,37 +964,31 @@ function drive.manualLoop(control, opts)
     while not stop do
         local timerId = os.startTimer(tick)
         while true do
-            -- pullEventRaw so we can exit immediately on Ctrl+T without
-            -- getting stuck behind motor drain sleeps.
             local ev = { os.pullEventRaw() }
             if ev[1] == "terminate" then
-                -- Queue stops only — do not sleep/drain (that made Ctrl+T feel stuck)
-                if wrenchMode then
-                    for _, t in ipairs(control.thrusters) do
-                        if t.kind == "motor" then
-                            motorDesired[t.name] = 0
-                            motorSent[t.name] = nil
-                        end
-                    end
-                end
-                drive.flushMotors(1)
+                forceIdle()
                 error("Terminated", 0)
             elseif ev[1] == "key" then
                 local key, isRepeat = ev[2], ev[3] and true or false
-                if isMoveKey(key) then
-                    -- Repeats keep the hold alive (OS often emits fake key_ups while held)
-                    pressMoveKey(key, isRepeat)
+                if MOVE[key] then
+                    if isRepeat then
+                        onMoveRepeat(key)
+                    else
+                        onMoveDown(key)
+                    end
                 elseif not isRepeat then
-                    onSpecialDown(key)
-                    if stop then
+                    if key == quitKey then
+                        stop = true
                         break
+                    elseif key == keys.x then
+                        held = {}
+                        pendingUp = {}
+                        forceIdle()
                     end
                 end
             elseif ev[1] == "key_up" then
-                local key = ev[2]
-                if isMoveKey(key) then
-                    -- Defer release; cancelled if a key/repeat arrives soon after
-                    pendingUp[key] = os.clock() + KEY_UP_DEBOUNCE
+                if MOVE[ev[2]] then
+                    onMoveUp(ev[2])
                 end
             elseif ev[1] == "timer" and ev[2] == timerId then
                 break
@@ -882,8 +1000,17 @@ function drive.manualLoop(control, opts)
 
         flushPendingKeyUps()
 
-        -- Drain queued motor RPM changes (stops first)
-        drive.flushMotors(2)
+        -- Hard idle watchdog: no keys → motors must be zero (kills ghost thrust)
+        local cmd = commandFromKeys()
+        if cmd.fx == 0 and cmd.fy == 0 and cmd.tz == 0 then
+            if lastCmdKey ~= "0,0,0" then
+                forceIdle()
+            elseif drive.motorsPending() then
+                drive.flushMotors(2)
+            end
+        else
+            drive.flushMotors(2)
+        end
 
         if recordName then
             local now = os.clock()
@@ -900,8 +1027,7 @@ function drive.manualLoop(control, opts)
         end
     end
 
-    drive.allOff(control)
-    -- Brief soft drain on normal quit only (not Ctrl+T)
+    forceIdle()
     local deadline = os.clock() + 0.25
     while drive.motorsPending() and os.clock() < deadline do
         drive.flushMotors(1)
