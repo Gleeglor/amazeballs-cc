@@ -5,7 +5,11 @@
 local REPO_BASE = "https://raw.githubusercontent.com/gleeglor/amazeballs-cc/main/"
 
 local function httpGet(url)
-    local res, err = http.get(url)
+    local bust = "?t=" .. tostring(os.epoch("utc"))
+    local res, err = http.get(url .. bust)
+    if not res then
+        res, err = http.get(url)
+    end
     if not res then
         return nil, err or "http.get failed"
     end
@@ -48,7 +52,7 @@ if not writeFile("/updater.lua", updater) then
     print("Could not write /updater.lua")
     return
 end
-print("Wrote /updater.lua")
+print("Wrote /updater.lua (" .. #updater .. " bytes)")
 
 local startup = [[
 -- Managed by amazeballs-cc installer. Do not replace with role startups.

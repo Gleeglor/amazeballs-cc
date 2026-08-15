@@ -1,7 +1,7 @@
 -- Amazeballs CC updater: tree setup, then pull selected files each run.
 local REPO_BASE = "https://raw.githubusercontent.com/gleeglor/amazeballs-cc/main/"
 local CONFIG_PATH = "/cc_update.json"
-local CATALOG_URL = REPO_BASE .. "catalog.json"
+local CATALOG_URL = REPO_BASE .. "catalog.v2.json"
 local UPDATER_URL = REPO_BASE .. "updater.lua"
 
 local PROTECTED = {
@@ -115,11 +115,14 @@ local function fetchCatalog()
     print("Fetching catalog...")
     local body, err = httpGet(CATALOG_URL)
     if not body then
+        body, err = httpGet(REPO_BASE .. "catalog.json")
+    end
+    if not body then
         return nil, err
     end
     local ok, catalog = pcall(textutils.unserialiseJSON, body)
     if not ok or type(catalog) ~= "table" or type(catalog.tree) ~= "table" then
-        return nil, "invalid catalog.json"
+        return nil, "invalid catalog"
     end
     if type(catalog.base_url) == "string" and catalog.base_url ~= "" then
         REPO_BASE = catalog.base_url
@@ -127,6 +130,30 @@ local function fetchCatalog()
             REPO_BASE = REPO_BASE .. "/"
         end
     end
+    local roots = {}
+    for k in pairs(catalog.tree) do
+        roots[#roots + 1] = k
+    end
+    table.sort(roots)
+    print("Catalog v" .. tostring(catalog.version or "?") .. " roots: " .. table.concat(roots, ", "))
+    local nav = catalog.tree.navigation
+    if type(nav) == "table" then
+        local nk = {}
+        for k in pairs(nav) do
+            if k ~= "dest" and k ~= "label" then
+                nk[#nk + 1] = k
+            end
+        end
+        table.sort(nk)
+        if #nk == 0 then
+            print("navigation/: (empty!)")
+        else
+            print("navigation/: " .. table.concat(nk, ", "))
+        end
+    else
+        print("navigation/: missing")
+    end
+    sleep(2)
     return catalog
 end
 
@@ -310,7 +337,7 @@ local function runSetup(catalog, existingCfg)
         term.setCursorPos(1, 1)
 
         print("Script setup  " .. pathDisplay(pathStack))
-        print("move=arrows  toggle=space  open/done=enter")
+        print("move=arrows  toggle=space (files or whole folder)  open/done=enter")
         print(formatSelectedLine(selected, w))
         print(string.rep("-", w))
 
@@ -360,6 +387,58 @@ local function runSetup(catalog, existingCfg)
         return rows
     end
 
+    local function collectFilesUnder(folderSrc, node, into)
+        into = into or {}
+        if type(node) ~= "table" then
+            return into
+        end
+        for name, child in pairs(node) do
+            if name ~= "dest" and name ~= "label" then
+                local src = joinPath(folderSrc, name)
+                if isFileEntry(name, child) then
+                    into[#into + 1] = {
+                        src = src,
+                        dest = defaultDest(src, child),
+                        label = (type(child) == "table" and child.label) or name,
+                    }
+                else
+                    collectFilesUnder(src, child, into)
+                end
+            end
+        end
+        return into
+    end
+
+    local function toggleFolder(folderSrc)
+        local node = tree
+        if folderSrc ~= "" then
+            for part in string.gmatch(folderSrc, "[^/]+") do
+                node = node[part]
+                if type(node) ~= "table" then
+                    return
+                end
+            end
+        end
+        local files = collectFilesUnder(folderSrc, node, {})
+        if #files == 0 then
+            return
+        end
+        local allOn = true
+        for _, f in ipairs(files) do
+            if not selected[f.src] then
+                allOn = false
+                break
+            end
+        end
+        for _, f in ipairs(files) do
+            if allOn then
+                selected[f.src] = nil
+            elseif not isProtectedDest(f.dest) then
+                selected[f.src] = f
+            end
+        end
+    end
+
     while true do
         local rows = draw()
         local _, key = os.pullEvent("key")
@@ -392,6 +471,9 @@ local function runSetup(catalog, existingCfg)
                         label = row.label,
                     }
                 end
+            elseif row.kind == "dir" then
+                local folderSrc = joinPath(currentPath(), row.name)
+                toggleFolder(folderSrc)
             end
         elseif key == keys.enter then
             local row = rows[cursor]
