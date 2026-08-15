@@ -208,14 +208,9 @@ function drive.hardStopThrusters(control)
         -- Must NOT mark sent=0 unless write succeeds (anti-spam used to fake-success)
         motorSent[name] = nil
     end
-    -- Stops first; retry once with gap if CCA anti-spam rejects
-    table.sort(names)
-    for _, name in ipairs(names) do
-        if not writeMotorRpm(name, 0) then
-            sleep(MOTOR_FLUSH_GAP)
-            writeMotorRpm(name, 0)
-        end
-    end
+    -- Non-blocking: sleep() uses pullEvent("timer") and DISCARDS key/key_up (sticky tap bug).
+    -- Prefer stops; remaining zeros are finished by flushMotors on the teleop tick.
+    drive.flushMotors(8)
 end
 
 --- Panic stop for X / idle: slower but hits every motor past CCA anti-spam.
@@ -785,25 +780,12 @@ function drive.applyReassembly(control, fx, fy, tz)
 end
 
 --- Write every pending motor RPM now (retries once on anti-spam).
+-- Never sleeps: filtered sleep drops key/key_up and leaves thrusters stuck after quick taps.
 function drive.commitMotorsNow()
-    local pending = {}
-    for name, want in pairs(motorDesired) do
-        if motorSent[name] ~= want then
-            pending[#pending + 1] = name
-        end
-    end
-    -- Stops first
-    table.sort(pending, function(a, b)
-        local da, db = motorDesired[a] or 0, motorDesired[b] or 0
-        if (da == 0) ~= (db == 0) then
-            return da == 0
-        end
-        return tostring(a) < tostring(b)
-    end)
-    for _, name in ipairs(pending) do
-        if not writeMotorRpm(name, motorDesired[name] or 0) then
-            sleep(0.05)
-            writeMotorRpm(name, motorDesired[name] or 0)
+    -- Several single flushes; gap is time-based without yielding the event loop away.
+    for _ = 1, 12 do
+        if drive.flushMotors(1) < 1 then
+            break
         end
     end
 end
@@ -1405,7 +1387,12 @@ function drive.manualLoop(control, opts)
             end
         end
         -- Finish any remaining motor RPM pushes without blocking the next keys long
-        drive.flushMotors(3)
+        -- Prefer draining stops hard when idle (quick-tap release)
+        if not anyDown() and drive.motorsPending() then
+            drive.flushMotors(8)
+        else
+            drive.flushMotors(3)
+        end
 
         if recordName then
             local now = os.clock()
