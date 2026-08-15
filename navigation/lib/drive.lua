@@ -1211,14 +1211,15 @@ function drive.manualLoop(control, opts)
     local tick = opts.tick or 0.05
     local recordName = opts.recordName
     local down = {}
-    local pendingUp = {}
     local waypoints = {}
     local t0 = os.clock()
     local lastSample = 0
     local stop = false
     local wrenchMode = drive.isWrenchMode(control)
     local lastIdleStopAt = 0
-    local KEY_UP_GRACE = 0.08 -- only when another MOVE key is still held (chords)
+    local lastSeen = {}
+    -- CC delays ~0.4s before first key_repeat; must be above that or hold drops early
+    local HOLD_STALE = 0.85
 
     local YAW_L = { [keys.a] = true, [keys.left] = true, [keys.j] = true }
     local YAW_R = { [keys.d] = true, [keys.right] = true, [keys.l] = true }
@@ -1284,24 +1285,15 @@ function drive.manualLoop(control, opts)
     end
 
     local function clearOpposites(key)
-        if key == keys.w then down[keys.s] = nil
-        elseif key == keys.s then down[keys.w] = nil
+        if key == keys.w then down[keys.s] = nil; lastSeen[keys.s] = nil
+        elseif key == keys.s then down[keys.w] = nil; lastSeen[keys.w] = nil
         elseif YAW_L[key] then
-            for k, _ in pairs(YAW_R) do down[k] = nil; pendingUp[k] = nil end
+            for k, _ in pairs(YAW_R) do down[k] = nil; lastSeen[k] = nil end
         elseif YAW_R[key] then
-            for k, _ in pairs(YAW_L) do down[k] = nil; pendingUp[k] = nil end
-        elseif key == keys.z then down[keys.c] = nil
-        elseif key == keys.c then down[keys.z] = nil
+            for k, _ in pairs(YAW_L) do down[k] = nil; lastSeen[k] = nil end
+        elseif key == keys.z then down[keys.c] = nil; lastSeen[keys.c] = nil
+        elseif key == keys.c then down[keys.z] = nil; lastSeen[keys.z] = nil
         end
-    end
-
-    local function otherMoveDown(exceptKey)
-        for k, _ in pairs(down) do
-            if k ~= exceptKey and MOVE[k] and not pendingUp[k] then
-                return true
-            end
-        end
-        return false
     end
 
     local function applyThrust()
@@ -1324,33 +1316,31 @@ function drive.manualLoop(control, opts)
         end
     end
 
-    local function flushPendingUps()
+    --- Drop MOVE keys that no longer get key/key_repeat (lost key_up → sticky thrust).
+    local function clearStaleKeys()
         local now = os.clock()
         local changed = false
-        for key, at in pairs(pendingUp) do
-            if now >= at then
+        for key, _ in pairs(down) do
+            if MOVE[key] and (now - (lastSeen[key] or 0)) > HOLD_STALE then
                 down[key] = nil
-                pendingUp[key] = nil
+                lastSeen[key] = nil
                 changed = true
             end
         end
         if changed then
             applyThrust()
         end
+        return changed
     end
 
     local function onKeyUp(key)
         if not MOVE[key] then
             return
         end
-        -- Solo release: stop immediately. Chord: brief grace so spurious ups don't drop the chord.
-        if otherMoveDown(key) then
-            pendingUp[key] = os.clock() + KEY_UP_GRACE
-        else
-            down[key] = nil
-            pendingUp[key] = nil
-            applyThrust()
-        end
+        -- Always clear immediately (deferred ups left yaw stuck when key_up was flaky)
+        down[key] = nil
+        lastSeen[key] = nil
+        applyThrust()
     end
 
     while not stop do
@@ -1363,20 +1353,24 @@ function drive.manualLoop(control, opts)
             elseif ev[1] == "key" then
                 local key, isRepeat = ev[2], ev[3] and true or false
                 if MOVE[key] then
-                    pendingUp[key] = nil
-                    down[key] = true
-                    if not isRepeat then
-                        clearOpposites(key)
-                        applyThrust()
+                    -- Ignore repeats after key_up already cleared this key (queue race)
+                    if isRepeat and not down[key] then
+                        -- drop
+                    else
+                        down[key] = true
+                        lastSeen[key] = os.clock()
+                        if not isRepeat then
+                            clearOpposites(key)
+                            applyThrust()
+                        end
                     end
-                    -- repeats keep chord alive (cancel pending key_up from other key)
                 elseif (not isRepeat) and key == quitKey then
                     stop = true
                     break
                 elseif (not isRepeat) and key == keys.x then
                     print("Panic stop")
                     down = {}
-                    pendingUp = {}
+                    lastSeen = {}
                     drive.panicStop(control)
                     lastIdleStopAt = os.clock()
                 end
@@ -1388,7 +1382,7 @@ function drive.manualLoop(control, opts)
         end
         if stop then break end
 
-        flushPendingUps()
+        clearStaleKeys()
 
         if not anyDown() then
             -- Retry failed setRPM(0) without full staggered hardStop every tick
