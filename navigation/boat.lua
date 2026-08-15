@@ -167,9 +167,45 @@ local function runRoute(cfg)
     end
 end
 
+local function splitArgs(str)
+    local out = {}
+    if not str or str == "" then
+        return out
+    end
+    for token in string.gmatch(str, "%S+") do
+        out[#out + 1] = token
+    end
+    return out
+end
+
+local function runCalibrate(argStr)
+    local navCal = require("nav_calibrate")
+    local opts = navCal.parseArgs(splitArgs(argStr))
+    print("=== Calibrate (from boat menu) ===")
+    print("Open water, props submerged. Q from control first if you were piloting.")
+    print(string.format("rpm=%s  power=%s RF/t", tostring(opts.probe_rpm), tostring(opts.power_budget_rf)))
+    print()
+    drive.stopAllMotors({ drain_timeout = 0.5 })
+    local control, err = navCal.run({
+        pulse = 0.7,
+        settle = 0.4,
+        use_sides = false,
+        invert_analog = opts.invert_analog,
+        probe_rpm = opts.probe_rpm,
+        power_budget_rf = opts.power_budget_rf,
+        fe_per_rpm = opts.fe_per_rpm,
+    })
+    if not control then
+        print("FAILED: " .. tostring(err))
+        return false
+    end
+    navCal.printReport(control)
+    return true
+end
+
 local function menu(cfg)
     print("Boat " .. cfg.boat_id)
-    print("Commands: control | record <name> | stop | run | follow <path> | dock <port> | list | pose | quit")
+    print("Commands: control | calibrate [power N] [rpm N] | record <name> | stop | run | follow <path> | dock <port> | list | pose | quit")
     while true do
         write("> ")
         local line = read()
@@ -189,6 +225,8 @@ local function menu(cfg)
             for _, n in ipairs(path.list()) do
                 print("  " .. n)
             end
+        elseif cmd == "calibrate" or cmd == "calib" then
+            runCalibrate(a)
         elseif cmd == "control" or cmd == "manual" then
             local _, reason = drive.manualLoop(drive.loadControl(), {})
             print("Control ended (" .. tostring(reason) .. ")")
@@ -211,7 +249,7 @@ local function menu(cfg)
             local p = pose.get()
             print(string.format("pos=%.2f,%.2f,%.2f yaw=%.1fdeg", p.position.x, p.position.y, p.position.z, pose.yawDeg(p.yaw)))
         else
-            print("Unknown. control | record <name> | stop | run | follow <path> | dock <port> | list | pose | quit")
+            print("Unknown. control | calibrate | record <name> | stop | run | follow <path> | dock <port> | list | pose | quit")
         end
     end
 end
@@ -235,6 +273,12 @@ local args = { ... }
 if args[1] == "stop" or args[1] == "halt" then
     drive.allOff(nil, { scan_all = true })
     print("All thrusters / motors stopped")
+elseif args[1] == "calibrate" or args[1] == "calib" then
+    local rest = {}
+    for i = 2, #args do
+        rest[#rest + 1] = args[i]
+    end
+    runCalibrate(table.concat(rest, " "))
 elseif args[1] == "run" then
     if not hasModem then
         print("Wireless modem required for run")

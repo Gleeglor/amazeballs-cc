@@ -86,7 +86,9 @@ end
 --
 -- IMPORTANT: Create Addition motors KEEP their last RPM if the computer
 -- reboots/shuts off mid-command. Always stop() before exit; boot must zero them.
-local DEFAULT_MAX_RPM = 64 -- hard preference for this boat
+local DEFAULT_MAX_RPM = 24 -- hard cap per motor for this boat
+local DEFAULT_POWER_BUDGET_RF = 45
+local DEFAULT_FE_PER_RPM = 1 -- CCA-ish: ~1 FE/t per RPM (pack-dependent)
 local motorDesired = {}
 local motorSent = {}
 local motorWrapCache = {}
@@ -177,12 +179,48 @@ function drive.clampControlRpm(control)
         return control
     end
     control.default_motor_rpm = math.min(tonumber(control.default_motor_rpm) or DEFAULT_MAX_RPM, DEFAULT_MAX_RPM)
+    if control.power_budget_rf == nil then
+        control.power_budget_rf = DEFAULT_POWER_BUDGET_RF
+    end
+    if control.fe_per_rpm == nil then
+        control.fe_per_rpm = DEFAULT_FE_PER_RPM
+    end
     if type(control.thrusters) == "table" then
         for _, t in ipairs(control.thrusters) do
             t.max_rpm = math.min(tonumber(t.max_rpm) or control.default_motor_rpm, DEFAULT_MAX_RPM)
         end
     end
     return control
+end
+
+--- Scale queued motor RPMs so sum(|rpm|)*fe_per_rpm <= power_budget_rf.
+function drive.applyPowerBudget(control)
+    control = control or drive.loadControl()
+    local budget = tonumber(control and control.power_budget_rf)
+    if not budget or budget <= 0 then
+        return false
+    end
+    local fePer = tonumber(control and control.fe_per_rpm) or DEFAULT_FE_PER_RPM
+    if fePer < 1e-6 then
+        fePer = DEFAULT_FE_PER_RPM
+    end
+    local maxUnits = budget / fePer
+    local total = 0
+    for _, rpm in pairs(motorDesired) do
+        total = total + math.abs(rpm or 0)
+    end
+    if total <= maxUnits + 1e-6 then
+        return false
+    end
+    local scale = maxUnits / total
+    for name, rpm in pairs(motorDesired) do
+        local nextRpm = math.floor((rpm or 0) * scale + (rpm >= 0 and 0.5 or -0.5))
+        if nextRpm ~= motorDesired[name] then
+            motorDesired[name] = nextRpm
+            motorSent[name] = nil
+        end
+    end
+    return true
 end
 
 --- Block until this motor's desired RPM is sent (for calibrate pulses).
@@ -542,6 +580,7 @@ function drive.applyDirect(control, fx, fy, tz)
             drive.setActuator(control, t, math.max(0, duty))
         end
     end
+    drive.applyPowerBudget(control)
     drive.flushMotors(1)
     return true
 end
@@ -665,6 +704,7 @@ function drive.applyWrench(control, fx, fy, tz)
             drive.setActuator(control, t, math.max(0, u[i]))
         end
     end
+    drive.applyPowerBudget(control)
     drive.flushMotors(1)
     return true
 end
@@ -935,6 +975,13 @@ function drive.manualLoop(control, opts)
     print("  Q    quit" .. (recordName and (" + save path '" .. recordName .. "'") or ""))
     if wrenchMode then
         print("  Thrusters: " .. #control.thrusters .. (nMotor > 0 and (" (" .. nMotor .. " motors)") or ""))
+        if nMotor > 0 then
+            print(string.format(
+                "  Motors: max %s RPM, power budget %s RF/t",
+                tostring(control.default_motor_rpm or 24),
+                tostring(control.power_budget_rf or 45)
+            ))
+        end
     end
     print()
 

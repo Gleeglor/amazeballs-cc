@@ -13,7 +13,7 @@ function calibrate.listActuators(useSides)
     table.sort(names)
     for _, name in ipairs(names) do
         if peripheral.hasType(name, "electric_motor") then
-            list[#list + 1] = { name = name, kind = "motor", max_rpm = 64 }
+            list[#list + 1] = { name = name, kind = "motor", max_rpm = 24 }
         end
     end
     for _, name in ipairs(names) do
@@ -69,7 +69,7 @@ end
 
 local function pulseOne(actuator, duration, control, probeRpm)
     if actuator.kind == "motor" then
-        drive.setMotorRpmNow(actuator.name, probeRpm or actuator.max_rpm or 64)
+        drive.setMotorRpmNow(actuator.name, probeRpm or actuator.max_rpm or 24)
         sleep(duration)
         drive.setMotorRpmNow(actuator.name, 0)
     else
@@ -114,12 +114,84 @@ function calibrate.describe(w)
     return "mixed"
 end
 
+--- Parse CLI / boat-menu args: invert, rpm N, power N, fe N
+function calibrate.parseArgs(args)
+    args = args or {}
+    local opts = {
+        invert_analog = false,
+        probe_rpm = 24,
+        power_budget_rf = 45,
+        fe_per_rpm = 1,
+    }
+    local i = 1
+    while i <= #args do
+        local a = string.lower(tostring(args[i]))
+        if a == "invert" or a == "--invert" or a == "inverted" then
+            opts.invert_analog = true
+        elseif a == "rpm" or a == "--rpm" then
+            i = i + 1
+            opts.probe_rpm = tonumber(args[i]) or opts.probe_rpm
+        elseif a == "power" or a == "--power" or a == "rf" or a == "fe" then
+            i = i + 1
+            opts.power_budget_rf = tonumber(args[i]) or opts.power_budget_rf
+        elseif a == "fe_per_rpm" or a == "--fe_per_rpm" then
+            i = i + 1
+            opts.fe_per_rpm = tonumber(args[i]) or opts.fe_per_rpm
+        elseif tonumber(a) then
+            opts.probe_rpm = tonumber(a)
+        end
+        i = i + 1
+    end
+    -- Never probe harder than the boat hard-cap
+    if opts.probe_rpm > 24 then
+        opts.probe_rpm = 24
+    end
+    if opts.probe_rpm < 1 then
+        opts.probe_rpm = 24
+    end
+    return opts
+end
+
+function calibrate.printReport(control)
+    if not control then
+        return
+    end
+    print()
+    print("Saved /boat_control.json  (version " .. tostring(control.version)
+        .. ", mode=" .. tostring(control.mode)
+        .. ", max_rpm=" .. tostring(control.default_motor_rpm)
+        .. ", power=" .. tostring(control.power_budget_rf) .. " RF/t)")
+    print("Thrusters (" .. #control.thrusters .. "):")
+    for _, t in ipairs(control.thrusters) do
+        local kind = t.kind or "?"
+        print(string.format(
+            "  [%s] %s  fx=%.3f fy=%.3f tz=%.3f  [%s]",
+            kind,
+            t.name,
+            t.fx,
+            t.fy,
+            t.tz,
+            calibrate.describe(t)
+        ))
+    end
+    if control.unused and #control.unused > 0 then
+        print("Unused: " .. table.concat(control.unused, ", "))
+    end
+    print("Motors reverse for strafe/turn when needed; idle = 0 RPM.")
+    print("Power budget scales simultaneous motor RPM to fit RF/t.")
+end
+
 function calibrate.run(opts)
     opts = opts or {}
     local pulse = opts.pulse or 0.7
     local settle = opts.settle or 0.4
     local useSides = opts.use_sides == true
-    local probeRpm = opts.probe_rpm or 64
+    local probeRpm = opts.probe_rpm or 24
+    if probeRpm > 24 then
+        probeRpm = 24
+    end
+    local powerBudget = opts.power_budget_rf or 45
+    local fePerRpm = opts.fe_per_rpm or 1
     local linFloor = (opts.thresholds and opts.thresholds.linear) or 0.04
     local yawFloor = (opts.thresholds and opts.thresholds.yaw) or 0.025
 
@@ -135,6 +207,8 @@ function calibrate.run(opts)
     print("Actuators: Create Addition electric_motor + redstone_relay")
     print("Motors: probes +RPM and -RPM (reverse thrust)")
     print("Motion vs CoM → force + torque (no modem GPS needed).")
+    print(string.format("Motor probe/max RPM: %s  |  power budget: %s RF/t (≈%s FE per RPM)",
+        tostring(probeRpm), tostring(powerBudget), tostring(fePerRpm)))
     if invert then
         print("Relay invert ON (motors ignore this — 0 RPM is always off)")
     end
@@ -161,6 +235,15 @@ function calibrate.run(opts)
         end
     end
     print(string.format("Found %d motor(s), %d relay(s)", nMotor, nRelay))
+    if nMotor > 0 then
+        local fair = math.floor(powerBudget / math.max(1, nMotor * fePerRpm))
+        print(string.format(
+            "Power: %s RF/t shared → ~%s RPM each if all spin together (cap %s)",
+            tostring(powerBudget),
+            tostring(math.min(probeRpm, math.max(1, fair))),
+            tostring(probeRpm)
+        ))
+    end
 
     local ok, err = pcall(pose.get)
     if not ok then
@@ -309,10 +392,12 @@ function calibrate.run(opts)
     end
 
     local control = {
-        version = 4,
+        version = 5,
         mode = "wrench",
         invert_analog = invert,
         default_motor_rpm = probeRpm,
+        power_budget_rf = powerBudget,
+        fe_per_rpm = fePerRpm,
         thrusters = thrusters,
         unused = unused,
         weights = { fx = 1.0, fy = 1.0, tz = 1.5 },
