@@ -679,16 +679,19 @@ function drive.applyReassembly(control, fx, fy, tz)
     if gain < 1e-6 then
         gain = 1
     end
-    -- Cost weights: uncommanded axes are expensive so strafe nulls yaw (CoM couple)
-    -- and yaw nulls leftover strafe — Reassembly-style decoupling.
-    local function axisW(cmd, onW, offW)
-        return math.abs(cmd) > 0.15 and onW or offW
+    -- Cost weights (sqrt applied below): boost nulling of uncommanded axes
+    -- only for pure-axis commands so surge (W) isn't crushed by yaw-coupling.
+    local axW = { 1.0, 1.0, 1.0 }
+    if math.abs(fy) >= 0.5 and math.abs(fx) + math.abs(tz) < 0.25 then
+        -- Strafe: kill CoM yaw couple (and leftover surge)
+        axW = { 2.8, 1.0, 5.5 }
+    elseif math.abs(fx) >= 0.5 and math.abs(fy) + math.abs(tz) < 0.25 then
+        -- Surge: modest yaw null so W still pushes hard
+        axW = { 1.0, 2.5, 3.0 }
+    elseif math.abs(tz) >= 0.5 and math.abs(fx) + math.abs(fy) < 0.25 then
+        -- Yaw: kill leftover translation
+        axW = { 2.8, 2.8, 1.0 }
     end
-    local axW = {
-        axisW(fx, 1.0, 3.2),
-        axisW(fy, 1.0, 3.2),
-        axisW(tz, 1.0, 5.0), -- strongest: kill yaw when only strafing/surging
-    }
     local sw = {
         math.sqrt(axW[1]),
         math.sqrt(axW[2]),
@@ -1219,8 +1222,6 @@ function drive.manualLoop(control, opts)
     local wrenchMode = drive.isWrenchMode(control)
     local lastIdleStopAt = 0
     local KEY_UP_GRACE = 0.06
-    local STALE_KEY_SEC = 0.35
-    local lastSeen = {}
 
     local YAW_L = { [keys.a] = true, [keys.left] = true, [keys.j] = true }
     local YAW_R = { [keys.d] = true, [keys.right] = true, [keys.l] = true }
@@ -1327,14 +1328,6 @@ function drive.manualLoop(control, opts)
                 changed = true
             end
         end
-        -- Lost key_up (CC sticky): drop MOVE keys with no recent key/repeat
-        for key, _ in pairs(down) do
-            if MOVE[key] and (now - (lastSeen[key] or 0)) > STALE_KEY_SEC then
-                down[key] = nil
-                pendingUp[key] = nil
-                changed = true
-            end
-        end
         if changed then
             applyThrust()
         end
@@ -1352,7 +1345,6 @@ function drive.manualLoop(control, opts)
                 if MOVE[key] then
                     pendingUp[key] = nil
                     down[key] = true
-                    lastSeen[key] = os.clock()
                     if not isRepeat then
                         clearOpposites(key)
                         applyThrust()
