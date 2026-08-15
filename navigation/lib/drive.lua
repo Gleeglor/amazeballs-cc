@@ -205,7 +205,7 @@ function drive.hardStopThrusters(control)
     end
     for _, name in ipairs(names) do
         motorDesired[name] = 0
-        motorSent[name] = nil
+        motorSent[name] = nil -- force setRPM(0) even if we thought it was already 0
         local m = getMotor(name)
         if m then
             pcall(function()
@@ -499,7 +499,16 @@ function drive.setActuator(control, thruster, duty)
         if math.abs(duty) < 0.08 then
             duty = 0
         end
-        drive.setMotorRpm(name, duty * maxRpm * rpmSign)
+        local rpm = duty * maxRpm * rpmSign
+        if math.abs(rpm) < 2 then
+            rpm = 0
+        end
+        -- Always re-issue stop when target is 0 (CCA sometimes ignores a prior 0)
+        if rpm == 0 then
+            motorDesired[name] = 0
+            motorSent[name] = nil
+        end
+        drive.setMotorRpm(name, rpm)
         return true
     end
 
@@ -670,30 +679,37 @@ function drive.applyReassembly(control, fx, fy, tz)
     if gain < 1e-6 then
         gain = 1
     end
-    -- Axis emphasis: pure yaw trusts tiny CoM-offset tz components
-    local axW = { 1.0, 1.0, 1.0 }
-    if math.abs(tz) >= 0.5 and math.abs(fx) + math.abs(fy) < 0.25 then
-        axW = { 0.25, 0.25, 1.0 }
-    elseif math.abs(fy) >= 0.5 and math.abs(fx) + math.abs(tz) < 0.25 then
-        axW = { 0.25, 1.0, 0.25 }
+    -- Cost weights: uncommanded axes are expensive so strafe nulls yaw (CoM couple)
+    -- and yaw nulls leftover strafe — Reassembly-style decoupling.
+    local function axisW(cmd, onW, offW)
+        return math.abs(cmd) > 0.15 and onW or offW
     end
+    local axW = {
+        axisW(fx, 1.0, 3.2),
+        axisW(fy, 1.0, 3.2),
+        axisW(tz, 1.0, 5.0), -- strongest: kill yaw when only strafing/surging
+    }
+    local sw = {
+        math.sqrt(axW[1]),
+        math.sqrt(axW[2]),
+        math.sqrt(axW[3]),
+    }
 
     local function dutiesFor(scale)
         local Fd = {
-            (fx / cmdMag) * gain * scale * axW[1],
-            (fy / cmdMag) * gain * scale * axW[2],
-            (tz / cmdMag) * gain * scale * axW[3],
+            (fx / cmdMag) * gain * scale * sw[1],
+            (fy / cmdMag) * gain * scale * sw[2],
+            (tz / cmdMag) * gain * scale * sw[3],
         }
-        -- G = W W^T with weighted columns: use wi' = (axW[k]*wi[k])
         local G = {
             { 1e-8, 0, 0 },
             { 0, 1e-8, 0 },
             { 0, 0, 1e-8 },
         }
         for _, t in ipairs(thrusters) do
-            local w1 = (t.fx or 0) * axW[1]
-            local w2 = (t.fy or 0) * axW[2]
-            local w3 = (t.tz or 0) * axW[3]
+            local w1 = (t.fx or 0) * sw[1]
+            local w2 = (t.fy or 0) * sw[2]
+            local w3 = (t.tz or 0) * sw[3]
             G[1][1] = G[1][1] + w1 * w1
             G[1][2] = G[1][2] + w1 * w2
             G[1][3] = G[1][3] + w1 * w3
@@ -711,9 +727,9 @@ function drive.applyReassembly(control, fx, fy, tz)
         local u = {}
         local maxAbs = 0
         for i, t in ipairs(thrusters) do
-            local wi1 = (t.fx or 0) * axW[1]
-            local wi2 = (t.fy or 0) * axW[2]
-            local wi3 = (t.tz or 0) * axW[3]
+            local wi1 = (t.fx or 0) * sw[1]
+            local wi2 = (t.fy or 0) * sw[2]
+            local wi3 = (t.tz or 0) * sw[3]
             local ui = wi1 * lambda[1] + wi2 * lambda[2] + wi3 * lambda[3]
             if t.kind ~= "motor" then
                 ui = math.max(0, ui)
@@ -742,11 +758,27 @@ function drive.applyReassembly(control, fx, fy, tz)
             duty = 0
         end
         drive.setActuator(control, t, duty)
+        -- Ensure idle thrusters actually get a stop command this frame
+        if duty == 0 and t.kind == "motor" and t.name then
+            motorDesired[t.name] = 0
+            if motorSent[t.name] ~= 0 then
+                motorSent[t.name] = nil
+            end
+        end
     end
 
-    -- Keep combinations intact for yaw (don't unevenly shrink one diagonal)
+    -- Keep yaw couples intact (don't unevenly shrink one diagonal)
     if not (math.abs(tz) >= 0.5 and math.abs(fx) + math.abs(fy) < 0.25) then
         drive.applyPowerBudget(control)
+    end
+    -- After budget, re-zero tiny RPMs and force-stop anything that should be off
+    for name, rpm in pairs(motorDesired) do
+        if math.abs(rpm or 0) < 2 then
+            motorDesired[name] = 0
+            if motorSent[name] ~= 0 then
+                motorSent[name] = nil
+            end
+        end
     end
     drive.commitMotorsNow()
     return true
@@ -1186,7 +1218,9 @@ function drive.manualLoop(control, opts)
     local stop = false
     local wrenchMode = drive.isWrenchMode(control)
     local lastIdleStopAt = 0
-    local KEY_UP_GRACE = 0.1
+    local KEY_UP_GRACE = 0.06
+    local STALE_KEY_SEC = 0.35
+    local lastSeen = {}
 
     local YAW_L = { [keys.a] = true, [keys.left] = true, [keys.j] = true }
     local YAW_R = { [keys.d] = true, [keys.right] = true, [keys.l] = true }
@@ -1267,6 +1301,7 @@ function drive.manualLoop(control, opts)
         local cmd = commandFromKeys()
         if cmd.fx == 0 and cmd.fy == 0 and cmd.tz == 0 then
             drive.hardStopThrusters(control)
+            drive.commitMotorsNow()
             lastIdleStopAt = os.clock()
             return
         end
@@ -1292,6 +1327,14 @@ function drive.manualLoop(control, opts)
                 changed = true
             end
         end
+        -- Lost key_up (CC sticky): drop MOVE keys with no recent key/repeat
+        for key, _ in pairs(down) do
+            if MOVE[key] and (now - (lastSeen[key] or 0)) > STALE_KEY_SEC then
+                down[key] = nil
+                pendingUp[key] = nil
+                changed = true
+            end
+        end
         if changed then
             applyThrust()
         end
@@ -1309,6 +1352,7 @@ function drive.manualLoop(control, opts)
                 if MOVE[key] then
                     pendingUp[key] = nil
                     down[key] = true
+                    lastSeen[key] = os.clock()
                     if not isRepeat then
                         clearOpposites(key)
                         applyThrust()
@@ -1338,8 +1382,9 @@ function drive.manualLoop(control, opts)
         flushPendingUps()
 
         if not anyDown() then
-            if (os.clock() - lastIdleStopAt) >= 0.2 then
+            if (os.clock() - lastIdleStopAt) >= 0.15 then
                 drive.hardStopThrusters(control)
+                drive.commitMotorsNow()
                 lastIdleStopAt = os.clock()
             end
         end
