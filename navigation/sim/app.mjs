@@ -78,6 +78,15 @@ function syncControlsFromDom() {
   params.comX = num("comX", 0);
   params.comY = num("comY", 0);
   params.comZ = num("comZ", -0.05);
+  // Allocation uses the same CoM as physics (τ about CoM + cancel).
+  control.com_x = params.comX;
+  control.com_y = params.comY;
+  control.com_z = params.comZ;
+  control.comX = params.comX;
+  control.comY = params.comY;
+  control.comZ = params.comZ;
+  if (control.com_compensate == null) control.com_compensate = true;
+  if (control.yaw_sign == null) control.yaw_sign = 1;
   params.wrenchForceScale = num("fScale", 40);
   params.wrenchTorqueScale = num("tScale", 25);
   const maxRpm = num("maxRpm", 24);

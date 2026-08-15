@@ -3,11 +3,13 @@
 Interactive top+side play-space and unit tests for Amazeballs ComputerCraft boat drive logic.
 
 **Default allocation** mirrors `navigation/lib/drive.lua` `applyCommand`:
-1. `applyReassembly` (weighted LS)
-2. if LS fails **or all duties deadband to 0** → `applyTeleop`
-3. if still dead → `applyCardinalRoles` (facing-only mixer; no calib `tz` needed)
+1. `applyReassembly` (weighted LS) with CoM-aware wrenches + duty-space yaw null
+2. if LS fails **or all duties deadband to 0** → `applyTeleop` (same cancel)
+3. if still dead → `applyCardinalRoles` (facing mixer + yaw null; no calib `tz` needed)
 
-Physics is a **boat on water**: multi-point buoyancy, gravity at offset CoM, hull linear/quadratic drag, yaw damping. Thruster torque is τ = (r − r_com) × F in geometric mode.
+**Sign convention:** `+tz` = CCW from above = **A / craft-left**. `boat_control.yaw_sign` (default `+1`) flips A/D in one place if motors are inverted.
+
+Physics is a **boat on water**: multi-point buoyancy, gravity at offset CoM, hull linear/quadratic drag, yaw damping. Thruster torque is τ = (r − r_com) × F in geometric mode. Sim sidebar CoM is fed into allocation.
 
 ## Default fixture: `cardinal_5_boat`
 
@@ -18,6 +20,8 @@ Physics is a **boat on water**: multi-point buoyancy, gravity at offset CoM, hul
 | `bow_stbd` | right | (0.55, 0.75) | Strafe + yaw |
 | `stern_port` | back | (−0.65, −0.60) | Reverse + yaw |
 | `stern_stbd` | back | (−0.65, 0.60) | Reverse + yaw |
+
+Offset-CoM fixtures: `cardinal_5_com_stbd`, `cardinal_5_com_port`, `cardinal_5_com_aft`.
 
 ## Open the sim
 
@@ -34,7 +38,7 @@ Or: `python3 -m http.server 8765` → http://localhost:8765
 | Key | Command |
 |-----|---------|
 | W / S | surge `fx` ±1 |
-| A / D | yaw `tz` ±1 |
+| A / D | yaw `tz` ±1 (A = left / +tz) |
 | Z / C | strafe `fy` ±1 |
 | X | clear held keys |
 | R | reset pose |
@@ -48,10 +52,17 @@ cd navigation/sim
 npm test
 ```
 
-## In-game mapping
+Covers allocation, physics, **user CoM bugs** (`com_bugs.test.mjs`), and **in-game-equivalent** `boat_control.json` v6 cases (`lua_like_cardinal5`).
 
-1. `updater` pulls Lua from `amazeballs-cc`
-2. **Recalibrate** (longer settle) so thrusters get `facing` / `max_force`
-3. `boat` → `control` — W/S/A/D/Z/C; if Reassembly would zero motors, teleop/cardinal fallback now runs
+## In-game (one updater pass)
+
+1. `updater` pulls Lua from `amazeballs-cc` **once**
+2. **Recalibrate once** (longer settle) so thrusters get `facing` / `max_force` (and `lx/ly` if available)
+3. `boat` → `control` smoke: W / S / A (left) / D (right) / Z / C / release (X)
+
+Optional in `/boat_control.json`:
+- `"yaw_sign": -1` — only if A still turns right after recalibrate
+- `"com_x" / "com_y" / "com_z"` — hull CoM for τ about CoM
+- `"com_compensate": false` — disable yaw-null polish
 
 If your four angle thrusters are not pure L/R/back (diagonal mounts), facing may be `mixed` — Reassembly uses measured wrenches; cardinal fallback needs clear facings.

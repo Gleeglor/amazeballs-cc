@@ -125,13 +125,20 @@ describe("physics integrator", () => {
     const { duties } = applyReassembly(control, 0, 0, 1);
     let body = createBody();
     const params = defaultPhysicsParams({ forceMode: "wrench", angularDrag: 0.5 });
-    const yaw0 = body.yaw;
+    let yawUnwrapped = 0;
+    let prevYaw = body.yaw;
     for (let i = 0; i < 180; i++) {
       const r = step(body, control.thrusters, duties, params, 1 / 60);
       assert.equal(r.ok, true);
       body = r.body;
+      let dy = body.yaw - prevYaw;
+      if (dy > Math.PI) dy -= 2 * Math.PI;
+      if (dy < -Math.PI) dy += 2 * Math.PI;
+      yawUnwrapped += dy;
+      prevYaw = body.yaw;
     }
-    assert.ok(body.yaw > yaw0 + 0.15, `expected +yaw, yaw=${body.yaw}`);
+    assert.ok(yawUnwrapped > 0.15, `expected +yaw unwrapped, got ${yawUnwrapped}`);
+    assert.ok(body.wz > 0, `expected +wz, got ${body.wz}`);
   });
 
   it("idle + drag damps after Reassembly burst", () => {

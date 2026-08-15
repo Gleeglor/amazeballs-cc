@@ -107,9 +107,114 @@ export function fixtureCardinal5Boat() {
     alloc_mode: "reassembly",
     default_motor_rpm: 24,
     gains: { norm: 1 },
+    yaw_sign: 1,
+    com_compensate: true,
+    com_x: 0,
+    com_y: 0,
+    com_z: -0.05,
     thrusters,
     description:
       "Default Amazeballs layout: 1 forward + 4 cardinal maneuver (L/R/back). Editable positions.",
+  };
+}
+
+/**
+ * Cardinal 5 with offset CoM — reproduces surge/strafe yaw couple until cancel.
+ * @param {{comX?:number,comY?:number,comZ?:number}} [opts]
+ */
+export function fixtureCardinal5OffsetCom(opts = {}) {
+  const base = fixtureCardinal5Boat();
+  base.com_x = opts.comX ?? 0;
+  base.com_y = opts.comY ?? 0.35;
+  base.com_z = opts.comZ ?? -0.05;
+  base.comX = base.com_x;
+  base.comY = base.com_y;
+  base.comZ = base.com_z;
+  base.com_compensate = true;
+  base.description = `Cardinal 5 with CoM offset (${base.com_x}, ${base.com_y}, ${base.com_z}).`;
+  for (const t of base.thrusters) syncWrenchFromFacing(t, base);
+  return base;
+}
+
+/** Lua-shaped v6 boat_control: facing + max_force + measured tz, little/no lx/ly. */
+export function fixtureLuaLikeCardinal5(opts = {}) {
+  const tzScale = opts.tzScale ?? 1;
+  const thrusters = [
+    {
+      name: "fwd",
+      kind: "motor",
+      facing: "forward",
+      role: "forward",
+      max_force: 0.5,
+      fx: 0.5,
+      fy: 0,
+      tz: 0.01 * tzScale,
+      max_rpm: 24,
+      side_score: 0,
+    },
+    {
+      name: "port",
+      kind: "motor",
+      facing: "left",
+      role: "left",
+      max_force: 0.4,
+      fx: 0,
+      fy: -0.4,
+      tz: 0.08 * tzScale,
+      max_rpm: 24,
+      side_score: -1,
+      lever_est: -0.5,
+    },
+    {
+      name: "stbd",
+      kind: "motor",
+      facing: "right",
+      role: "right",
+      max_force: 0.4,
+      fx: 0,
+      fy: 0.4,
+      tz: -0.08 * tzScale,
+      max_rpm: 24,
+      side_score: 1,
+      lever_est: 0.5,
+    },
+    {
+      name: "aftL",
+      kind: "motor",
+      facing: "back",
+      role: "back",
+      max_force: 0.35,
+      fx: -0.35,
+      fy: 0,
+      tz: 0.04 * tzScale,
+      max_rpm: 24,
+      side_score: -1,
+      ly: -0.5,
+    },
+    {
+      name: "aftR",
+      kind: "motor",
+      facing: "back",
+      role: "back",
+      max_force: 0.35,
+      fx: -0.35,
+      fy: 0,
+      tz: -0.04 * tzScale,
+      max_rpm: 24,
+      side_score: 1,
+      ly: 0.5,
+    },
+  ];
+  return {
+    version: 6,
+    mode: "wrench",
+    alloc_mode: "reassembly",
+    default_motor_rpm: 24,
+    gains: { norm: 0.5 },
+    yaw_sign: opts.yawSign ?? 1,
+    com_compensate: true,
+    thrusters: thrusters.map(withMag),
+    description: "In-game-equivalent boat_control.json v6 (facing + calib tz).",
   };
 }
 
@@ -365,6 +470,10 @@ export const FIXTURES = {
   cardinal_5_boat: fixtureCardinal5Boat,
   cardinal_5_sized: fixtureCardinal5Sized,
   cardinal_6_plus: fixtureCardinal6Plus,
+  cardinal_5_com_stbd: () => fixtureCardinal5OffsetCom({ comY: 0.35 }),
+  cardinal_5_com_port: () => fixtureCardinal5OffsetCom({ comY: -0.35 }),
+  cardinal_5_com_aft: () => fixtureCardinal5OffsetCom({ comX: -0.25, comY: 0.2 }),
+  lua_like_cardinal5: () => fixtureLuaLikeCardinal5(),
   symmetric_surge: fixtureSymmetricSurge,
   near_com_strafe: fixtureSymmetricStrafeNearCom,
   asymmetric_near_com: fixtureAsymmetricNearCom,

@@ -559,6 +559,103 @@ local function facingToUnit(facing)
     return nil, nil
 end
 
+--- Sign convention: +tz = CCW = A / craft-left. boat_control.yaw_sign flips once.
+function drive.getYawSign(control)
+    local s = tonumber(control and control.yaw_sign)
+    if s and s ~= 0 then
+        return (s > 0) and 1 or -1
+    end
+    return 1
+end
+
+function drive.getCom(control)
+    control = control or {}
+    return {
+        x = tonumber(control.com_x or control.comX) or 0,
+        y = tonumber(control.com_y or control.comY) or 0,
+        z = tonumber(control.com_z or control.comZ) or 0,
+    }
+end
+
+function drive.netWrench(thrusters, duties)
+    local Fx, Fy, Tz = 0, 0, 0
+    for i, t in ipairs(thrusters) do
+        local d = duties[i] or 0
+        if math.abs(d) >= 1e-12 then
+            Fx = Fx + d * (t.fx or 0)
+            Fy = Fy + d * (t.fy or 0)
+            Tz = Tz + d * (t.tz or 0)
+        end
+    end
+    return { fx = Fx, fy = Fy, tz = Tz }
+end
+
+--- Yaw mixer authority: prefer calib/geometry tz sign (fixes A-invert on forward thrusters).
+function drive.yawAuthority(t, sideFallback)
+    local tz = tonumber(t and t.tz) or 0
+    if math.abs(tz) >= 0.015 then
+        return (tz >= 0) and 1 or -1
+    end
+    local side = sideFallback or drive.thrusterSide(t)
+    if math.abs(side) < 1e-6 then
+        return 0
+    end
+    local facing = t and (t.facing or t.role) or ""
+    if facing == "forward" or facing == "surge" or facing == "main" then
+        return (side >= 0) and -1 or 1
+    elseif facing == "back" or facing == "aft" or facing == "reverse" then
+        return (side >= 0) and 1 or -1
+    end
+    return (side >= 0) and 1 or -1
+end
+
+--- Duty-space yaw null for pure surge/strafe (CoM couple cancel).
+function drive.nullResidualYaw(thrusters, duties)
+    local out = {}
+    for i, d in ipairs(duties) do
+        out[i] = d or 0
+    end
+    for _ = 1, 10 do
+        local w = drive.netWrench(thrusters, out)
+        local primary = math.max(math.abs(w.fx), math.abs(w.fy), 1e-3)
+        if math.abs(w.tz) < 0.06 and math.abs(w.tz) / primary < 0.12 then
+            break
+        end
+        local bestI, bestScore = nil, 0
+        for i, t in ipairs(thrusters) do
+            local tz = tonumber(t.tz) or 0
+            if math.abs(tz) >= 0.01 then
+                local couple = math.abs(tz) / (0.15 + math.abs(t.fx or 0) + math.abs(t.fy or 0))
+                if couple > bestScore then
+                    bestScore = couple
+                    bestI = i
+                end
+            end
+        end
+        if not bestI then
+            break
+        end
+        local t = thrusters[bestI]
+        local tz = tonumber(t.tz) or 0
+        local delta = (-w.tz / tz) * 0.55
+        local lo, hi = (t.kind == "motor") and -1 or 0, 1
+        out[bestI] = util.clamp((out[bestI] or 0) + delta, lo, hi)
+    end
+    for i = 1, #out do
+        if math.abs(out[i] or 0) < 0.08 then
+            out[i] = 0
+        end
+    end
+    return out
+end
+
+local function isPureSurge(fx, fy, tz)
+    return math.abs(fx) >= 0.5 and math.abs(fy) + math.abs(tz) < 0.25
+end
+local function isPureStrafe(fx, fy, tz)
+    return math.abs(fy) >= 0.5 and math.abs(fx) + math.abs(tz) < 0.25
+end
+
 --- Classify cardinal facing from wrench when facing/role missing.
 function drive.classifyFacing(t)
     local fx = tonumber(t.fx) or 0
@@ -577,9 +674,8 @@ function drive.classifyFacing(t)
     return "mixed"
 end
 
---- Rebuild fx/fy from facing × max_force when geometry labels exist.
--- Keeps measured tz (lever). Used so Reassembly matches cardinal thruster model.
-function drive.syncThrusterFacing(t)
+--- Rebuild fx/fy/(tz about CoM) from facing × max_force when geometry labels exist.
+function drive.syncThrusterFacing(t, control)
     if type(t) ~= "table" then
         return t
     end
@@ -605,8 +701,20 @@ function drive.syncThrusterFacing(t)
     end
     t.facing = facing
     t.role = facing
+    local prevTz = tonumber(t.tz) or 0
     t.fx = strength * ux
     t.fy = strength * uy
+    local lx = tonumber(t.lx) or 0
+    local ly = tonumber(t.ly) or 0
+    local lz = tonumber(t.lz) or 0
+    local hasLever = math.sqrt(lx * lx + ly * ly + lz * lz) >= 1e-4
+    if hasLever then
+        local com = drive.getCom(control)
+        local rx, ry = lx - com.x, ly - com.y
+        t.tz = rx * t.fy - ry * t.fx
+    else
+        t.tz = prevTz
+    end
     if facing == "left" then
         t.side_score = -1
     elseif facing == "right" then
@@ -622,20 +730,59 @@ function drive.enrichControl(control)
     if not control or type(control.thrusters) ~= "table" then
         return control
     end
+    if control.yaw_sign == nil then
+        control.yaw_sign = 1
+    end
+    if control.com_compensate == nil then
+        control.com_compensate = true
+    end
     for _, t in ipairs(control.thrusters) do
         local facing = t.facing or t.role
         if facing and facing ~= "mixed" then
-            drive.syncThrusterFacing(t)
+            drive.syncThrusterFacing(t, control)
         elseif not facing then
             facing = drive.classifyFacing(t)
             t.facing = facing
             t.role = facing
             if facing ~= "mixed" and (t.max_force or t.strength) then
-                drive.syncThrusterFacing(t)
+                drive.syncThrusterFacing(t, control)
             end
         end
     end
     return control
+end
+
+--- Collect duties from actuators without writing motors (sim-style). Internal.
+local lastDuties = {}
+
+local function readBackDuties(control, scores, maxAbs, scale)
+    local duties = {}
+    for i, t in ipairs(control.thrusters) do
+        local duty = ((scores[i] or 0) / maxAbs) * scale
+        if math.abs(duty) < 0.08 then
+            duty = 0
+        end
+        if t.kind ~= "motor" then
+            duty = util.clamp(duty, 0, 1)
+        else
+            duty = util.clamp(duty, -1, 1)
+        end
+        duties[i] = duty
+    end
+    return duties
+end
+
+local function applyDutiesToActuators(control, duties)
+    local anyDuty = false
+    for i, t in ipairs(control.thrusters) do
+        local duty = duties[i] or 0
+        if math.abs(duty) >= 0.08 then
+            anyDuty = true
+        end
+        drive.setActuator(control, t, duty)
+    end
+    lastDuties = duties
+    return anyDuty
 end
 
 --- Prefer Reassembly when alloc_mode says so or when facings are present.
@@ -670,8 +817,9 @@ function drive.preferCardinal(control)
     return mode == "cardinal" or mode == "roles"
 end
 
---- Facing/role mixer: W uses forward (+), back (−); A/D uses L/R sides; Z/C uses L/R facing.
+--- Facing/role mixer: W uses forward (+), back (−); A/D uses yaw authority; Z/C uses L/R facing.
 -- Does not need calibrated tz — fixes A/D dead when Reassembly LS deadbands to 0.
+-- Applies CoM duty-space yaw null on pure surge/strafe.
 function drive.applyCardinalRoles(control, fx, fy, tz)
     control = control or drive.loadControl()
     if not drive.isWrenchMode(control) then
@@ -680,6 +828,7 @@ function drive.applyCardinalRoles(control, fx, fy, tz)
     drive.enrichControl(control)
 
     fx, fy, tz = fx or 0, fy or 0, tz or 0
+    tz = tz * drive.getYawSign(control)
     local cmdMag = math.sqrt(fx * fx + fy * fy + tz * tz)
     if cmdMag < 1e-4 then
         drive.hardStopThrusters(control)
@@ -710,8 +859,8 @@ function drive.applyCardinalRoles(control, fx, fy, tz)
         elseif facing == "left" or facing == "port" then
             strafe = -1
         end
-        local yawSide = drive.thrusterSide(t)
-        scores[i] = fx * surge + fy * strafe + tz * yawSide
+        local yawAuth = drive.yawAuthority(t, drive.thrusterSide(t))
+        scores[i] = fx * surge + fy * strafe + tz * yawAuth
     end
     if not anyFacing then
         return false
@@ -727,17 +876,14 @@ function drive.applyCardinalRoles(control, fx, fy, tz)
     end
 
     local scale = math.min(1, cmdMag)
-    local anyDuty = false
-    for i, t in ipairs(thrusters) do
-        local duty = ((scores[i] or 0) / maxAbs) * scale
-        if math.abs(duty) < 0.08 then
-            duty = 0
+    local duties = readBackDuties(control, scores, maxAbs, scale)
+    if isPureSurge(fx, fy, 0) or isPureStrafe(fx, fy, 0) then
+        if control.com_compensate ~= false then
+            duties = drive.nullResidualYaw(thrusters, duties)
         end
-        if math.abs(duty) >= 0.08 then
-            anyDuty = true
-        end
-        drive.setActuator(control, t, duty)
     end
+
+    local anyDuty = applyDutiesToActuators(control, duties)
     if not anyDuty then
         drive.hardStopThrusters(control)
         return false
@@ -758,10 +904,12 @@ function drive.applyCardinalRoles(control, fx, fy, tz)
     return true
 end
 
---- Allocate command; Reassembly → teleop → cardinal roles when duties die.
+--- Allocate command; yaw_sign + CoM cancel; Reassembly → teleop → cardinal roles.
 function drive.applyCommand(control, fx, fy, tz)
     control = control or drive.loadControl()
     drive.enrichControl(control)
+    fx, fy, tz = fx or 0, fy or 0, tz or 0
+
     if drive.preferCardinal(control) then
         if drive.applyCardinalRoles(control, fx, fy, tz) then
             return true, "cardinal"
@@ -913,6 +1061,7 @@ function drive.applyReassembly(control, fx, fy, tz)
     drive.enrichControl(control)
 
     fx, fy, tz = fx or 0, fy or 0, tz or 0
+    tz = tz * drive.getYawSign(control)
     local cmdMag = math.sqrt(fx * fx + fy * fy + tz * tz)
     if cmdMag < 1e-4 then
         drive.hardStopThrusters(control)
@@ -1009,23 +1158,30 @@ function drive.applyReassembly(control, fx, fy, tz)
         end
     end
 
+    local duties = {}
     local anyDuty = false
     for i, t in ipairs(thrusters) do
         local duty = util.clamp(u[i] or 0, (t.kind == "motor") and -1 or 0, 1)
         if math.abs(duty) < dutyDeadband then
             duty = 0
         end
+        duties[i] = duty
         if math.abs(duty) >= dutyDeadband then
             anyDuty = true
         end
-        drive.setActuator(control, t, duty)
     end
 
     -- LS "succeeded" but every duty deadbanded → fail so applyCommand can fall back
-    -- (classic A/D dead: all tz≈0 after facing snap / noisy calib).
     if not anyDuty then
         return false
     end
+
+    -- CoM couple polish on pure surge/strafe
+    if control.com_compensate ~= false and (isPureSurge(fx, fy, 0) or isPureStrafe(fx, fy, 0)) then
+        duties = drive.nullResidualYaw(thrusters, duties)
+    end
+
+    applyDutiesToActuators(control, duties)
 
     -- Per-motor RPM only (no shared RF pool scaling)
     if not (math.abs(tz) >= 0.5 and math.abs(fx) + math.abs(fy) < 0.25) then
@@ -1153,13 +1309,19 @@ function drive.healYawThrusters(control)
             and math.abs(row.s) < 1e-6 then
             -- leave tz as-is
         elseif t.kind == "motor" or math.abs(t.fx or 0) > 0.01 or math.abs(t.fy or 0) > 0.01 then
-            -- Left half of sorted sides → negative tz lever, right half → positive
-            local sign = (idx <= (n / 2)) and -1 or 1
+            local sideSign = (idx <= (n / 2)) and -1 or 1
             if row.s ~= 0 then
-                sign = (row.s < 0) and -1 or 1
+                sideSign = (row.s < 0) and -1 or 1
+            end
+            -- Match τ = −ly·fx so A (+tz) → +Tz (left). Forward: opposite of side.
+            local sign = sideSign
+            if facing == "forward" or facing == "surge" or facing == "main" then
+                sign = -sideSign
+            elseif facing == "back" or facing == "aft" or facing == "reverse" then
+                sign = sideSign
             end
             t.tz = sign * base * 0.5
-            t.side_score = sign
+            t.side_score = sideSign
             t.mag = math.sqrt((t.fx or 0) ^ 2 + (t.fy or 0) ^ 2 + (t.tz or 0) ^ 2)
             healed = healed + 1
         end
@@ -1177,6 +1339,7 @@ function drive.applyTeleop(control, fx, fy, tz)
     end
 
     fx, fy, tz = fx or 0, fy or 0, tz or 0
+    tz = tz * drive.getYawSign(control)
     local cmdMag = math.sqrt(fx * fx + fy * fy + tz * tz)
     if cmdMag < 1e-4 then
         drive.hardStopThrusters(control)
@@ -1219,9 +1382,9 @@ function drive.applyTeleop(control, fx, fy, tz)
     end
 
     local scores = {}
-    local pureSurge = math.abs(fx) >= 0.5 and math.abs(fy) + math.abs(tz) < 0.25
+    local pureSurge = isPureSurge(fx, fy, tz)
     local pureYaw = math.abs(tz) >= 0.5 and math.abs(fx) + math.abs(fy) < 0.25
-    local pureStrafe = math.abs(fy) >= 0.5 and math.abs(fx) + math.abs(tz) < 0.25
+    local pureStrafe = isPureStrafe(fx, fy, tz)
 
     if pureSurge then
         -- Forward/back only: use calibrated fx. If calib is all-strafe, push every motor equally
@@ -1235,17 +1398,13 @@ function drive.applyTeleop(control, fx, fy, tz)
             end
         end
     elseif pureYaw then
-        -- Turn: differential by physical side. Prefer calib tz when it has real authority.
+        -- Turn: differential by physical yaw authority. Prefer calib tz when it has real authority.
         local useCalibTz = maxTz >= 0.02 and maxTz >= math.max(maxFx, maxFy) * 0.1
         for i, t in ipairs(thrusters) do
             if useCalibTz then
                 scores[i] = tz * (t.tz or 0)
             else
-                local s = sides[i]
-                if math.abs(s) < 1e-6 then
-                    s = 1
-                end
-                scores[i] = tz * ((s >= 0) and 1 or -1)
+                scores[i] = tz * drive.yawAuthority(t, sides[i])
             end
         end
     elseif pureStrafe then
@@ -1263,8 +1422,8 @@ function drive.applyTeleop(control, fx, fy, tz)
         for i, t in ipairs(thrusters) do
             local yawLever = t.tz or 0
             if math.abs(yawLever) < 0.02 then
-                local s = sides[i]
-                yawLever = ((s >= 0) and 1 or -1) * math.max(0.25, math.abs(t.fx or 0), math.abs(t.fy or 0))
+                local auth = drive.yawAuthority(t, sides[i])
+                yawLever = auth * math.max(0.25, math.abs(t.fx or 0), math.abs(t.fy or 0))
             end
             scores[i] = fx * (t.fx or 0) + fy * (t.fy or 0) + tz * yawLever
         end
@@ -1275,15 +1434,14 @@ function drive.applyTeleop(control, fx, fy, tz)
         maxAbs = math.max(maxAbs, math.abs(scores[i] or 0))
     end
     if maxAbs < 1e-8 then
-        -- Last resort: surge → all equal; yaw → name-split differential
+        -- Last resort: surge → all equal; yaw → authority differential
         if math.abs(fx) >= math.abs(fy) and math.abs(fx) >= math.abs(tz) then
             for i = 1, n do
                 scores[i] = fx
             end
         else
             for i = 1, n do
-                local s = sides[i]
-                scores[i] = (tz ~= 0 and tz or fy) * ((s >= 0) and 1 or -1)
+                scores[i] = (tz ~= 0 and tz or fy) * drive.yawAuthority(thrusters[i], sides[i])
             end
         end
         maxAbs = 0
@@ -1297,13 +1455,11 @@ function drive.applyTeleop(control, fx, fy, tz)
     end
 
     local scale = math.min(1, cmdMag)
-    for i, t in ipairs(thrusters) do
-        local duty = ((scores[i] or 0) / maxAbs) * scale
-        if math.abs(duty) < 0.08 then
-            duty = 0
-        end
-        drive.setActuator(control, t, duty)
+    local duties = readBackDuties(control, scores, maxAbs, scale)
+    if control.com_compensate ~= false and (pureSurge or pureStrafe) then
+        duties = drive.nullResidualYaw(thrusters, duties)
     end
+    applyDutiesToActuators(control, duties)
 
     for name, rpm in pairs(motorDesired) do
         if math.abs(rpm or 0) < 2 then

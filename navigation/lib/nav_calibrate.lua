@@ -459,6 +459,9 @@ function calibrate.run(opts)
         version = 6,
         mode = "wrench",
         alloc_mode = "reassembly",
+        -- +tz = CCW = A / craft-left. Set to -1 only if A still turns right after recalibrate.
+        yaw_sign = 1,
+        com_compensate = true,
         invert_analog = invert,
         default_motor_rpm = probeRpm,
         power_budget_rf = powerBudget,

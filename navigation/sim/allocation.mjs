@@ -12,6 +12,17 @@
 
 const DUTY_DEADBAND = 0.08;
 
+/**
+ * Sign convention (body frame, top-down):
+ *   +fx = surge forward (W)
+ *   +fy = strafe starboard (C)
+ *   +tz = yaw CCW = craft-left turn (A / port)
+ *   −tz = yaw CW = craft-right turn (D / starboard)
+ *
+ * boat_control.yaw_sign (default +1) multiplies the commanded tz once in
+ * applyCommand / compensate so a single flip fixes inverted A/D in-game.
+ */
+
 export const FACING_DIRS = {
   forward: { x: 1, y: 0, z: 0 },
   back: { x: -1, y: 0, z: 0 },
@@ -21,6 +32,37 @@ export const FACING_DIRS = {
 
 function clamp(v, lo, hi) {
   return Math.max(lo, Math.min(hi, v));
+}
+
+/** CoM from boat_control.json / sim params (body frame, hull origin). */
+export function getCom(control, opts = {}) {
+  const c = control || {};
+  return {
+    x: Number(opts.comX ?? c.comX ?? c.com_x) || 0,
+    y: Number(opts.comY ?? c.comY ?? c.com_y) || 0,
+    z: Number(opts.comZ ?? c.comZ ?? c.com_z) || 0,
+  };
+}
+
+export function getYawSign(control) {
+  const s = Number(control && control.yaw_sign);
+  return Number.isFinite(s) && s !== 0 ? Math.sign(s) : 1;
+}
+
+/** Net body wrench from duties × thruster fx/fy/tz (allocation units). */
+export function netWrench(thrusters, duties) {
+  let Fx = 0;
+  let Fy = 0;
+  let Tz = 0;
+  for (let i = 0; i < thrusters.length; i++) {
+    const d = duties[i] || 0;
+    if (Math.abs(d) < 1e-12) continue;
+    const t = thrusters[i];
+    Fx += d * (t.fx || 0);
+    Fy += d * (t.fy || 0);
+    Tz += d * (t.tz || 0);
+  }
+  return { Fx, Fy, Tz };
 }
 
 /** Map facing / role string → unit thrust direction in body frame. */
@@ -49,11 +91,13 @@ export function classifyFacingFromWrench(t) {
 }
 
 /**
- * Geometric wrench at duty=1: F = strength × facing, τ = r × F.
+ * Geometric wrench at duty=1: F = strength × facing, τ = (r − r_com) × F.
  * Mutates thruster; sets fx/fy/fz/tx/ty/tz used by applyReassembly.
  * If no lever arm is set (lx=ly=lz≈0), keep any measured tz (Lua calib path).
+ * @param {object} t thruster
+ * @param {{x?:number,y?:number,z?:number}|object} [comOrControl] CoM or full control
  */
-export function syncWrenchFromFacing(t) {
+export function syncWrenchFromFacing(t, comOrControl = null) {
   if (!t || typeof t !== "object") return t;
   let facing = t.facing || t.role;
   if (!facing || facing === "mixed") {
@@ -83,10 +127,28 @@ export function syncWrenchFromFacing(t) {
   const ly = Number(t.ly) || 0;
   const lz = Number(t.lz) || 0;
   const hasLever = Math.hypot(lx, ly, lz) >= 1e-4;
-  t.tx = ly * t.fz - lz * t.fy;
-  t.ty = lz * t.fx - lx * t.fz;
+  const com =
+    comOrControl &&
+    (Array.isArray(comOrControl.thrusters) ||
+      comOrControl.com_x != null ||
+      comOrControl.comX != null ||
+      comOrControl.com_y != null ||
+      comOrControl.comY != null ||
+      comOrControl.com_z != null ||
+      comOrControl.comZ != null)
+      ? getCom(comOrControl)
+      : {
+          x: Number(comOrControl?.x ?? comOrControl?.comX) || 0,
+          y: Number(comOrControl?.y ?? comOrControl?.comY) || 0,
+          z: Number(comOrControl?.z ?? comOrControl?.comZ) || 0,
+        };
+  const rx = lx - com.x;
+  const ry = ly - com.y;
+  const rz = lz - com.z;
+  t.tx = ry * t.fz - rz * t.fy;
+  t.ty = rz * t.fx - rx * t.fz;
   // Preserve calib tz when positions were never measured (in-game JSON).
-  t.tz = hasLever ? lx * t.fy - ly * t.fx : prevTz;
+  t.tz = hasLever ? rx * t.fy - ry * t.fx : prevTz;
   t.mag = Math.hypot(t.fx, t.fy, t.tz);
 
   if (facing === "left") t.side_score = -1;
@@ -117,7 +179,26 @@ export function enrichThruster(t, opts = {}) {
     t.strength != null ||
     t.sync_geometry === true;
   if (wantGeom && facingToDir(t.facing || t.role)) {
-    return syncWrenchFromFacing(t);
+    return syncWrenchFromFacing(t, opts.com || opts.control || null);
+  }
+
+  // Recompute τ about CoM when levers exist and CoM is offset (keep calib tz at origin).
+  const lx = Number(t.lx) || 0;
+  const ly = Number(t.ly) || 0;
+  const lz = Number(t.lz) || 0;
+  if (Math.hypot(lx, ly, lz) >= 1e-4 && (opts.com || opts.control)) {
+    const com = opts.com || getCom(opts.control);
+    if (Math.hypot(com.x, com.y, com.z) >= 1e-4) {
+      const rx = lx - com.x;
+      const ry = ly - com.y;
+      const rz = lz - com.z;
+      const fx = Number(t.fx) || 0;
+      const fy = Number(t.fy) || 0;
+      const fz = Number(t.fz) || 0;
+      t.tx = ry * fz - rz * fy;
+      t.ty = rz * fx - rx * fz;
+      t.tz = rx * fy - ry * fx;
+    }
   }
 
   t.mag =
@@ -128,8 +209,147 @@ export function enrichThruster(t, opts = {}) {
 
 export function enrichControl(control, opts = {}) {
   if (!control || !Array.isArray(control.thrusters)) return control;
-  for (const t of control.thrusters) enrichThruster(t, opts);
+  const com = opts.com || getCom(control, opts);
+  for (const t of control.thrusters) {
+    enrichThruster(t, { ...opts, com, control });
+  }
   return control;
+}
+
+function isPureSurge(fx, fy, tz) {
+  return Math.abs(fx) >= 0.5 && Math.abs(fy) + Math.abs(tz) < 0.25;
+}
+function isPureStrafe(fx, fy, tz) {
+  return Math.abs(fy) >= 0.5 && Math.abs(fx) + Math.abs(tz) < 0.25;
+}
+function isPureYaw(fx, fy, tz) {
+  return Math.abs(tz) >= 0.5 && Math.abs(fx) + Math.abs(fy) < 0.25;
+}
+
+/**
+ * Iterative yaw cancel for pure surge/strafe: allocate, measure residual Tz,
+ * nudge tz command opposite the couple. Reverse flips naturally with duties.
+ */
+export function allocateWithComCancel(allocFn, control, fx, fy, tz, opts = {}) {
+  enrichControl(control, opts);
+  const enabled =
+    opts.compensate !== false && control && control.com_compensate !== false;
+  const yawSign = opts.yawSign != null ? opts.yawSign : getYawSign(control);
+  const pilotTz = tz * yawSign;
+
+  const pure =
+    isPureSurge(fx, fy, pilotTz) || isPureStrafe(fx, fy, pilotTz);
+  if (!enabled || !pure) {
+    const r = allocFn(control, fx, fy, pilotTz);
+    return {
+      ...r,
+      cmd: { fx, fy, tz: pilotTz },
+      yawSign,
+      compensated: false,
+      residualTz: 0,
+    };
+  }
+
+  const maxIter = Math.max(1, Number(opts.cancelIters ?? control.com_cancel_iters) || 4);
+  const gain = Number(opts.cancelGain ?? control.com_cancel_gain) || 0.85;
+  const ratioLim = Number(opts.cancelRatioLimit) || 0.08;
+  const absLim = Number(opts.cancelAbsLimit) || 0.05;
+
+  let tzCmd = pilotTz;
+  let r = allocFn(control, fx, fy, tzCmd);
+  let residualTz = 0;
+  let compensated = false;
+  const intentBranch = isPureSurge(fx, fy, pilotTz)
+    ? "pure_surge"
+    : isPureStrafe(fx, fy, pilotTz)
+      ? "pure_strafe"
+      : null;
+
+  for (let i = 0; i < maxIter; i++) {
+    if (!r.ok || !dutiesAlive(r.duties, 0.04)) break;
+    const w = netWrench(control.thrusters, r.duties);
+    residualTz = w.Tz;
+    const primary = Math.max(Math.abs(w.Fx), Math.abs(w.Fy), 1e-3);
+    const ratio = residualTz / primary;
+    if (Math.abs(ratio) < ratioLim && Math.abs(residualTz) < absLim) break;
+    tzCmd = clamp(tzCmd - ratio * gain, -1.25, 1.25);
+    compensated = true;
+    r = allocFn(control, fx, fy, tzCmd);
+  }
+
+  if (r.ok && dutiesAlive(r.duties, 0.04) && intentBranch) {
+    const before = netWrench(control.thrusters, r.duties).Tz;
+    const polished = nullResidualYaw(control.thrusters, r.duties);
+    r = { ...r, duties: polished };
+    residualTz = netWrench(control.thrusters, r.duties).Tz;
+    if (Math.abs(residualTz) + 1e-9 < Math.abs(before)) compensated = true;
+  } else if (r.ok && dutiesAlive(r.duties, 0.04)) {
+    residualTz = netWrench(control.thrusters, r.duties).Tz;
+  }
+
+  const branch =
+    compensated && intentBranch
+      ? intentBranch
+      : r.branch;
+
+  return {
+    ...r,
+    branch,
+    cmd: { fx, fy, tz: tzCmd },
+    yawSign,
+    compensated,
+    residualTz,
+  };
+}
+
+/** @deprecated open-loop shim — prefer allocateWithComCancel */
+export function compensateComCommand(control, fx = 0, fy = 0, tz = 0, opts = {}) {
+  const r = allocateWithComCancel(
+    (c, x, y, z) => applyReassembly(c, x, y, z),
+    control,
+    fx,
+    fy,
+    tz,
+    opts,
+  );
+  return {
+    fx,
+    fy,
+    tz: r.cmd.tz,
+    compensated: r.compensated,
+    biasTz: r.residualTz,
+  };
+}
+
+export function prepareCommand(control, fx = 0, fy = 0, tz = 0, opts = {}) {
+  const yawSign = opts.yawSign != null ? opts.yawSign : getYawSign(control);
+  return {
+    fx,
+    fy,
+    tz: tz * yawSign,
+    yawSign,
+    compensated: false,
+    biasTz: 0,
+  };
+}
+
+/** Yaw authority for mixers: prefer geometric/calib tz sign (fixes A-invert on fwd thrusters). */
+export function yawAuthority(t, sideFallback = 0) {
+  const tz = Number(t && t.tz) || 0;
+  if (Math.abs(tz) >= 0.015) return Math.sign(tz);
+  const side = sideFallback || thrusterSide(t);
+  if (Math.abs(side) < 1e-6) return 0;
+  const facing = String((t && (t.facing || t.role)) || "").toLowerCase();
+  // τz = −ly·fx: forward thruster on +starboard → negative tz → authority −side
+  if (facing === "forward" || facing === "surge" || facing === "main") {
+    return -Math.sign(side);
+  }
+  // back: fx negative at +duty → tz shares side sign
+  if (facing === "back" || facing === "aft" || facing === "reverse") {
+    return Math.sign(side);
+  }
+  // left/right facing: bow port (fy<0, lx>0) → tz < 0 → matches side (−)
+  return Math.sign(side);
 }
 
 export function isWrenchMode(control) {
@@ -166,14 +386,97 @@ function dutiesAlive(duties, eps = DUTY_DEADBAND) {
 }
 
 /**
- * Role/facing mixer for cardinal thrusters (no LS, no calib tz needed).
- * W: forward +duty, back −duty; A/D: side differential; Z/C: L/R facing.
+ * Nudge duties to kill residual Tz without a full LS solve.
+ * Used by cardinal/teleop when iterative command cancel oscillates.
  */
-export function applyCardinalRoles(control, fx = 0, fy = 0, tz = 0) {
+export function nullResidualYaw(thrusters, duties, opts = {}) {
+  const out = duties.map((d) => d || 0);
+  const maxSteps = Math.max(1, Number(opts.steps) || 10);
+  const targetRatio = Number(opts.targetRatio) || 0.12;
+  const targetAbs = Number(opts.targetAbs) || 0.06;
+  for (let step = 0; step < maxSteps; step++) {
+    const w = netWrench(thrusters, out);
+    const primary = Math.max(Math.abs(w.Fx), Math.abs(w.Fy), 1e-3);
+    if (Math.abs(w.Tz) < targetAbs && Math.abs(w.Tz) / primary < targetRatio) {
+      break;
+    }
+    // Pick thruster whose tz best reduces residual with least primary damage.
+    let bestI = -1;
+    let bestScore = 0;
+    for (let i = 0; i < thrusters.length; i++) {
+      const t = thrusters[i];
+      const tz = Number(t.tz) || 0;
+      if (Math.abs(tz) < 0.01) continue;
+      const reversible = t.kind === "motor";
+      const room = reversible
+        ? 1 - Math.abs(out[i])
+        : out[i] >= 0
+          ? 1 - out[i]
+          : 0;
+      if (room < 0.02 && !(reversible && Math.abs(out[i]) > 0.02)) continue;
+      // Prefer yaw authority over surge/strafe force.
+      const couple =
+        Math.abs(tz) /
+        (0.15 + Math.abs(t.fx || 0) + Math.abs(t.fy || 0));
+      if (couple > bestScore) {
+        bestScore = couple;
+        bestI = i;
+      }
+    }
+    if (bestI < 0) break;
+    const t = thrusters[bestI];
+    const tz = Number(t.tz) || 0;
+    let delta = (-w.Tz / tz) * 0.55;
+    const reversible = t.kind === "motor";
+    const next = clamp(out[bestI] + delta, reversible ? -1 : 0, 1);
+    if (Math.abs(next - out[bestI]) < 1e-4) break;
+    out[bestI] = next;
+  }
+  // Deadband scrub
+  for (let i = 0; i < out.length; i++) {
+    if (Math.abs(out[i]) < DUTY_DEADBAND) out[i] = 0;
+  }
+  return out;
+}
+
+/**
+ * Role/facing mixer for cardinal thrusters (no LS, no calib tz needed).
+ * W: forward +duty, back −duty; A/D: physical yaw authority; Z/C: L/R facing.
+ * Pass opts.skipCancel to allocate raw roles (used inside cancel loop).
+ */
+export function applyCardinalRoles(control, fx = 0, fy = 0, tz = 0, opts = {}) {
   if (!isWrenchMode(control)) {
     return { ok: false, duties: [], branch: "not_wrench" };
   }
-  enrichControl(control);
+  if (opts.skipCancel !== true && opts.compensate !== false) {
+    const wrapped = allocateWithComCancel(
+      (c, x, y, z) => applyCardinalRoles(c, x, y, z, { skipCancel: true }),
+      control,
+      fx,
+      fy,
+      tz,
+      opts,
+    );
+    // Command-space cancel can oscillate on aft CoM; duty-space null finishes the job.
+    if (
+      wrapped.ok &&
+      dutiesAlive(wrapped.duties) &&
+      (isPureSurge(fx, fy, 0) || isPureStrafe(fx, fy, 0))
+    ) {
+      const duties = nullResidualYaw(control.thrusters, wrapped.duties);
+      const residualTz = netWrench(control.thrusters, duties).Tz;
+      return {
+        ...wrapped,
+        duties,
+        residualTz,
+        branch: wrapped.branch || "cardinal_roles",
+        compensated: true,
+      };
+    }
+    return { ...wrapped, branch: wrapped.branch || "cardinal_roles" };
+  }
+
+  enrichControl(control, opts);
   const thrusters = control.thrusters;
   const n = thrusters.length;
   const cmdMag = Math.sqrt(fx * fx + fy * fy + tz * tz);
@@ -199,12 +502,9 @@ export function applyCardinalRoles(control, fx = 0, fy = 0, tz = 0) {
     if (facing === "right" || facing === "starboard" || facing === "stbd")
       strafe = 1;
     else if (facing === "left" || facing === "port") strafe = -1;
-    // Yaw: port (−) vs starboard (+). Centerline fwd uses 0 (no invented spin).
-    let yawSide = side;
-    if (Math.abs(yawSide) < 1e-6 && Math.abs(Number(t.ly) || 0) >= 0.05) {
-      yawSide = Math.sign(t.ly);
-    }
-    scores[i] = fx * surge + fy * strafe + tz * yawSide;
+    // Prefer wrench tz sign so A (+tz) always drives +Tz (left / CCW).
+    const yawAuth = yawAuthority(t, side);
+    scores[i] = fx * surge + fy * strafe + tz * yawAuth;
   }
 
   if (!anyFacing) {
@@ -218,7 +518,7 @@ export function applyCardinalRoles(control, fx = 0, fy = 0, tz = 0) {
   }
 
   const scale = Math.min(1, cmdMag);
-  const duties = new Array(n);
+  let duties = new Array(n);
   for (let i = 0; i < n; i++) {
     let duty = ((scores[i] || 0) / maxAbs) * scale;
     if (Math.abs(duty) < DUTY_DEADBAND) duty = 0;
@@ -229,43 +529,62 @@ export function applyCardinalRoles(control, fx = 0, fy = 0, tz = 0) {
   if (!dutiesAlive(duties)) {
     return { ok: false, duties, branch: "deadband" };
   }
+
+  // Duty-space yaw null for pure surge/strafe (skipCancel path used by cancel loop).
+  if (isPureSurge(fx, fy, tz) || isPureStrafe(fx, fy, tz)) {
+    duties = nullResidualYaw(thrusters, duties);
+  }
+
   return { ok: true, duties, branch: "cardinal_roles", scores };
 }
 
 /**
- * Full applyCommand mirror: Reassembly → teleop → cardinal roles on dead duties.
+ * Full applyCommand mirror: yaw_sign + CoM cancel, then
+ * Reassembly → teleop → cardinal roles on dead duties.
  */
 export function applyCommand(control, fx = 0, fy = 0, tz = 0, opts = {}) {
   const mode = (opts.allocMode || control.alloc_mode || control.teleop_mode || "")
     .toString()
     .toLowerCase();
+
+  const run = (allocFn) =>
+    allocateWithComCancel(allocFn, control, fx, fy, tz, {
+      ...opts,
+      // Inner allocators must not recurse cancel.
+      skipCancel: undefined,
+    });
+
   const preferReassembly =
     opts.preferReassembly !== false &&
     mode !== "teleop" &&
     mode !== "direct" &&
-    mode !== "cardinal";
+    mode !== "cardinal" &&
+    mode !== "roles";
 
   if (mode === "cardinal" || mode === "roles") {
-    return applyCardinalRoles(control, fx, fy, tz);
+    const r = applyCardinalRoles(control, fx, fy, tz, opts);
+    return { ...r, path: "cardinal" };
   }
   if (mode === "teleop" || mode === "direct") {
-    const tele = applyTeleop(control, fx, fy, tz);
+    const tele = run((c, x, y, z) => applyTeleop(c, x, y, z, { skipCancel: true }));
     if (tele.ok && dutiesAlive(tele.duties)) return { ...tele, path: "teleop" };
-    const roles = applyCardinalRoles(control, fx, fy, tz);
+    const roles = applyCardinalRoles(control, fx, fy, tz, opts);
     if (roles.ok) return { ...roles, path: "cardinal_fallback" };
     return { ...tele, path: "teleop" };
   }
 
   if (preferReassembly) {
-    const reass = applyReassembly(control, fx, fy, tz);
+    const reass = run((c, x, y, z) =>
+      applyReassembly(c, x, y, z, { skipCancel: true }),
+    );
     if (reass.ok && (reass.branch === "idle" || dutiesAlive(reass.duties))) {
       return { ...reass, path: "reassembly" };
     }
-    const tele = applyTeleop(control, fx, fy, tz);
+    const tele = run((c, x, y, z) => applyTeleop(c, x, y, z, { skipCancel: true }));
     if (tele.ok && (tele.branch === "idle" || dutiesAlive(tele.duties))) {
       return { ...tele, path: "teleop_fallback" };
     }
-    const roles = applyCardinalRoles(control, fx, fy, tz);
+    const roles = applyCardinalRoles(control, fx, fy, tz, opts);
     if (roles.ok) return { ...roles, path: "cardinal_fallback" };
     return {
       ok: false,
@@ -275,9 +594,9 @@ export function applyCommand(control, fx = 0, fy = 0, tz = 0, opts = {}) {
     };
   }
 
-  const tele = applyTeleop(control, fx, fy, tz);
+  const tele = run((c, x, y, z) => applyTeleop(c, x, y, z, { skipCancel: true }));
   if (tele.ok && dutiesAlive(tele.duties)) return { ...tele, path: "teleop" };
-  const roles = applyCardinalRoles(control, fx, fy, tz);
+  const roles = applyCardinalRoles(control, fx, fy, tz, opts);
   if (roles.ok) return { ...roles, path: "cardinal_fallback" };
   return { ...tele, path: "teleop" };
 }
@@ -319,7 +638,7 @@ export function healYawThrusters(control) {
   }
   ranked.forEach((row, idx) => {
     const t = row.t;
-    const facing = t.facing || t.role;
+    const facing = String(t.facing || t.role || "").toLowerCase();
     if (
       hasStrafeFacing &&
       (facing === "forward" || facing === "surge" || facing === "main") &&
@@ -332,10 +651,17 @@ export function healYawThrusters(control) {
       Math.abs(t.fx || 0) > 0.01 ||
       Math.abs(t.fy || 0) > 0.01
     ) {
-      let sign = idx <= n / 2 ? -1 : 1;
-      if (row.s !== 0) sign = row.s < 0 ? -1 : 1;
+      let sideSign = idx <= n / 2 ? -1 : 1;
+      if (row.s !== 0) sideSign = row.s < 0 ? -1 : 1;
+      // Match τ = (r−com)×F so A (+tz) → +Tz (left / CCW).
+      let sign = sideSign;
+      if (facing === "forward" || facing === "surge" || facing === "main") {
+        sign = -sideSign;
+      } else if (facing === "back" || facing === "aft" || facing === "reverse") {
+        sign = sideSign;
+      }
       t.tz = sign * base * 0.5;
-      t.side_score = sign;
+      t.side_score = sideSign;
       t.mag = Math.sqrt(
         (t.fx || 0) ** 2 + (t.fy || 0) ** 2 + (t.tz || 0) ** 2,
       );
@@ -375,11 +701,21 @@ function buildSides(thrusters) {
  * Teleop mixer — same command vector and scoring as drive.applyTeleop.
  * @returns {{ ok: boolean, duties: number[], branch: string, useEqual?: boolean, useCalibTz?: boolean }}
  */
-export function applyTeleop(control, fx = 0, fy = 0, tz = 0) {
+export function applyTeleop(control, fx = 0, fy = 0, tz = 0, opts = {}) {
   if (!isWrenchMode(control)) {
     return { ok: false, duties: [], branch: "not_wrench" };
   }
-  enrichControl(control);
+  if (opts.skipCancel !== true && opts.compensate !== false) {
+    return allocateWithComCancel(
+      (c, x, y, z) => applyTeleop(c, x, y, z, { skipCancel: true }),
+      control,
+      fx,
+      fy,
+      tz,
+      opts,
+    );
+  }
+  enrichControl(control, opts);
   const thrusters = control.thrusters;
   const n = thrusters.length;
   const cmdMag = Math.sqrt(fx * fx + fy * fy + tz * tz);
@@ -398,9 +734,9 @@ export function applyTeleop(control, fx = 0, fy = 0, tz = 0) {
   }
 
   const scores = new Array(n).fill(0);
-  const pureSurge = Math.abs(fx) >= 0.5 && Math.abs(fy) + Math.abs(tz) < 0.25;
-  const pureYaw = Math.abs(tz) >= 0.5 && Math.abs(fx) + Math.abs(fy) < 0.25;
-  const pureStrafe = Math.abs(fy) >= 0.5 && Math.abs(fx) + Math.abs(tz) < 0.25;
+  const pureSurge = isPureSurge(fx, fy, tz);
+  const pureYaw = isPureYaw(fx, fy, tz);
+  const pureStrafe = isPureStrafe(fx, fy, tz);
 
   let branch = "chord";
   let useEqual;
@@ -419,9 +755,7 @@ export function applyTeleop(control, fx = 0, fy = 0, tz = 0) {
       if (useCalibTz) {
         scores[i] = tz * (thrusters[i].tz || 0);
       } else {
-        let s = sides[i];
-        if (Math.abs(s) < 1e-6) s = 1;
-        scores[i] = tz * (s >= 0 ? 1 : -1);
+        scores[i] = tz * yawAuthority(thrusters[i], sides[i]);
       }
     }
   } else if (pureStrafe) {
@@ -440,9 +774,9 @@ export function applyTeleop(control, fx = 0, fy = 0, tz = 0) {
       const t = thrusters[i];
       let yawLever = t.tz || 0;
       if (Math.abs(yawLever) < 0.02) {
-        const s = sides[i];
+        const auth = yawAuthority(t, sides[i]);
         yawLever =
-          (s >= 0 ? 1 : -1) *
+          auth *
           Math.max(0.25, Math.abs(t.fx || 0), Math.abs(t.fy || 0));
       }
       scores[i] = fx * (t.fx || 0) + fy * (t.fy || 0) + tz * yawLever;
@@ -458,7 +792,8 @@ export function applyTeleop(control, fx = 0, fy = 0, tz = 0) {
       branch = "fallback_equal_surge";
     } else {
       for (let i = 0; i < n; i++) {
-        scores[i] = (tz !== 0 ? tz : fy) * (sides[i] >= 0 ? 1 : -1);
+        scores[i] =
+          (tz !== 0 ? tz : fy) * yawAuthority(thrusters[i], sides[i] || 1);
       }
       branch = "fallback_side_diff";
     }
@@ -515,11 +850,21 @@ function solve3x3(A, b) {
  * Reassembly-style least-squares allocation (drive.applyReassembly core).
  * Falls back is left to the caller / applyWrench — here we return null duties on singular.
  */
-export function applyReassembly(control, fx = 0, fy = 0, tz = 0) {
+export function applyReassembly(control, fx = 0, fy = 0, tz = 0, opts = {}) {
   if (!isWrenchMode(control)) {
     return { ok: false, duties: [], branch: "not_wrench" };
   }
-  enrichControl(control);
+  if (opts.skipCancel !== true && opts.compensate !== false) {
+    return allocateWithComCancel(
+      (c, x, y, z) => applyReassembly(c, x, y, z, { skipCancel: true }),
+      control,
+      fx,
+      fy,
+      tz,
+      opts,
+    );
+  }
+  enrichControl(control, opts);
   const thrusters = control.thrusters;
   const n = thrusters.length;
   const cmdMag = Math.sqrt(fx * fx + fy * fy + tz * tz);
