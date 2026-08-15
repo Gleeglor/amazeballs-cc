@@ -44,20 +44,8 @@ local function allOff(actuators, control)
     for _, a in ipairs(actuators) do
         drive.setActuator(control, a, 0)
     end
-    -- Also stop any motors not yet in the list (user just wired them)
-    drive.stopAllMotors()
-end
-
-local function pulseOne(actuator, duration, control, probeRpm)
-    if actuator.kind == "motor" then
-        drive.setMotorRpmNow(actuator.name, probeRpm or actuator.max_rpm or 128)
-        sleep(duration)
-        drive.setMotorRpmNow(actuator.name, 0)
-    else
-        drive.setActuator(control, actuator, 1)
-        sleep(duration)
-        drive.setActuator(control, actuator, 0)
-    end
+    -- Drain briefly so the next probe starts from a true stop
+    drive.stopAllMotors({ drain = true, drain_timeout = 0.4 })
 end
 
 local function sampleMotion()
@@ -77,6 +65,35 @@ end
 
 local function wrenchMag(w)
     return math.sqrt(w.fx * w.fx + w.fy * w.fy + w.tz * w.tz)
+end
+
+local function pulseOne(actuator, duration, control, probeRpm)
+    if actuator.kind == "motor" then
+        drive.setMotorRpmNow(actuator.name, probeRpm or actuator.max_rpm or 128)
+        sleep(duration)
+        drive.setMotorRpmNow(actuator.name, 0)
+    else
+        drive.setActuator(control, actuator, 1)
+        sleep(duration)
+        drive.setActuator(control, actuator, 0)
+    end
+end
+
+local function measureActuator(actuator, duration, control, probeRpm)
+    allOff({ actuator }, control)
+    sleep(0.25)
+    local before = sampleMotion()
+    pulseOne(actuator, duration, control, probeRpm)
+    sleep(0.25)
+    local after = sampleMotion()
+    allOff({ actuator }, control)
+    local w = {
+        fx = after.forward - before.forward,
+        fy = after.right - before.right,
+        tz = after.yaw - before.yaw,
+    }
+    w.mag = wrenchMag(w)
+    return w
 end
 
 function calibrate.describe(w)
@@ -116,6 +133,7 @@ function calibrate.run(opts)
 
     print("Calibrate (Reassembly / wrench mode)")
     print("Actuators: Create Addition electric_motor + redstone_relay")
+    print("Motors: probes +RPM and -RPM (reverse thrust)")
     print("Motion vs CoM → force + torque (no modem GPS needed).")
     if invert then
         print("Relay invert ON (motors ignore this — 0 RPM is always off)")
@@ -162,23 +180,88 @@ function calibrate.run(opts)
 
     for _, a in ipairs(actuators) do
         print("Probing " .. a.name .. " (" .. a.kind .. ") ...")
-        allOff(actuators, probeControl)
-        sleep(settle)
-        local before = sampleMotion()
-        pulseOne(a, pulse, probeControl, probeRpm)
-        sleep(settle)
-        local after = sampleMotion()
-        allOff(actuators, probeControl)
+        local w
 
-        local w = {
-            name = a.name,
-            kind = a.kind,
-            max_rpm = a.max_rpm or probeRpm,
-            fx = after.forward - before.forward,
-            fy = after.right - before.right,
-            tz = after.yaw - before.yaw,
-        }
-        w.mag = wrenchMag(w)
+        if a.kind == "motor" then
+            print("  +RPM ...")
+            local wPlus = measureActuator(a, pulse, probeControl, probeRpm)
+            print(string.format("    +  fx=%.3f fy=%.3f tz=%.3f", wPlus.fx, wPlus.fy, wPlus.tz))
+            sleep(0.15)
+            print("  -RPM ...")
+            local wMinus = measureActuator(a, pulse, probeControl, -probeRpm)
+            print(string.format("    -  fx=%.3f fy=%.3f tz=%.3f", wMinus.fx, wMinus.fy, wMinus.tz))
+
+            local plusOk = wPlus.mag >= linFloor or math.abs(wPlus.tz) >= yawFloor
+            local minusOk = wMinus.mag >= linFloor or math.abs(wMinus.tz) >= yawFloor
+
+            if plusOk and minusOk then
+                -- Best estimate of +1 duty effect: average of +rpm and opposite of -rpm
+                w = {
+                    name = a.name,
+                    kind = "motor",
+                    max_rpm = a.max_rpm or probeRpm,
+                    rpm_sign = 1,
+                    reversible = true,
+                    fx = 0.5 * (wPlus.fx - wMinus.fx),
+                    fy = 0.5 * (wPlus.fy - wMinus.fy),
+                    tz = 0.5 * (wPlus.tz - wMinus.tz),
+                }
+                local dot = wPlus.fx * wMinus.fx + wPlus.fy * wMinus.fy + wPlus.tz * wMinus.tz
+                local revOk = dot < -0.2 * (wPlus.mag * wMinus.mag + 1e-6)
+                print(revOk and "  reverse: OK (opposes forward)" or "  reverse: weak/asymmetric (still usable)")
+            elseif plusOk then
+                w = {
+                    name = a.name,
+                    kind = "motor",
+                    max_rpm = a.max_rpm or probeRpm,
+                    rpm_sign = 1,
+                    reversible = minusOk,
+                    fx = wPlus.fx,
+                    fy = wPlus.fy,
+                    tz = wPlus.tz,
+                }
+                print("  reverse: little/no response (check prop/FE)")
+            elseif minusOk then
+                -- Only reverse RPM pushes — map +duty to -RPM
+                w = {
+                    name = a.name,
+                    kind = "motor",
+                    max_rpm = a.max_rpm or probeRpm,
+                    rpm_sign = -1,
+                    reversible = true,
+                    fx = wMinus.fx,
+                    fy = wMinus.fy,
+                    tz = wMinus.tz,
+                }
+                print("  only -RPM thrusted; rpm_sign=-1 so +duty uses reverse")
+            else
+                w = {
+                    name = a.name,
+                    kind = "motor",
+                    max_rpm = a.max_rpm or probeRpm,
+                    fx = 0,
+                    fy = 0,
+                    tz = 0,
+                }
+            end
+            w.mag = wrenchMag(w)
+        else
+            allOff(actuators, probeControl)
+            sleep(settle)
+            local before = sampleMotion()
+            pulseOne(a, pulse, probeControl, probeRpm)
+            sleep(settle)
+            local after = sampleMotion()
+            allOff(actuators, probeControl)
+            w = {
+                name = a.name,
+                kind = a.kind,
+                fx = after.forward - before.forward,
+                fy = after.right - before.right,
+                tz = after.yaw - before.yaw,
+            }
+            w.mag = wrenchMag(w)
+        end
 
         local fHoriz = math.sqrt(w.fx * w.fx + w.fy * w.fy)
         if fHoriz > linFloor then
@@ -192,20 +275,22 @@ function calibrate.run(opts)
         else
             thrusters[#thrusters + 1] = w
             local lever = w.lever_est and string.format(" lever~%.2f", w.lever_est) or ""
+            local rev = w.reversible and " reversible" or ""
             print(string.format(
-                "  -> thruster [%s] fx=%.3f fy=%.3f tz=%.3f%s",
+                "  -> thruster [%s] fx=%.3f fy=%.3f tz=%.3f%s%s",
                 role,
                 w.fx,
                 w.fy,
                 w.tz,
-                lever
+                lever,
+                rev
             ))
         end
-        sleep(0.2) -- motor setRPM anti-spam
+        sleep(0.15)
     end
 
     allOff(actuators, probeControl)
-    drive.stopAllMotors()
+    drive.stopAllMotors({ drain = true, drain_timeout = 0.4 })
 
     if #thrusters == 0 then
         return nil, "no thrusters responded (no FE? props not connected? not on sublevel?)"
@@ -222,7 +307,7 @@ function calibrate.run(opts)
     end
 
     local control = {
-        version = 3,
+        version = 4,
         mode = "wrench",
         invert_analog = invert,
         default_motor_rpm = probeRpm,

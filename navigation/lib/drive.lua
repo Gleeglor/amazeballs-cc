@@ -148,19 +148,18 @@ function drive.setMotorRpm(name, rpm)
 end
 
 --- Block until this motor's desired RPM is sent (for calibrate pulses).
+-- Yields via sleep so Ctrl+T can interrupt; keeps timeout short.
 function drive.setMotorRpmNow(name, rpm, timeout)
     drive.setMotorRpm(name, rpm)
     motorSent[name] = nil
-    local deadline = os.clock() + (timeout or 1.0)
+    local deadline = os.clock() + (timeout or 0.8)
     while os.clock() < deadline do
         if motorSent[name] == motorDesired[name] then
             return true
         end
-        if drive.flushMotors(1) < 1 then
-            sleep(MOTOR_FLUSH_GAP)
-        else
-            sleep(MOTOR_FLUSH_GAP)
-        end
+        drive.flushMotors(1)
+        -- Short yield; pullEventRaw would also work but sleep is fine for calibrate
+        sleep(MOTOR_FLUSH_GAP)
     end
     return motorSent[name] == motorDesired[name]
 end
@@ -235,6 +234,7 @@ function drive.motorsPending()
 end
 
 --- Invalidate caches and queue stop for known motors (and optional full scan).
+-- Non-blocking by default — does not sleep (Ctrl+T must stay snappy).
 function drive.stopAllMotors(opts)
     opts = opts or {}
     local names = {}
@@ -251,14 +251,11 @@ function drive.stopAllMotors(opts)
         motorDesired[name] = 0
         motorSent[name] = nil -- force re-send
     end
-    -- Drain a handful immediately; remainder finishes on subsequent flushMotors ticks
-    for _ = 1, math.max(4, #names) do
-        if not drive.motorsPending() then
-            break
-        end
-        if drive.flushMotors(1) < 1 then
-            sleep(MOTOR_FLUSH_GAP)
-        else
+    drive.flushMotors(1)
+    if opts.drain then
+        local deadline = os.clock() + (opts.drain_timeout or 0.35)
+        while drive.motorsPending() and os.clock() < deadline do
+            drive.flushMotors(1)
             sleep(MOTOR_FLUSH_GAP)
         end
     end
@@ -294,11 +291,12 @@ function drive.setActuator(control, thruster, duty)
 
     if kind == "motor" then
         local maxRpm = thruster.max_rpm or (control and control.default_motor_rpm) or 256
+        local rpmSign = thruster.rpm_sign or 1
         duty = util.clamp(tonumber(duty) or 0, -1, 1)
         if math.abs(duty) < 0.03 then
             duty = 0
         end
-        drive.setMotorRpm(name, duty * maxRpm)
+        drive.setMotorRpm(name, duty * maxRpm * rpmSign)
         return true
     end
 
@@ -806,8 +804,22 @@ function drive.manualLoop(control, opts)
     while not stop do
         local timerId = os.startTimer(tick)
         while true do
-            local ev = { os.pullEvent() }
-            if ev[1] == "key" then
+            -- pullEventRaw so we can exit immediately on Ctrl+T without
+            -- getting stuck behind motor drain sleeps.
+            local ev = { os.pullEventRaw() }
+            if ev[1] == "terminate" then
+                -- Queue stops only — do not sleep/drain (that made Ctrl+T feel stuck)
+                if wrenchMode then
+                    for _, t in ipairs(control.thrusters) do
+                        if t.kind == "motor" then
+                            motorDesired[t.name] = 0
+                            motorSent[t.name] = nil
+                        end
+                    end
+                end
+                drive.flushMotors(1)
+                error("Terminated", 0)
+            elseif ev[1] == "key" then
                 -- Ignore OS key-repeat: re-applying every repeat was flooding setRPM
                 -- and delaying key_up by hundreds of ms.
                 if not ev[3] then
@@ -845,8 +857,8 @@ function drive.manualLoop(control, opts)
     end
 
     drive.allOff(control)
-    -- Finish stopping motors before exit
-    local deadline = os.clock() + 1.0
+    -- Brief soft drain on normal quit only (not Ctrl+T)
+    local deadline = os.clock() + 0.25
     while drive.motorsPending() and os.clock() < deadline do
         drive.flushMotors(1)
         sleep(MOTOR_FLUSH_GAP)
