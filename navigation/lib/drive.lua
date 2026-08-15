@@ -697,12 +697,41 @@ function drive.manualLoop(control, opts)
     local tick = opts.tick or 0.05
     local recordName = opts.recordName
     local held = {}
+    local pendingUp = {} -- key -> release-at clock (debounce spurious key_ups while held)
     local waypoints = {}
     local t0 = os.clock()
     local lastSample = 0
     local stop = false
     local wrenchMode = drive.isWrenchMode(control)
     local lastCmdKey = "000"
+    local KEY_UP_DEBOUNCE = 0.14
+
+    local function isMoveKey(key)
+        return key == keys.w or key == keys.s or key == keys.a or key == keys.d
+            or key == keys.z or key == keys.c
+    end
+
+    local function clearOpposite(key)
+        if key == keys.w then
+            held[keys.s] = nil
+            pendingUp[keys.s] = nil
+        elseif key == keys.s then
+            held[keys.w] = nil
+            pendingUp[keys.w] = nil
+        elseif key == keys.a then
+            held[keys.d] = nil
+            pendingUp[keys.d] = nil
+        elseif key == keys.d then
+            held[keys.a] = nil
+            pendingUp[keys.a] = nil
+        elseif key == keys.z then
+            held[keys.c] = nil
+            pendingUp[keys.c] = nil
+        elseif key == keys.c then
+            held[keys.z] = nil
+            pendingUp[keys.z] = nil
+        end
+    end
 
     drive.allOff(control)
 
@@ -758,45 +787,44 @@ function drive.manualLoop(control, opts)
         end
     end
 
-    local function onKeyDown(key)
+    local function pressMoveKey(key, isRepeat)
+        pendingUp[key] = nil -- cancel deferred release; still held
+        local wasHeld = held[key]
+        held[key] = true
+        if not isRepeat then
+            clearOpposite(key)
+        end
+        -- Re-apply if this restores a hold that a spurious key_up cleared
+        if not wasHeld or not isRepeat then
+            applyCommand()
+        end
+    end
+
+    local function onSpecialDown(key)
         if key == quitKey then
             stop = true
             return
         end
         if key == keys.x then
             held = {}
-            lastCmdKey = "xxx" -- force applyCommand to run after clear
+            pendingUp = {}
+            lastCmdKey = "xxx"
             drive.allOff(control)
             lastCmdKey = "000"
-            return
-        end
-        if key == keys.w or key == keys.s or key == keys.a or key == keys.d
-            or key == keys.z or key == keys.c then
-            held[key] = true
-            if key == keys.w then
-                held[keys.s] = nil
-            elseif key == keys.s then
-                held[keys.w] = nil
-            elseif key == keys.a then
-                held[keys.d] = nil
-            elseif key == keys.d then
-                held[keys.a] = nil
-            elseif key == keys.z then
-                held[keys.c] = nil
-            elseif key == keys.c then
-                held[keys.z] = nil
-            end
-            applyCommand()
         end
     end
 
-    local function onKeyUp(key)
-        if key == keys.x or key == quitKey then
-            return
+    local function flushPendingKeyUps()
+        local now = os.clock()
+        local changed = false
+        for key, at in pairs(pendingUp) do
+            if now >= at then
+                held[key] = nil
+                pendingUp[key] = nil
+                changed = true
+            end
         end
-        if key == keys.w or key == keys.s or key == keys.a or key == keys.d
-            or key == keys.z or key == keys.c then
-            held[key] = nil
+        if changed then
             applyCommand()
         end
     end
@@ -820,16 +848,22 @@ function drive.manualLoop(control, opts)
                 drive.flushMotors(1)
                 error("Terminated", 0)
             elseif ev[1] == "key" then
-                -- Ignore OS key-repeat: re-applying every repeat was flooding setRPM
-                -- and delaying key_up by hundreds of ms.
-                if not ev[3] then
-                    onKeyDown(ev[2])
+                local key, isRepeat = ev[2], ev[3] and true or false
+                if isMoveKey(key) then
+                    -- Repeats keep the hold alive (OS often emits fake key_ups while held)
+                    pressMoveKey(key, isRepeat)
+                elseif not isRepeat then
+                    onSpecialDown(key)
                     if stop then
                         break
                     end
                 end
             elseif ev[1] == "key_up" then
-                onKeyUp(ev[2])
+                local key = ev[2]
+                if isMoveKey(key) then
+                    -- Defer release; cancelled if a key/repeat arrives soon after
+                    pendingUp[key] = os.clock() + KEY_UP_DEBOUNCE
+                end
             elseif ev[1] == "timer" and ev[2] == timerId then
                 break
             end
@@ -837,6 +871,8 @@ function drive.manualLoop(control, opts)
         if stop then
             break
         end
+
+        flushPendingKeyUps()
 
         -- Drain queued motor RPM changes (stops first)
         drive.flushMotors(2)
