@@ -213,53 +213,30 @@ function drive.hardStopThrusters(control)
     drive.flushMotors(8)
 end
 
---- Panic stop for X / idle: slower but hits every motor past CCA anti-spam.
+--- Panic stop for X: zero known thrusters hard, no sleeps (sleep drops key events).
 function drive.panicStop(control)
     drive.hardStopThrusters(control)
-    local names = {}
-    local seen = {}
-    local function add(name)
-        if name and not seen[name] and peripheral.isPresent(name) then
-            seen[name] = true
-            names[#names + 1] = name
-        end
-    end
-    for _, name in ipairs(peripheral.getNames()) do
-        if peripheral.hasType(name, "electric_motor") then
-            add(name)
-        end
-    end
-    if type(control) == "table" then
-        if type(control.thrusters) == "table" then
-            for _, t in ipairs(control.thrusters) do
-                add(t.name)
-            end
-        end
-        if type(control.unused) == "table" then
-            for _, name in ipairs(control.unused) do
-                add(name)
+    -- One more forced pass: invalidate sent cache so zeros retry on next flushes
+    if type(control) == "table" and type(control.thrusters) == "table" then
+        for _, t in ipairs(control.thrusters) do
+            if t.name then
+                motorDesired[t.name] = 0
+                motorSent[t.name] = nil
+                motorWrapCache[t.name] = nil
             end
         end
     end
-    for _, name in ipairs(names) do
-        motorDesired[name] = 0
-        motorWrapCache[name] = nil
-        local m = peripheral.wrap(name)
-        if m then
-            pcall(function()
-                if m.setRPM then
-                    m.setRPM(0)
-                end
-                if m.setSpeed then
-                    m.setSpeed(0)
-                end
-                if m.stop then
-                    m.stop()
-                end
-            end)
+    if type(control) == "table" and type(control.unused) == "table" then
+        for _, name in ipairs(control.unused) do
+            motorDesired[name] = 0
+            motorSent[name] = nil
+            motorWrapCache[name] = nil
         end
-        motorSent[name] = 0
-        sleep(0.05)
+    end
+    for _ = 1, 16 do
+        if drive.flushMotors(1) < 1 then
+            break
+        end
     end
 end
 
@@ -1206,19 +1183,14 @@ function drive.manualLoop(control, opts)
     local recordName = opts.recordName
     local down = {}
     local pendingUp = {}
-    local pressAt = {}
-    local seenRepeat = {}
     local waypoints = {}
     local t0 = os.clock()
     local lastSample = 0
     local stop = false
     local wrenchMode = drive.isWrenchMode(control)
     local lastIdleStopAt = 0
-    local lastSeen = {}
-    -- CC ~0.4s before first key_repeat; ghost taps never get a repeat
-    local HOLD_STALE = 0.9
-    local CHORD_GRACE = 0.2
-    local GHOST_NO_REPEAT = 0.5
+    local lastApplyAt = 0
+    local CHORD_GRACE = 0.15
 
     local YAW_L = { [keys.a] = true, [keys.left] = true, [keys.j] = true }
     local YAW_R = { [keys.d] = true, [keys.right] = true, [keys.l] = true }
@@ -1230,12 +1202,7 @@ function drive.manualLoop(control, opts)
         [keys.j] = true, [keys.l] = true,
     }
 
-    if wrenchMode then
-        -- Keep real calib wrenches (do NOT invent left/right groups)
-        drive.clampControlRpm(control)
-    else
-        drive.clampControlRpm(control)
-    end
+    drive.clampControlRpm(control)
     drive.hardStopThrusters(control)
 
     local nMotor = 0
@@ -1252,16 +1219,12 @@ function drive.manualLoop(control, opts)
     print("  X panic-stop | Q quit")
     if wrenchMode then
         print("  Thrusters: " .. #control.thrusters .. " (" .. nMotor .. " motors)")
-        print("  Uses calib fx/fy/tz — diagonals turn even if each thruster looks like strafe")
     end
     print()
 
     local function forgetKey(key)
         down[key] = nil
         pendingUp[key] = nil
-        pressAt[key] = nil
-        seenRepeat[key] = nil
-        lastSeen[key] = nil
     end
 
     local function otherMoveDown(exceptKey)
@@ -1276,19 +1239,14 @@ function drive.manualLoop(control, opts)
     local function commandFromKeys()
         local fx = (down[keys.w] and 1 or 0) + (down[keys.s] and -1 or 0)
         local fy = (down[keys.c] and 1 or 0) + (down[keys.z] and -1 or 0)
-        local function yawLeft()
-            for k, _ in pairs(YAW_L) do
-                if down[k] then return true end
-            end
-            return false
+        local yawL, yawR = false, false
+        for k, _ in pairs(YAW_L) do
+            if down[k] then yawL = true break end
         end
-        local function yawRight()
-            for k, _ in pairs(YAW_R) do
-                if down[k] then return true end
-            end
-            return false
+        for k, _ in pairs(YAW_R) do
+            if down[k] then yawR = true break end
         end
-        local tz = (yawLeft() and 1 or 0) - (yawRight() and 1 or 0)
+        local tz = (yawL and 1 or 0) - (yawR and 1 or 0)
         return { fx = fx, fy = fy, tz = tz }
     end
 
@@ -1313,9 +1271,9 @@ function drive.manualLoop(control, opts)
         local cmd = commandFromKeys()
         if cmd.fx == 0 and cmd.fy == 0 and cmd.tz == 0 then
             drive.hardStopThrusters(control)
-            drive.commitMotorsNow()
             lastIdleStopAt = os.clock()
             lastCmd = { fx = 0, fy = 0, tz = 0 }
+            lastApplyAt = os.clock()
             return
         end
         if wrenchMode then
@@ -1329,6 +1287,7 @@ function drive.manualLoop(control, opts)
             drive.setAxis(control, "strafe_right", cmd.fy > 0)
         end
         lastCmd = { fx = cmd.fx, fy = cmd.fy, tz = cmd.tz }
+        lastApplyAt = os.clock()
     end
 
     local function flushPendingUps()
@@ -1340,25 +1299,8 @@ function drive.manualLoop(control, opts)
         end
     end
 
-    --- Lost key_up / ghost tap: no key_repeat within GHOST_NO_REPEAT → drop key.
-    local function clearGhostAndStaleKeys()
-        local now = os.clock()
-        for key, _ in pairs(down) do
-            if MOVE[key] then
-                if (now - (lastSeen[key] or 0)) > HOLD_STALE then
-                    forgetKey(key)
-                elseif (not seenRepeat[key]) and pressAt[key]
-                    and (now - pressAt[key]) > GHOST_NO_REPEAT then
-                    -- Tap/short press whose key_up was lost (never reached repeat delay)
-                    forgetKey(key)
-                end
-            end
-        end
-    end
-
     while not stop do
         local timerId = os.startTimer(tick)
-        -- Drain whole tick of input BEFORE thrusting so key+key_up taps cancel out
         while true do
             local ev = { os.pullEventRaw() }
             if ev[1] == "terminate" then
@@ -1367,18 +1309,12 @@ function drive.manualLoop(control, opts)
             elseif ev[1] == "key" then
                 local key, isRepeat = ev[2], ev[3] and true or false
                 if MOVE[key] then
-                    -- Repeat after we already released: ignore
                     if isRepeat and not down[key] and not pendingUp[key] then
-                        -- drop
+                        -- ignore late repeat after full release
                     else
-                        pendingUp[key] = nil -- cancel deferred release (real hold / chord)
+                        pendingUp[key] = nil
                         down[key] = true
-                        lastSeen[key] = os.clock()
-                        if isRepeat then
-                            seenRepeat[key] = true
-                        else
-                            pressAt[key] = os.clock()
-                            seenRepeat[key] = nil
+                        if not isRepeat then
                             clearOpposites(key)
                         end
                     end
@@ -1389,9 +1325,6 @@ function drive.manualLoop(control, opts)
                     print("Panic stop")
                     down = {}
                     pendingUp = {}
-                    pressAt = {}
-                    seenRepeat = {}
-                    lastSeen = {}
                     lastCmd = { fx = 0, fy = 0, tz = 0 }
                     drive.panicStop(control)
                     lastIdleStopAt = os.clock()
@@ -1399,8 +1332,7 @@ function drive.manualLoop(control, opts)
             elseif ev[1] == "key_up" then
                 local key = ev[2]
                 if MOVE[key] then
-                    -- Solo release: clear now. Chord: defer — CC often sends spurious
-                    -- key_up on the held key when another MOVE key is pressed.
+                    -- Chord: defer clear (CC spuriously ups held keys). Solo: clear now.
                     if otherMoveDown(key) then
                         pendingUp[key] = os.clock() + CHORD_GRACE
                     else
@@ -1414,7 +1346,6 @@ function drive.manualLoop(control, opts)
         if stop then break end
 
         flushPendingUps()
-        clearGhostAndStaleKeys()
 
         local cmd = commandFromKeys()
         local idle = cmd.fx == 0 and cmd.fy == 0 and cmd.tz == 0
@@ -1423,14 +1354,15 @@ function drive.manualLoop(control, opts)
                 or (os.clock() - lastIdleStopAt) >= 0.2 then
                 applyThrust()
             end
-        elseif not cmdEqual(cmd, lastCmd) then
+        elseif not cmdEqual(cmd, lastCmd) or (os.clock() - lastApplyAt) >= 0.25 then
+            -- Re-assert while held so X / anti-spam can't leave motors dead
             applyThrust()
         end
 
-        if idle and drive.motorsPending() then
+        if idle then
             drive.flushMotors(8)
         else
-            drive.flushMotors(3)
+            drive.flushMotors(4)
         end
 
         if recordName then
