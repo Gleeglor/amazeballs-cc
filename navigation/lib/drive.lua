@@ -1193,6 +1193,7 @@ function drive.manualLoop(control, opts)
     local tick = opts.tick or 0.05
     local recordName = opts.recordName
     local down = {}
+    local heldTicks = {}
     local waypoints = {}
     local t0 = os.clock()
     local lastSample = 0
@@ -1239,22 +1240,25 @@ function drive.manualLoop(control, opts)
     end
     print()
 
-    local function yawLeft()
-        for k, _ in pairs(YAW_L) do
-            if down[k] then return true end
-        end
-        return false
-    end
-    local function yawRight()
-        for k, _ in pairs(YAW_R) do
-            if down[k] then return true end
-        end
-        return false
-    end
-
     local function commandFromKeys()
-        local fx = (down[keys.w] and 1 or 0) + (down[keys.s] and -1 or 0)
-        local fy = (down[keys.c] and 1 or 0) + (down[keys.z] and -1 or 0)
+        -- Require 2 ticks (~0.1s) held so press+release taps never spool motors
+        local function held(key)
+            return down[key] and (heldTicks[key] or 0) >= 2
+        end
+        local fx = (held(keys.w) and 1 or 0) + (held(keys.s) and -1 or 0)
+        local fy = (held(keys.c) and 1 or 0) + (held(keys.z) and -1 or 0)
+        local function yawLeft()
+            for k, _ in pairs(YAW_L) do
+                if held(k) then return true end
+            end
+            return false
+        end
+        local function yawRight()
+            for k, _ in pairs(YAW_R) do
+                if held(k) then return true end
+            end
+            return false
+        end
         local tz = (yawLeft() and 1 or 0) - (yawRight() and 1 or 0)
         return { fx = fx, fy = fy, tz = tz }
     end
@@ -1278,12 +1282,18 @@ function drive.manualLoop(control, opts)
         end
     end
 
+    local lastCmd = { fx = 0, fy = 0, tz = 0 }
+    local function cmdEqual(a, b)
+        return a.fx == b.fx and a.fy == b.fy and a.tz == b.tz
+    end
+
     local function applyThrust()
         local cmd = commandFromKeys()
         if cmd.fx == 0 and cmd.fy == 0 and cmd.tz == 0 then
             drive.hardStopThrusters(control)
             drive.commitMotorsNow()
             lastIdleStopAt = os.clock()
+            lastCmd = { fx = 0, fy = 0, tz = 0 }
             return
         end
         if wrenchMode then
@@ -1296,6 +1306,7 @@ function drive.manualLoop(control, opts)
             drive.setAxis(control, "strafe_left", cmd.fy < 0)
             drive.setAxis(control, "strafe_right", cmd.fy > 0)
         end
+        lastCmd = { fx = cmd.fx, fy = cmd.fy, tz = cmd.tz }
     end
 
     --- Drop MOVE keys that no longer get key/key_repeat (lost key_up → sticky thrust).
@@ -1309,24 +1320,12 @@ function drive.manualLoop(control, opts)
                 changed = true
             end
         end
-        if changed then
-            applyThrust()
-        end
         return changed
-    end
-
-    local function onKeyUp(key)
-        if not MOVE[key] then
-            return
-        end
-        -- Always clear immediately (deferred ups left yaw stuck when key_up was flaky)
-        down[key] = nil
-        lastSeen[key] = nil
-        applyThrust()
     end
 
     while not stop do
         local timerId = os.startTimer(tick)
+        -- Drain whole tick of input BEFORE thrusting so key+key_up taps cancel out
         while true do
             local ev = { os.pullEventRaw() }
             if ev[1] == "terminate" then
@@ -1335,15 +1334,13 @@ function drive.manualLoop(control, opts)
             elseif ev[1] == "key" then
                 local key, isRepeat = ev[2], ev[3] and true or false
                 if MOVE[key] then
-                    -- Ignore repeats after key_up already cleared this key (queue race)
                     if isRepeat and not down[key] then
-                        -- drop
+                        -- ignore repeat after release
                     else
                         down[key] = true
                         lastSeen[key] = os.clock()
                         if not isRepeat then
                             clearOpposites(key)
-                            applyThrust()
                         end
                     end
                 elseif (not isRepeat) and key == quitKey then
@@ -1353,11 +1350,16 @@ function drive.manualLoop(control, opts)
                     print("Panic stop")
                     down = {}
                     lastSeen = {}
+                    lastCmd = { fx = 0, fy = 0, tz = 0 }
                     drive.panicStop(control)
                     lastIdleStopAt = os.clock()
                 end
             elseif ev[1] == "key_up" then
-                onKeyUp(ev[2])
+                local key = ev[2]
+                if MOVE[key] then
+                    down[key] = nil
+                    lastSeen[key] = nil
+                end
             elseif ev[1] == "timer" and ev[2] == timerId then
                 break
             end
@@ -1366,29 +1368,31 @@ function drive.manualLoop(control, opts)
 
         clearStaleKeys()
 
-        if not anyDown() then
-            -- Retry failed setRPM(0) without full staggered hardStop every tick
-            if drive.motorsPending() then
-                drive.commitMotorsNow()
-                lastIdleStopAt = os.clock()
-            elseif (os.clock() - lastIdleStopAt) >= 0.25 then
-                if type(control.thrusters) == "table" then
-                    for _, t in ipairs(control.thrusters) do
-                        if t.name then
-                            motorDesired[t.name] = 0
-                            if motorSent[t.name] ~= 0 then
-                                motorSent[t.name] = nil
-                            end
-                        end
-                    end
-                end
-                drive.commitMotorsNow()
-                lastIdleStopAt = os.clock()
+        -- Age held keys; clear counters for released keys
+        for key, _ in pairs(heldTicks) do
+            if not down[key] then
+                heldTicks[key] = nil
             end
         end
-        -- Finish any remaining motor RPM pushes without blocking the next keys long
-        -- Prefer draining stops hard when idle (quick-tap release)
-        if not anyDown() and drive.motorsPending() then
+        for key, _ in pairs(down) do
+            if MOVE[key] then
+                heldTicks[key] = (heldTicks[key] or 0) + 1
+            end
+        end
+
+        local cmd = commandFromKeys()
+        local idle = cmd.fx == 0 and cmd.fy == 0 and cmd.tz == 0
+        if idle then
+            -- Always stop when no keys — even if lastCmd already idle (retry CCA)
+            if not cmdEqual(cmd, lastCmd) or drive.motorsPending()
+                or (os.clock() - lastIdleStopAt) >= 0.2 then
+                applyThrust()
+            end
+        elseif not cmdEqual(cmd, lastCmd) then
+            applyThrust()
+        end
+
+        if idle and drive.motorsPending() then
             drive.flushMotors(8)
         else
             drive.flushMotors(3)
