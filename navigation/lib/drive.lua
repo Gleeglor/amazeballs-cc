@@ -23,8 +23,23 @@ function drive.saveControl(data)
     return util.writeJSON(CONTROL_PATH, data)
 end
 
---- Set relay analog level 0-15 (0 = off).
-function drive.setRelayLevel(name, level)
+--- True if RS is inverted: logical thrust 15 (full) → physical 0, off → 15.
+function drive.isInvert(control)
+    control = control or drive.loadControl()
+    return control and control.invert_analog == true
+end
+
+--- Map logical thrust level (0=off .. 15=full) to physical redstone on the wire.
+function drive.logicalToPhysical(logicalLevel, invert)
+    local level = math.floor(util.clamp(tonumber(logicalLevel) or 0, 0, 15) + 0.5)
+    if invert then
+        return 15 - level
+    end
+    return level
+end
+
+--- Write raw physical redstone 0-15 to a relay (no invert).
+function drive.setRelayPhysical(name, level)
     if not name then
         return false
     end
@@ -50,6 +65,7 @@ function drive.setRelayLevel(name, level)
         return true
     end
     if r.setOutput then
+        -- Digital-only relay: treat any physical >0 as on (invert-aware callers pass physical)
         local on = level > 0
         for _, side in ipairs(sides) do
             pcall(function()
@@ -61,8 +77,22 @@ function drive.setRelayLevel(name, level)
     return false
 end
 
-local function setRelay(name, on)
-    return drive.setRelayLevel(name, on and 15 or 0)
+--- Set thruster by logical strength 0=off .. 15=full (honors invert_analog).
+function drive.setThrustLevel(control, name, logicalLevel)
+    local invert = drive.isInvert(control)
+    return drive.setRelayPhysical(name, drive.logicalToPhysical(logicalLevel, invert))
+end
+
+--- Back-compat name: treats boolean/"level" as logical (full or off) unless number given.
+function drive.setRelayLevel(name, levelOrOn, control)
+    control = control or drive.loadControl()
+    local logical
+    if type(levelOrOn) == "boolean" then
+        logical = levelOrOn and 15 or 0
+    else
+        logical = levelOrOn
+    end
+    return drive.setThrustLevel(control, name, logical)
 end
 
 function drive.isWrenchMode(control)
@@ -78,9 +108,10 @@ function drive.allOff(control)
     if not control then
         return
     end
+    -- Logical off → physical 15 when inverted (transmission disengaged / prop stopped)
     if type(control.thrusters) == "table" then
         for _, t in ipairs(control.thrusters) do
-            drive.setRelayLevel(t.name, 0)
+            drive.setThrustLevel(control, t.name, 0)
         end
     end
     if type(control.relays) == "table" then
@@ -88,7 +119,7 @@ function drive.allOff(control)
             local list = control.relays[axis]
             if type(list) == "table" then
                 for _, name in ipairs(list) do
-                    drive.setRelayLevel(name, 0)
+                    drive.setThrustLevel(control, name, 0)
                 end
             end
         end
@@ -104,7 +135,7 @@ function drive.setAxis(control, axis, on)
         return
     end
     for _, name in ipairs(list) do
-        drive.setRelayLevel(name, on and 15 or 0)
+        drive.setThrustLevel(control, name, on and 15 or 0)
     end
 end
 
@@ -211,7 +242,7 @@ function drive.applyWrench(control, fx, fy, tz)
     end
 
     for i, t in ipairs(control.thrusters) do
-        drive.setRelayLevel(t.name, dutyToLevel(u[i]))
+        drive.setThrustLevel(control, t.name, dutyToLevel(u[i]))
     end
     return true
 end
@@ -427,6 +458,9 @@ function drive.manualLoop(control, opts)
     print("  Q    quit" .. (recordName and (" + save path '" .. recordName .. "'") or ""))
     if wrenchMode then
         print("  Analog 1-15 + live yaw/strafe trim (off-center CoM cancel)")
+        if drive.isInvert(control) then
+            print("  invert_analog: ON  (logical full→RS 0, off→RS 15)")
+        end
         print("  Thrusters: " .. #control.thrusters)
     end
     print()

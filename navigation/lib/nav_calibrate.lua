@@ -6,35 +6,6 @@ local drive = require("drive")
 
 local calibrate = {}
 
-local function setRelay(name, on)
-    if not peripheral.isPresent(name) then
-        return false
-    end
-    local r = peripheral.wrap(name)
-    if not r then
-        return false
-    end
-    local sides = { "top", "bottom", "left", "right", "front", "back" }
-    local level = on and 15 or 0
-    if r.setAnalogOutput then
-        for _, side in ipairs(sides) do
-            pcall(function()
-                r.setAnalogOutput(side, level)
-            end)
-        end
-        return true
-    end
-    if r.setOutput then
-        for _, side in ipairs(sides) do
-            pcall(function()
-                r.setOutput(side, on)
-            end)
-        end
-        return true
-    end
-    return false
-end
-
 function calibrate.listRelays(useSides)
     local names = {}
     for _, name in ipairs(peripheral.getNames()) do
@@ -51,27 +22,17 @@ function calibrate.listRelays(useSides)
     return names
 end
 
-local function allOff(names)
+local function allOff(names, control)
     for _, name in ipairs(names) do
-        if string.sub(name, 1, 5) ~= "side:" then
-            setRelay(name, false)
-        else
-            rs.setAnalogOutput(string.sub(name, 6), 0)
-        end
+        drive.setThrustLevel(control, name, 0)
     end
 end
 
-local function pulseOne(name, duration)
-    if string.sub(name, 1, 5) == "side:" then
-        local side = string.sub(name, 6)
-        rs.setAnalogOutput(side, 15)
-        sleep(duration)
-        rs.setAnalogOutput(side, 0)
-    else
-        setRelay(name, true)
-        sleep(duration)
-        setRelay(name, false)
-    end
+local function pulseOne(name, duration, control)
+    -- Logical full thrust (physical 0 if inverted)
+    drive.setThrustLevel(control, name, 15)
+    sleep(duration)
+    drive.setThrustLevel(control, name, 0)
 end
 
 local function sampleMotion()
@@ -120,9 +81,23 @@ function calibrate.run(opts)
     local linFloor = (opts.thresholds and opts.thresholds.linear) or 0.05
     local yawFloor = (opts.thresholds and opts.thresholds.yaw) or 0.03
 
+    -- Invert: preserve from existing config unless opts override
+    local prev = drive.loadControl() or {}
+    local invert = opts.invert_analog
+    if invert == nil then
+        invert = prev.invert_analog == true
+    end
+
+    local probeControl = { invert_analog = invert }
+
     print("Calibrate (Reassembly / wrench mode)")
     print("Each relay = one thruster. Motion vs CoM → force + torque.")
     print("(Modems cannot report block position; we measure effect instead.)")
+    if invert then
+        print("invert_analog ON: full thrust = RS 0, off = RS 15 (analog transmission)")
+    else
+        print("invert_analog OFF: full thrust = RS 15, off = RS 0")
+    end
     print()
 
     local names = calibrate.listRelays(useSides)
@@ -141,7 +116,7 @@ function calibrate.run(opts)
         print(string.format("CoM (world): %.2f, %.2f, %.2f", com.x, com.y, com.z))
     end
 
-    allOff(names)
+    allOff(names, probeControl)
     sleep(0.2)
 
     local thrusters = {}
@@ -149,13 +124,13 @@ function calibrate.run(opts)
 
     for _, name in ipairs(names) do
         print("Probing " .. name .. " ...")
-        allOff(names)
+        allOff(names, probeControl)
         sleep(settle)
         local before = sampleMotion()
-        pulseOne(name, pulse)
+        pulseOne(name, pulse, probeControl)
         sleep(settle)
         local after = sampleMotion()
-        allOff(names)
+        allOff(names, probeControl)
 
         -- Wrench proxy: Δv_local ≈ force direction; Δω_yaw ≈ torque about CoM
         local w = {
@@ -193,10 +168,10 @@ function calibrate.run(opts)
         sleep(0.15)
     end
 
-    allOff(names)
+    allOff(names, probeControl)
 
     if #thrusters == 0 then
-        return nil, "no thrusters responded (props dry / no RPM / clutches open?)"
+        return nil, "no thrusters responded (props dry / no RPM / wrong invert mode?)"
     end
 
     -- Normalize scores so allocation is scale-stable across craft masses
@@ -213,6 +188,7 @@ function calibrate.run(opts)
     local control = {
         version = 2,
         mode = "wrench",
+        invert_analog = invert,
         thrusters = thrusters,
         unused = unused,
         -- Prefer yaw a bit so turn commands aren't drowned by big main thrusters
