@@ -13,6 +13,61 @@
         "label": "ammo - reload turtle"
       }
     },
-    "navigation": {}
+    "navigation": {
+      "boat.lua": {
+        "label": "boat - autopilot + dock handshake",
+        "dest": "boat.lua"
+      },
+      "port.lua": {
+        "label": "port - schedule + SS transfer",
+        "dest": "port.lua"
+      },
+      "recorder.lua": {
+        "label": "recorder - record path waypoints",
+        "dest": "recorder.lua"
+      },
+      "calibrate.lua": {
+        "label": "calibrate - auto-map redstone relays",
+        "dest": "calibrate.lua"
+      },
+      "lib": {
+        "util.lua": {
+          "label": "lib util",
+          "dest": "lib/util.lua"
+        },
+        "pose.lua": {
+          "label": "lib pose (CC:Sable)",
+          "dest": "lib/pose.lua"
+        },
+        "path.lua": {
+          "label": "lib path record/load",
+          "dest": "lib/path.lua"
+        },
+        "protocol.lua": {
+          "label": "lib transport rednet",
+          "dest": "lib/protocol.lua"
+        },
+        "filters.lua": {
+          "label": "lib item filters",
+          "dest": "lib/filters.lua"
+        },
+        "xfer.lua": {
+          "label": "lib inventory transfer",
+          "dest": "lib/xfer.lua"
+        },
+        "schedule.lua": {
+          "label": "lib port schedule",
+          "dest": "lib/schedule.lua"
+        },
+        "drive.lua": {
+          "label": "lib drive + dock-assist",
+          "dest": "lib/drive.lua"
+        },
+        "nav_calibrate.lua": {
+          "label": "lib relay calibrate",
+          "dest": "lib/nav_calibrate.lua"
+        }
+      }
+    }
   }
 }
