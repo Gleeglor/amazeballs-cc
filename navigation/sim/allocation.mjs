@@ -51,6 +51,7 @@ export function classifyFacingFromWrench(t) {
 /**
  * Geometric wrench at duty=1: F = strength × facing, τ = r × F.
  * Mutates thruster; sets fx/fy/fz/tx/ty/tz used by applyReassembly.
+ * If no lever arm is set (lx=ly=lz≈0), keep any measured tz (Lua calib path).
  */
 export function syncWrenchFromFacing(t) {
   if (!t || typeof t !== "object") return t;
@@ -74,15 +75,18 @@ export function syncWrenchFromFacing(t) {
   t.dirZ = dir.z;
   t.angleRad = Math.atan2(dir.y, dir.x);
 
+  const prevTz = Number(t.tz) || 0;
   t.fx = strength * dir.x;
   t.fy = strength * dir.y;
   t.fz = strength * dir.z;
   const lx = Number(t.lx) || 0;
   const ly = Number(t.ly) || 0;
   const lz = Number(t.lz) || 0;
+  const hasLever = Math.hypot(lx, ly, lz) >= 1e-4;
   t.tx = ly * t.fz - lz * t.fy;
   t.ty = lz * t.fx - lx * t.fz;
-  t.tz = lx * t.fy - ly * t.fx;
+  // Preserve calib tz when positions were never measured (in-game JSON).
+  t.tz = hasLever ? lx * t.fy - ly * t.fx : prevTz;
   t.mag = Math.hypot(t.fx, t.fy, t.tz);
 
   if (facing === "left") t.side_score = -1;
@@ -137,10 +141,15 @@ export function isWrenchMode(control) {
   );
 }
 
-/** Physical side score: +starboard / -port (from calib, not name order). */
+/** Physical side score: +starboard / -port (facing first, like drive.lua). */
 export function thrusterSide(t) {
   if (!t || typeof t !== "object") return 0;
+  const facing = String(t.facing || t.role || "").toLowerCase();
+  if (facing === "left" || facing === "port") return -1;
+  if (facing === "right" || facing === "starboard" || facing === "stbd") return 1;
   if (t.side_score != null) return Number(t.side_score) || 0;
+  const ly = Number(t.ly) || 0;
+  if (Math.abs(ly) >= 0.05) return Math.sign(ly);
   const fy = Number(t.fy) || 0;
   if (Math.abs(fy) >= 0.02) return fy;
   const lever = t.lever_est != null ? Number(t.lever_est) : null;
@@ -150,6 +159,127 @@ export function thrusterSide(t) {
   if (Math.abs(fx) >= 0.02 && Math.abs(tz) >= 0.004) return -tz / fx;
   if (Math.abs(tz) >= 0.008) return tz;
   return 0;
+}
+
+function dutiesAlive(duties, eps = DUTY_DEADBAND) {
+  return Array.isArray(duties) && duties.some((d) => Math.abs(d || 0) >= eps);
+}
+
+/**
+ * Role/facing mixer for cardinal thrusters (no LS, no calib tz needed).
+ * W: forward +duty, back −duty; A/D: side differential; Z/C: L/R facing.
+ */
+export function applyCardinalRoles(control, fx = 0, fy = 0, tz = 0) {
+  if (!isWrenchMode(control)) {
+    return { ok: false, duties: [], branch: "not_wrench" };
+  }
+  enrichControl(control);
+  const thrusters = control.thrusters;
+  const n = thrusters.length;
+  const cmdMag = Math.sqrt(fx * fx + fy * fy + tz * tz);
+  if (cmdMag < 1e-4) {
+    return { ok: true, duties: zeroDuties(n), branch: "idle" };
+  }
+
+  const scores = new Array(n).fill(0);
+  let anyFacing = false;
+  for (let i = 0; i < n; i++) {
+    const t = thrusters[i];
+    let facing = String(t.facing || t.role || "").toLowerCase();
+    if (!facing || facing === "mixed") {
+      facing = classifyFacingFromWrench(t);
+    }
+    if (facing && facing !== "mixed") anyFacing = true;
+    const side = thrusterSide(t);
+    let surge = 0;
+    let strafe = 0;
+    if (facing === "forward" || facing === "surge" || facing === "main") surge = 1;
+    else if (facing === "back" || facing === "aft" || facing === "reverse")
+      surge = -1;
+    if (facing === "right" || facing === "starboard" || facing === "stbd")
+      strafe = 1;
+    else if (facing === "left" || facing === "port") strafe = -1;
+    // Yaw: port (−) vs starboard (+). Centerline fwd uses 0 (no invented spin).
+    let yawSide = side;
+    if (Math.abs(yawSide) < 1e-6 && Math.abs(Number(t.ly) || 0) >= 0.05) {
+      yawSide = Math.sign(t.ly);
+    }
+    scores[i] = fx * surge + fy * strafe + tz * yawSide;
+  }
+
+  if (!anyFacing) {
+    return { ok: false, duties: zeroDuties(n), branch: "no_facing" };
+  }
+
+  let maxAbs = 0;
+  for (let i = 0; i < n; i++) maxAbs = Math.max(maxAbs, Math.abs(scores[i] || 0));
+  if (maxAbs < 1e-8) {
+    return { ok: false, duties: zeroDuties(n), branch: "zero_scores" };
+  }
+
+  const scale = Math.min(1, cmdMag);
+  const duties = new Array(n);
+  for (let i = 0; i < n; i++) {
+    let duty = ((scores[i] || 0) / maxAbs) * scale;
+    if (Math.abs(duty) < DUTY_DEADBAND) duty = 0;
+    const reversible = thrusters[i].kind === "motor";
+    duties[i] = reversible ? clamp(duty, -1, 1) : clamp(duty, 0, 1);
+  }
+
+  if (!dutiesAlive(duties)) {
+    return { ok: false, duties, branch: "deadband" };
+  }
+  return { ok: true, duties, branch: "cardinal_roles", scores };
+}
+
+/**
+ * Full applyCommand mirror: Reassembly → teleop → cardinal roles on dead duties.
+ */
+export function applyCommand(control, fx = 0, fy = 0, tz = 0, opts = {}) {
+  const mode = (opts.allocMode || control.alloc_mode || control.teleop_mode || "")
+    .toString()
+    .toLowerCase();
+  const preferReassembly =
+    opts.preferReassembly !== false &&
+    mode !== "teleop" &&
+    mode !== "direct" &&
+    mode !== "cardinal";
+
+  if (mode === "cardinal" || mode === "roles") {
+    return applyCardinalRoles(control, fx, fy, tz);
+  }
+  if (mode === "teleop" || mode === "direct") {
+    const tele = applyTeleop(control, fx, fy, tz);
+    if (tele.ok && dutiesAlive(tele.duties)) return { ...tele, path: "teleop" };
+    const roles = applyCardinalRoles(control, fx, fy, tz);
+    if (roles.ok) return { ...roles, path: "cardinal_fallback" };
+    return { ...tele, path: "teleop" };
+  }
+
+  if (preferReassembly) {
+    const reass = applyReassembly(control, fx, fy, tz);
+    if (reass.ok && (reass.branch === "idle" || dutiesAlive(reass.duties))) {
+      return { ...reass, path: "reassembly" };
+    }
+    const tele = applyTeleop(control, fx, fy, tz);
+    if (tele.ok && (tele.branch === "idle" || dutiesAlive(tele.duties))) {
+      return { ...tele, path: "teleop_fallback" };
+    }
+    const roles = applyCardinalRoles(control, fx, fy, tz);
+    if (roles.ok) return { ...roles, path: "cardinal_fallback" };
+    return {
+      ok: false,
+      duties: reass.duties || zeroDuties(control.thrusters?.length || 0),
+      branch: "failed",
+      path: "failed",
+    };
+  }
+
+  const tele = applyTeleop(control, fx, fy, tz);
+  if (tele.ok && dutiesAlive(tele.duties)) return { ...tele, path: "teleop" };
+  const roles = applyCardinalRoles(control, fx, fy, tz);
+  if (roles.ok) return { ...roles, path: "cardinal_fallback" };
+  return { ...tele, path: "teleop" };
 }
 
 /**
@@ -179,8 +309,24 @@ export function healYawThrusters(control) {
 
   const base = Math.max(0.25, maxFx, maxFy * 0.5, maxTz);
   let healed = 0;
+  let hasStrafeFacing = false;
+  for (const t of control.thrusters) {
+    const f = t.facing || t.role;
+    if (f === "left" || f === "right" || f === "port" || f === "starboard") {
+      hasStrafeFacing = true;
+      break;
+    }
+  }
   ranked.forEach((row, idx) => {
     const t = row.t;
+    const facing = t.facing || t.role;
+    if (
+      hasStrafeFacing &&
+      (facing === "forward" || facing === "surge" || facing === "main") &&
+      Math.abs(row.s) < 1e-6
+    ) {
+      return;
+    }
     if (
       t.kind === "motor" ||
       Math.abs(t.fx || 0) > 0.01 ||
@@ -460,6 +606,10 @@ export function applyReassembly(control, fx = 0, fy = 0, tz = 0) {
     return duty;
   });
 
+  // Deadband wiped every thruster → treat as failure so applyCommand can fall back.
+  if (!dutiesAlive(duties, dutyDeadband)) {
+    return { ok: false, duties, branch: "deadband", axW, dutyDeadband };
+  }
   return { ok: true, duties, branch: "reassembly", axW, dutyDeadband };
 }
 

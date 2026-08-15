@@ -1,7 +1,6 @@
 /**
- * 3D rigid-body boat semi-sim for thruster duty visualization.
+ * Watercraft physics: buoyancy, offset CoM, hull drag, thruster τ = (r − r_com) × F.
  * Body frame: +x forward (surge), +y starboard (strafe), +z up.
- * Angular: roll (wx), pitch (wy), yaw (wz) — CCW positive about each axis.
  * World: +X east, +Y north, +Z up; yaw 0 faces +Y (north) for top-down viz.
  */
 
@@ -20,7 +19,6 @@ export function createBody(opts = {}) {
     wx: opts.wx ?? 0,
     wy: opts.wy ?? 0,
     wz,
-    /** Alias of wz for callers that still use 2D naming. */
     omega: wz,
   };
 }
@@ -28,23 +26,38 @@ export function createBody(opts = {}) {
 export function defaultPhysicsParams(overrides = {}) {
   return {
     mass: 8,
-    /** Diagonal inertia (body axes). `inertia` alone sets Iz for yaw. */
     Ix: 3,
     Iy: 4,
     Iz: 4,
     inertia: 4,
+    /** Body-frame CoM offset from geometric origin (hull reference). */
+    comX: 0,
+    comY: 0,
+    comZ: -0.05,
+    gravity: 9.81,
+    /** Water density (kg/m³). */
+    waterDensity: 1000,
+    /**
+     * Hull displaced volume at full submersion (m³). Equilibrium when
+     * ρ·V_sub·g ≈ mass·g → V_sub ≈ mass/ρ. Draft fraction scales volume.
+     */
+    hullVolume: 0.012,
+    /** Vertical extent of hull for waterline / draft (m). */
+    hullHeight: 0.35,
+    /** Half-length / half-beam for pontoon sample layout (m). */
+    hullLength: 1.1,
+    hullBeam: 0.7,
+    /** Number of buoyancy sample points along length×beam grid. */
+    pontoonSamples: 6,
     linearDrag: 1.2,
+    quadraticDrag: 0.35,
     angularDrag: 2.0,
-    /** Extra damping on world vertical velocity (water). */
-    verticalDrag: 8,
-    /** Soft spring holding boat near water plane z=0. */
-    waterSpring: 25,
-    /** Cap |z| soft clamp after integrate (optional fly-prevention). */
-    waterPlaneClamp: 0.35,
-    /** Scale calib wrench → Newtons / N·m at duty=1 */
+    yawDamping: 0.8,
+    verticalDrag: 6,
+    /** Soft clamp only as a safety net (buoyancy is primary). */
+    waterPlaneClamp: 1.2,
     wrenchForceScale: 40,
     wrenchTorqueScale: 25,
-    /** Geometric mode: Newtons at duty=1 along thruster direction */
     geometricForceScale: 50,
     forceMode: "wrench", // "wrench" | "geometric"
     ...overrides,
@@ -62,7 +75,6 @@ function resolveInertia(p) {
 
 /**
  * Body-frame 6DOF wrench from duties × calibrated wrenches.
- * Uses thruster.fx/fy/fz and tx/ty/tz (tz preferred; legacy only tz).
  */
 export function wrenchFromDuties(thrusters, duties, params) {
   const p = { ...defaultPhysicsParams(), ...params };
@@ -116,7 +128,6 @@ export function thrusterDirection(t) {
   };
 }
 
-/** Per-thruster strength multiplier (max_force / strength, default 1). */
 export function thrusterStrength(t) {
   const s = Number(t.max_force ?? t.strength);
   return Number.isFinite(s) && s > 0 ? s : 1;
@@ -124,10 +135,13 @@ export function thrusterStrength(t) {
 
 /**
  * Geometric: each thruster pushes along local direction at (lx, ly, lz).
- * Torque τ = r × F.
+ * Torque about CoM: τ = (r − r_com) × F.
  */
 export function geometricFromDuties(thrusters, duties, params) {
   const p = { ...defaultPhysicsParams(), ...params };
+  const cx = p.comX || 0;
+  const cy = p.comY || 0;
+  const cz = p.comZ || 0;
   let Fx = 0;
   let Fy = 0;
   let Fz = 0;
@@ -143,16 +157,15 @@ export function geometricFromDuties(thrusters, duties, params) {
     const fx = dir.x * mag;
     const fy = dir.y * mag;
     const fz = dir.z * mag;
-    const lx = t.lx || 0;
-    const ly = t.ly || 0;
-    const lz = t.lz || 0;
+    const rx = (t.lx || 0) - cx;
+    const ry = (t.ly || 0) - cy;
+    const rz = (t.lz || 0) - cz;
     Fx += fx;
     Fy += fy;
     Fz += fz;
-    // τ = r × F
-    Tx += ly * fz - lz * fy;
-    Ty += lz * fx - lx * fz;
-    Tz += lx * fy - ly * fx;
+    Tx += ry * fz - rz * fy;
+    Ty += rz * fx - rx * fz;
+    Tz += rx * fy - ry * fx;
   }
   return { Fx, Fy, Fz, Tx, Ty, Tz };
 }
@@ -169,7 +182,6 @@ function isFiniteNumber(n) {
   return typeof n === "number" && Number.isFinite(n);
 }
 
-/** Body → world rotation of a vector (yaw/pitch/roll, ZYX extrinsic ≈ body yaw then pitch then roll). */
 export function bodyToWorld(body, bx, by, bz) {
   const cy = Math.cos(body.yaw);
   const sy = Math.sin(body.yaw);
@@ -177,8 +189,6 @@ export function bodyToWorld(body, bx, by, bz) {
   const sp = Math.sin(body.pitch);
   const cr = Math.cos(body.roll);
   const sr = Math.sin(body.roll);
-  // R = Rz(yaw) * Ry(pitch) * Rx(roll), with yaw0 facing +Y:
-  // forward(+x_body) → (sin yaw, cos yaw, 0) when pitch=roll=0
   const x1 = bx;
   const y1 = by * cr - bz * sr;
   const z1 = by * sr + bz * cr;
@@ -191,7 +201,6 @@ export function bodyToWorld(body, bx, by, bz) {
   return { x: wx, y: wy, z: wz };
 }
 
-/** World → body (inverse of bodyToWorld). */
 export function worldToBody(body, wx, wy, wz) {
   const cy = Math.cos(body.yaw);
   const sy = Math.sin(body.yaw);
@@ -199,7 +208,6 @@ export function worldToBody(body, wx, wy, wz) {
   const sp = Math.sin(body.pitch);
   const cr = Math.cos(body.roll);
   const sr = Math.sin(body.roll);
-  // Inverse: Rx(-roll) Ry(-pitch) then un-yaw mapping
   const x2 = wx * sy + wy * cy;
   const y2 = wx * cy - wy * sy;
   const z2 = wz;
@@ -212,28 +220,153 @@ export function worldToBody(body, wx, wy, wz) {
   return { x: bx, y: by, z: bz };
 }
 
+/** Local sample points on hull bottom for multi-point buoyancy. */
+export function pontoonPoints(params) {
+  const p = { ...defaultPhysicsParams(), ...params };
+  const n = Math.max(2, Math.floor(p.pontoonSamples || 6));
+  const halfL = (p.hullLength || 1.1) * 0.5;
+  const halfB = (p.hullBeam || 0.7) * 0.5;
+  const keel = -(p.hullHeight || 0.35) * 0.5;
+  const pts = [];
+  const along = Math.ceil(Math.sqrt(n));
+  const across = Math.max(2, Math.ceil(n / along));
+  for (let i = 0; i < along; i++) {
+    const u = along === 1 ? 0 : i / (along - 1);
+    const lx = -halfL + 2 * halfL * u;
+    for (let j = 0; j < across; j++) {
+      const v = across === 1 ? 0 : j / (across - 1);
+      const ly = -halfB + 2 * halfB * v;
+      pts.push({ lx, ly, lz: keel });
+    }
+  }
+  return pts;
+}
+
 /**
- * Semi-implicit Euler step. Mutates and returns body.
- * Water plane: vertical spring + strong vz damping; soft |z| clamp.
+ * Submerged fraction of a pontoon sample from world height of the point.
+ * waterline at world z=0: fully submerged when point.z << 0.
+ */
+function sampleSubmerge(worldZ, hullHeight) {
+  const h = Math.max(0.05, hullHeight || 0.35);
+  // Point represents a vertical column of height h centered on lz.
+  const top = worldZ + h * 0.5;
+  const bot = worldZ - h * 0.5;
+  if (top <= 0) return 1;
+  if (bot >= 0) return 0;
+  return Math.max(0, Math.min(1, -bot / h));
+}
+
+/**
+ * Buoyancy + gravity wrench in body frame, plus diagnostics.
+ * Restores pitch/roll when heeled (asymmetric submersion).
+ */
+export function buoyancyWrench(body, params) {
+  const p = { ...defaultPhysicsParams(), ...params };
+  const pts = pontoonPoints(p);
+  const perVol = (p.hullVolume || 0.012) / Math.max(1, pts.length);
+  const rho = p.waterDensity || 1000;
+  const g = p.gravity || 9.81;
+  const cx = p.comX || 0;
+  const cy = p.comY || 0;
+  const cz = p.comZ || 0;
+
+  let Fx = 0;
+  let Fy = 0;
+  let Fz = 0;
+  let Tx = 0;
+  let Ty = 0;
+  let Tz = 0;
+  let submergedVol = 0;
+  let weight = p.mass * g;
+
+  // Gravity at CoM (world −Z) → body
+  const gB = worldToBody(body, 0, 0, -weight);
+  Fx += gB.x;
+  Fy += gB.y;
+  Fz += gB.z;
+  // Gravity acts at CoM → no torque about CoM
+
+  for (const pt of pts) {
+    const w = bodyToWorld(body, pt.lx, pt.ly, pt.lz);
+    const worldZ = body.z + w.z;
+    const sub = sampleSubmerge(worldZ, p.hullHeight);
+    if (sub < 1e-6) continue;
+    const dV = perVol * sub;
+    submergedVol += dV;
+    const buoy = rho * dV * g; // world +Z
+    const fB = worldToBody(body, 0, 0, buoy);
+    Fx += fB.x;
+    Fy += fB.y;
+    Fz += fB.z;
+    const rx = pt.lx - cx;
+    const ry = pt.ly - cy;
+    const rz = pt.lz - cz;
+    Tx += ry * fB.z - rz * fB.y;
+    Ty += rz * fB.x - rx * fB.z;
+    Tz += rx * fB.y - ry * fB.x;
+  }
+
+  const buoyancy = rho * submergedVol * g;
+  // Draft / waterline marker: + when floating high (origin above water)
+  const waterline = body.z;
+  const equilibriumDraft =
+    (p.mass / Math.max(1e-9, rho * (p.hullVolume || 0.012))) *
+    (p.hullHeight || 0.35) *
+    0.5;
+
+  return {
+    Fx,
+    Fy,
+    Fz,
+    Tx,
+    Ty,
+    Tz,
+    buoyancy,
+    weight,
+    submergedVol,
+    waterline,
+    equilibriumDraft,
+    floats: buoyancy + 1e-6 >= weight * 0.98,
+  };
+}
+
+/**
+ * Semi-implicit Euler step with buoyancy, drag, thrusters about CoM.
  */
 export function step(body, thrusters, duties, params, dt) {
   const p = { ...defaultPhysicsParams(), ...params };
   const I = resolveInertia(p);
-  const { Fx, Fy, Fz, Tx, Ty, Tz } = forcesFromDuties(thrusters, duties, p);
+  const thrust = forcesFromDuties(thrusters, duties, p);
+  const hydro = buoyancyWrench(body, p);
+
+  const Fx = thrust.Fx + hydro.Fx;
+  const Fy = thrust.Fy + hydro.Fy;
+  const Fz = thrust.Fz + hydro.Fz;
+  const Tx = thrust.Tx + hydro.Tx;
+  const Ty = thrust.Ty + hydro.Ty;
+  const Tz = thrust.Tz + hydro.Tz;
 
   const vB = worldToBody(body, body.vx, body.vy, body.vz);
+  const speed = Math.hypot(vB.x, vB.y, vB.z);
+  const lin = p.linearDrag || 0;
+  const quad = p.quadraticDrag || 0;
+  const vert = p.verticalDrag || 0;
 
-  // Water: spring + vertical drag in world Z, applied in body via transform of residual
-  const waterForceZ = -p.waterSpring * body.z - p.verticalDrag * body.vz;
-  const waterB = worldToBody(body, 0, 0, waterForceZ);
+  const dragX = -lin * vB.x - quad * vB.x * Math.abs(vB.x);
+  const dragY = -lin * vB.y - quad * vB.y * Math.abs(vB.y);
+  // Extra heave damping when near the waterline (kills bounce from buoyancy).
+  const heaveBoost = 2 + 10 / (1 + Math.abs(body.z) * 6);
+  const dragZ =
+    -lin * vB.z - quad * vB.z * Math.abs(vB.z) - vert * heaveBoost * vB.z;
 
-  const axB = Fx / p.mass - p.linearDrag * vB.x + waterB.x / p.mass;
-  const ayB = Fy / p.mass - p.linearDrag * vB.y + waterB.y / p.mass;
-  const azB = Fz / p.mass - p.linearDrag * vB.z + waterB.z / p.mass;
+  const axB = (Fx + dragX) / p.mass;
+  const ayB = (Fy + dragY) / p.mass;
+  const azB = (Fz + dragZ) / p.mass;
 
+  const yawDamp = (p.yawDamping || 0) * body.wz;
   const alphaX = Tx / I.Ix - p.angularDrag * body.wx;
   const alphaY = Ty / I.Iy - p.angularDrag * body.wy;
-  const alphaZ = Tz / I.Iz - p.angularDrag * body.wz;
+  const alphaZ = Tz / I.Iz - p.angularDrag * body.wz - yawDamp;
 
   const aW = bodyToWorld(body, axB, ayB, azB);
 
@@ -249,7 +382,6 @@ export function step(body, thrusters, duties, params, dt) {
   body.y += body.vy * dt;
   body.z += body.vz * dt;
 
-  // Approximate attitude integrate (small-angle / planar boats: yaw primary)
   body.roll += body.wx * dt;
   body.pitch += body.wy * dt;
   body.yaw += body.wz * dt;
@@ -274,7 +406,10 @@ export function step(body, thrusters, duties, params, dt) {
   return {
     body,
     forces: { Fx, Fy, Fz, Tx, Ty, Tz },
+    thrust,
+    hydro,
     localVel: { forward: vB.x, right: vB.y, up: vB.z },
+    speed,
     ok:
       isFiniteNumber(body.x) &&
       isFiniteNumber(body.y) &&

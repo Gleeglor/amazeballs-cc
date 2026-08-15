@@ -188,11 +188,10 @@
   </head>
   <body>
     <header>
-      <h1>Boat physics sim — 3D + Reassembly allocation</h1>
+      <h1>Boat physics sim — buoyancy + Reassembly allocation</h1>
       <p>
-        Duties from ported <code>drive.applyReassembly</code> (default) /
-        <code>applyTeleop</code>. Keys: W/S surge, A/D yaw, Z/C strafe. Top +
-        side views show boat, CoM, thruster forces, velocity.
+        Duties from ported <code>drive.applyCommand</code> (Reassembly with teleop/cardinal
+        fallback). Buoyancy / CoM / hull drag watercraft model. Keys: W/S surge, A/D yaw, Z/C strafe.
       </p>
     </header>
     <div class="layout">
@@ -241,8 +240,9 @@
         <label class="field"
           >Allocator
           <select id="allocMode">
-            <option value="reassembly" selected>applyReassembly</option>
+            <option value="reassembly" selected>applyCommand (Reassembly+fb)</option>
             <option value="teleop">applyTeleop</option>
+            <option value="cardinal">applyCardinalRoles</option>
           </select>
         </label>
         <label class="field"
@@ -262,7 +262,7 @@
           <button type="button" id="btnRemoveThruster">Remove</button>
         </div>
 
-        <h2>Physics (3D)</h2>
+        <h2>Physics (watercraft)</h2>
         <label class="field">mass <input id="mass" type="number" step="0.5" value="8" /></label>
         <label class="field"
           >Iz (yaw) <input id="inertia" type="number" step="0.5" value="4"
@@ -271,13 +271,28 @@
           >lin drag <input id="linDrag" type="number" step="0.1" value="1.2"
         /></label>
         <label class="field"
+          >quad drag <input id="quadDrag" type="number" step="0.05" value="0.35"
+        /></label>
+        <label class="field"
           >ang drag <input id="angDrag" type="number" step="0.1" value="2"
         /></label>
         <label class="field"
-          >vert drag <input id="vertDrag" type="number" step="0.5" value="8"
+          >vert drag <input id="vertDrag" type="number" step="0.5" value="6"
         /></label>
         <label class="field"
-          >water spring <input id="waterSpring" type="number" step="1" value="25"
+          >hull volume <input id="hullVol" type="number" step="0.001" value="0.012"
+        /></label>
+        <label class="field"
+          >ballast (mass+) <input id="ballast" type="number" step="0.5" value="0"
+        /></label>
+        <label class="field"
+          >CoM x <input id="comX" type="number" step="0.05" value="0"
+        /></label>
+        <label class="field"
+          >CoM y <input id="comY" type="number" step="0.05" value="0"
+        /></label>
+        <label class="field"
+          >CoM z <input id="comZ" type="number" step="0.05" value="-0.05"
         /></label>
         <label class="field"
           >wrench F scale <input id="fScale" type="number" step="1" value="40"

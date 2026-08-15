@@ -644,7 +644,7 @@ function drive.preferReassembly(control)
         return true
     end
     local mode = control.alloc_mode or control.teleop_mode
-    if mode == "teleop" or mode == "direct" then
+    if mode == "teleop" or mode == "direct" or mode == "cardinal" or mode == "roles" then
         return false
     end
     if mode == "reassembly" or mode == "wrench_ls" then
@@ -662,23 +662,130 @@ function drive.preferReassembly(control)
     return true -- Reassembly-like default (sim + tests)
 end
 
---- Allocate command; Reassembly primary, teleop fallback on failure / near-CoM flag.
+function drive.preferCardinal(control)
+    if not control then
+        return false
+    end
+    local mode = control.alloc_mode or control.teleop_mode
+    return mode == "cardinal" or mode == "roles"
+end
+
+--- Facing/role mixer: W uses forward (+), back (−); A/D uses L/R sides; Z/C uses L/R facing.
+-- Does not need calibrated tz — fixes A/D dead when Reassembly LS deadbands to 0.
+function drive.applyCardinalRoles(control, fx, fy, tz)
+    control = control or drive.loadControl()
+    if not drive.isWrenchMode(control) then
+        return false
+    end
+    drive.enrichControl(control)
+
+    fx, fy, tz = fx or 0, fy or 0, tz or 0
+    local cmdMag = math.sqrt(fx * fx + fy * fy + tz * tz)
+    if cmdMag < 1e-4 then
+        drive.hardStopThrusters(control)
+        return true
+    end
+
+    local thrusters = control.thrusters
+    local n = #thrusters
+    if n == 0 then
+        return false
+    end
+
+    local scores = {}
+    local anyFacing = false
+    for i, t in ipairs(thrusters) do
+        local facing = t.facing or t.role or drive.classifyFacing(t)
+        if facing and facing ~= "mixed" then
+            anyFacing = true
+        end
+        local surge, strafe = 0, 0
+        if facing == "forward" or facing == "surge" or facing == "main" then
+            surge = 1
+        elseif facing == "back" or facing == "aft" or facing == "reverse" then
+            surge = -1
+        end
+        if facing == "right" or facing == "starboard" or facing == "stbd" then
+            strafe = 1
+        elseif facing == "left" or facing == "port" then
+            strafe = -1
+        end
+        local yawSide = drive.thrusterSide(t)
+        scores[i] = fx * surge + fy * strafe + tz * yawSide
+    end
+    if not anyFacing then
+        return false
+    end
+
+    local maxAbs = 0
+    for i = 1, n do
+        maxAbs = math.max(maxAbs, math.abs(scores[i] or 0))
+    end
+    if maxAbs < 1e-8 then
+        drive.hardStopThrusters(control)
+        return false
+    end
+
+    local scale = math.min(1, cmdMag)
+    local anyDuty = false
+    for i, t in ipairs(thrusters) do
+        local duty = ((scores[i] or 0) / maxAbs) * scale
+        if math.abs(duty) < 0.08 then
+            duty = 0
+        end
+        if math.abs(duty) >= 0.08 then
+            anyDuty = true
+        end
+        drive.setActuator(control, t, duty)
+    end
+    if not anyDuty then
+        drive.hardStopThrusters(control)
+        return false
+    end
+
+    for name, rpm in pairs(motorDesired) do
+        if math.abs(rpm or 0) < 2 then
+            motorDesired[name] = 0
+            motorSent[name] = nil
+        end
+    end
+    for name, want in pairs(motorDesired) do
+        if (want or 0) == 0 then
+            writeMotorRpm(name, 0)
+        end
+    end
+    drive.commitMotorsNow()
+    return true
+end
+
+--- Allocate command; Reassembly → teleop → cardinal roles when duties die.
 function drive.applyCommand(control, fx, fy, tz)
     control = control or drive.loadControl()
     drive.enrichControl(control)
+    if drive.preferCardinal(control) then
+        if drive.applyCardinalRoles(control, fx, fy, tz) then
+            return true, "cardinal"
+        end
+        return false, "failed"
+    end
     if drive.preferReassembly(control) then
         local ok = drive.applyReassembly(control, fx, fy, tz)
         if ok then
             return true, "reassembly"
         end
-        -- Singular LS → teleop mixer
         if drive.applyTeleop(control, fx, fy, tz) then
             return true, "teleop_fallback"
+        end
+        if drive.applyCardinalRoles(control, fx, fy, tz) then
+            return true, "cardinal_fallback"
         end
         return false, "failed"
     end
     if drive.applyTeleop(control, fx, fy, tz) then
         return true, "teleop"
+    end
+    if drive.applyCardinalRoles(control, fx, fy, tz) then
+        return true, "cardinal_fallback"
     end
     return false, "failed"
 end
@@ -902,12 +1009,22 @@ function drive.applyReassembly(control, fx, fy, tz)
         end
     end
 
+    local anyDuty = false
     for i, t in ipairs(thrusters) do
         local duty = util.clamp(u[i] or 0, (t.kind == "motor") and -1 or 0, 1)
         if math.abs(duty) < dutyDeadband then
             duty = 0
         end
+        if math.abs(duty) >= dutyDeadband then
+            anyDuty = true
+        end
         drive.setActuator(control, t, duty)
+    end
+
+    -- LS "succeeded" but every duty deadbanded → fail so applyCommand can fall back
+    -- (classic A/D dead: all tz≈0 after facing snap / noisy calib).
+    if not anyDuty then
+        return false
     end
 
     -- Per-motor RPM only (no shared RF pool scaling)
@@ -1020,9 +1137,22 @@ function drive.healYawThrusters(control)
     end
     local base = math.max(0.25, maxFx, maxFy * 0.5, maxTz)
     local healed = 0
+    local hasStrafeFacing = false
+    for _, t in ipairs(control.thrusters) do
+        local f = t.facing or t.role
+        if f == "left" or f == "right" or f == "port" or f == "starboard" then
+            hasStrafeFacing = true
+            break
+        end
+    end
     for idx, row in ipairs(ranked) do
         local t = row.t
-        if t.kind == "motor" or math.abs(t.fx or 0) > 0.01 or math.abs(t.fy or 0) > 0.01 then
+        local facing = t.facing or t.role
+        -- Don't invent yaw levers on centerline forward when L/R exist (that made W spin).
+        if hasStrafeFacing and (facing == "forward" or facing == "surge" or facing == "main")
+            and math.abs(row.s) < 1e-6 then
+            -- leave tz as-is
+        elseif t.kind == "motor" or math.abs(t.fx or 0) > 0.01 or math.abs(t.fy or 0) > 0.01 then
             -- Left half of sorted sides → negative tz lever, right half → positive
             local sign = (idx <= (n / 2)) and -1 or 1
             if row.s ~= 0 then
@@ -1519,8 +1649,13 @@ function drive.manualLoop(control, opts)
         end
     end
 
-    local useReassembly = wrenchMode and drive.preferReassembly(control)
-    print("Manual control (" .. (useReassembly and "Reassembly LS" or "teleop mixer") .. "):")
+    local allocLabel = "teleop mixer"
+    if wrenchMode and drive.preferCardinal(control) then
+        allocLabel = "cardinal roles"
+    elseif wrenchMode and drive.preferReassembly(control) then
+        allocLabel = "Reassembly LS (+ fallback)"
+    end
+    print("Manual control (" .. allocLabel .. "):")
     print("  W/S surge | A/D or arrows or J/L yaw | Z/C strafe")
     print("  X panic-stop | Q quit")
     if wrenchMode then

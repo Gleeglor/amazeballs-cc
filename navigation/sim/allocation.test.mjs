@@ -3,10 +3,13 @@ import assert from "node:assert/strict";
 import {
   applyTeleop,
   applyReassembly,
+  applyCommand,
+  applyCardinalRoles,
   commandFromKeys,
   thrusterSide,
   syncWrenchFromFacing,
   classifyFacingFromWrench,
+  dutyToRpm,
 } from "./allocation.mjs";
 import { loadFixture, DEFAULT_FIXTURE } from "./fixtures.mjs";
 import { wrenchFromDuties, geometricFromDuties } from "./physics.mjs";
@@ -324,5 +327,165 @@ describe("facing helpers", () => {
     assert.equal(t.fx, 2);
     assert.equal(t.fy, 0);
     assert.ok(Math.abs(t.tz - -2) < 1e-9); // −ly·fx
+  });
+
+  it("syncWrenchFromFacing preserves calib tz when no lever", () => {
+    const t = syncWrenchFromFacing({
+      facing: "forward",
+      max_force: 1,
+      tz: 0.12,
+      lx: 0,
+      ly: 0,
+      lz: 0,
+    });
+    assert.ok(Math.abs(t.tz - 0.12) < 1e-9);
+  });
+});
+
+/**
+ * Lua-shaped calibrate output: facing + max_force + measured tz, no lx/ly.
+ * Reassembly A/D dies when all tz≈0; applyCommand must fall back.
+ */
+function luaLikeCardinal5(opts = {}) {
+  const tzScale = opts.tzScale ?? 1;
+  const thrusters = [
+    {
+      name: "fwd",
+      kind: "motor",
+      facing: "forward",
+      role: "forward",
+      max_force: 0.5,
+      fx: 0.5,
+      fy: 0,
+      tz: 0.01 * tzScale,
+      max_rpm: 24,
+      side_score: 0,
+    },
+    {
+      name: "port",
+      kind: "motor",
+      facing: "left",
+      role: "left",
+      max_force: 0.4,
+      fx: 0,
+      fy: -0.4,
+      tz: 0.05 * tzScale,
+      max_rpm: 24,
+      side_score: -1,
+    },
+    {
+      name: "stbd",
+      kind: "motor",
+      facing: "right",
+      role: "right",
+      max_force: 0.4,
+      fx: 0,
+      fy: 0.4,
+      tz: -0.05 * tzScale,
+      max_rpm: 24,
+      side_score: 1,
+    },
+    {
+      name: "aftL",
+      kind: "motor",
+      facing: "back",
+      role: "back",
+      max_force: 0.35,
+      fx: -0.35,
+      fy: 0,
+      tz: 0.03 * tzScale,
+      max_rpm: 24,
+      side_score: -1,
+      ly: -0.5,
+    },
+    {
+      name: "aftR",
+      kind: "motor",
+      facing: "back",
+      role: "back",
+      max_force: 0.35,
+      fx: -0.35,
+      fy: 0,
+      tz: -0.03 * tzScale,
+      max_rpm: 24,
+      side_score: 1,
+      ly: 0.5,
+    },
+  ];
+  return {
+    version: 6,
+    mode: "wrench",
+    alloc_mode: "reassembly",
+    default_motor_rpm: 24,
+    gains: { norm: 0.5 },
+    thrusters,
+  };
+}
+
+describe("applyCommand fallback (Lua-shaped control)", () => {
+  it("Reassembly with tz=0 fails A; applyCommand still yields yaw duties", () => {
+    const control = luaLikeCardinal5({ tzScale: 0 });
+    // Strip positions so sync keeps tz=0
+    for (const t of control.thrusters) {
+      delete t.lx;
+      delete t.ly;
+      delete t.lz;
+    }
+    const dead = applyReassembly(JSON.parse(JSON.stringify(control)), 0, 0, 1);
+    assert.equal(dead.ok, false);
+    assert.equal(dead.branch, "deadband");
+    const cmd = applyCommand(JSON.parse(JSON.stringify(control)), 0, 0, 1);
+    assert.equal(cmd.ok, true);
+    assert.ok(
+      cmd.duties.some((d) => Math.abs(d) > 0.08),
+      `expected yaw duties via fallback, path=${cmd.path} duties=${cmd.duties}`,
+    );
+    assert.ok(
+      cmd.path === "teleop_fallback" || cmd.path === "cardinal_fallback",
+      `path ${cmd.path}`,
+    );
+  });
+
+  it("W/S/strafe/yaw all produce non-zero RPM-class duties", () => {
+    const control = luaLikeCardinal5({ tzScale: 0 });
+    for (const t of control.thrusters) {
+      delete t.lx;
+      delete t.ly;
+      delete t.lz;
+    }
+    const cases = [
+      [1, 0, 0, "W"],
+      [-1, 0, 0, "S"],
+      [0, 1, 0, "C"],
+      [0, -1, 0, "Z"],
+      [0, 0, 1, "A"],
+      [0, 0, -1, "D"],
+    ];
+    for (const [fx, fy, tz, label] of cases) {
+      const r = applyCommand(JSON.parse(JSON.stringify(control)), fx, fy, tz);
+      assert.equal(r.ok, true, label);
+      assert.ok(
+        r.duties.some((d) => Math.abs(d) > 0.08),
+        `${label} dead duties path=${r.path}`,
+      );
+      const rpms = r.duties.map((d) => dutyToRpm(d, 24));
+      assert.ok(
+        rpms.some((rpm) => Math.abs(rpm) >= 2),
+        `${label} expected visible RPM, got ${rpms}`,
+      );
+    }
+  });
+
+  it("cardinal roles alone: W lights forward, A differentials sides", () => {
+    const control = luaLikeCardinal5({ tzScale: 0 });
+    const w = applyCardinalRoles(JSON.parse(JSON.stringify(control)), 1, 0, 0);
+    const a = applyCardinalRoles(JSON.parse(JSON.stringify(control)), 0, 0, 1);
+    assert.equal(w.ok, true);
+    assert.equal(a.ok, true);
+    const fwd = control.thrusters.findIndex((t) => t.facing === "forward");
+    assert.ok(w.duties[fwd] > 0.08);
+    const port = control.thrusters.findIndex((t) => t.facing === "left");
+    const stbd = control.thrusters.findIndex((t) => t.facing === "right");
+    assert.ok(a.duties[port] * a.duties[stbd] < 0);
   });
 });

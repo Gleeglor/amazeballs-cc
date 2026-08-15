@@ -1,10 +1,11 @@
 /**
- * Interactive boat physics play-space (top + side 3D views).
- * Uses the same allocation.mjs as unit tests (CC applyReassembly / applyTeleop).
+ * Interactive boat physics play-space (top + side views).
+ * Uses the same allocation.mjs as unit tests (CC applyCommand / teleop / roles).
  */
 import {
   applyTeleop,
-  applyReassembly,
+  applyCommand,
+  applyCardinalRoles,
   commandFromKeys,
   dutyToRpm,
   healYawThrusters,
@@ -37,37 +38,46 @@ const statusEl = document.getElementById("status");
 
 const held = { w: false, a: false, s: false, d: false, z: false, c: false };
 let control = loadFixture(DEFAULT_FIXTURE);
-let body = createBody();
+let body = createBody({ z: -0.05 });
 let allocMode = "reassembly";
 let forceMode = "geometric";
 let lastDuties = control.thrusters.map(() => 0);
 let lastBranch = "idle";
+let lastPath = "";
 let lastForces = { Fx: 0, Fy: 0, Fz: 0, Tx: 0, Ty: 0, Tz: 0 };
+let lastHydro = { buoyancy: 0, weight: 0, waterline: 0 };
 let selectedThruster = 0;
 let running = true;
+let baseMass = 8;
 
 const params = defaultPhysicsParams({
   mass: 8,
   Iz: 4,
   inertia: 4,
   linearDrag: 1.2,
+  quadraticDrag: 0.35,
   angularDrag: 2.0,
-  verticalDrag: 8,
-  waterSpring: 25,
+  verticalDrag: 6,
   wrenchForceScale: 40,
   wrenchTorqueScale: 25,
   geometricForceScale: 50,
-  forceMode: "wrench",
+  forceMode: "geometric",
 });
 
 function syncControlsFromDom() {
-  params.mass = num("mass", 8);
+  baseMass = num("mass", 8);
+  const ballast = num("ballast", 0);
+  params.mass = Math.max(0.5, baseMass + ballast);
   params.inertia = num("inertia", 4);
   params.Iz = params.inertia;
   params.linearDrag = num("linDrag", 1.2);
+  params.quadraticDrag = num("quadDrag", 0.35);
   params.angularDrag = num("angDrag", 2.0);
-  params.verticalDrag = num("vertDrag", 8);
-  params.waterSpring = num("waterSpring", 25);
+  params.verticalDrag = num("vertDrag", 6);
+  params.hullVolume = num("hullVol", 0.012);
+  params.comX = num("comX", 0);
+  params.comY = num("comY", 0);
+  params.comZ = num("comZ", -0.05);
   params.wrenchForceScale = num("fScale", 40);
   params.wrenchTorqueScale = num("tScale", 25);
   const maxRpm = num("maxRpm", 24);
@@ -79,22 +89,31 @@ function syncControlsFromDom() {
 }
 
 function num(id, fallback) {
-  const v = Number(document.getElementById(id).value);
+  const el = document.getElementById(id);
+  if (!el) return fallback;
+  const v = Number(el.value);
   return Number.isFinite(v) ? v : fallback;
 }
 
 function allocate(cmd) {
-  const r =
-    allocMode === "reassembly"
-      ? applyReassembly(control, cmd.fx, cmd.fy, cmd.tz)
-      : applyTeleop(control, cmd.fx, cmd.fy, cmd.tz);
+  let r;
+  if (allocMode === "teleop") {
+    r = applyTeleop(control, cmd.fx, cmd.fy, cmd.tz);
+    lastPath = "teleop";
+  } else if (allocMode === "cardinal") {
+    r = applyCardinalRoles(control, cmd.fx, cmd.fy, cmd.tz);
+    lastPath = "cardinal";
+  } else {
+    r = applyCommand(control, cmd.fx, cmd.fy, cmd.tz);
+    lastPath = r.path || "reassembly";
+  }
   lastDuties = r.duties || control.thrusters.map(() => 0);
   lastBranch = r.branch || "?";
   return r;
 }
 
 function resetPose() {
-  body = createBody();
+  body = createBody({ z: -0.05 });
 }
 
 function reloadFixture(name) {
@@ -153,7 +172,6 @@ function commitThrusterEditor() {
   t.facing = document.getElementById("t_facing").value;
   t.role = t.facing;
   syncWrenchFromFacing(t);
-  // Keep editor fields in sync after geometric rewrite
   document.getElementById("t_fx").value = t.fx ?? 0;
   document.getElementById("t_fy").value = t.fy ?? 0;
   document.getElementById("t_tz").value = t.tz ?? 0;
@@ -217,7 +235,6 @@ function clearCanvas(ctx, canvas) {
   return { cx, cy, scale };
 }
 
-/** Project body-local (lx,ly,lz) to world, then to top XY screen. */
 function bodyLocalWorld(lx, ly, lz) {
   const w = bodyToWorld(body, lx, ly, lz);
   return { x: body.x + w.x, y: body.y + w.y, z: body.z + w.z };
@@ -234,8 +251,7 @@ function drawTop() {
     return { x: ox + wx * scale, y: oy - wy * scale };
   }
 
-  // water hint
-  ctx.fillStyle = "rgba(56, 139, 253, 0.06)";
+  ctx.fillStyle = "rgba(56, 139, 253, 0.08)";
   ctx.fillRect(0, 0, canvas.width, canvas.height);
 
   const hull = [
@@ -259,7 +275,7 @@ function drawTop() {
   ctx.lineWidth = 2;
   ctx.stroke();
 
-  const comW = bodyLocalWorld(0, 0, 0);
+  const comW = bodyLocalWorld(params.comX || 0, params.comY || 0, params.comZ || 0);
   const com = toScreen(comW.x, comW.y);
   ctx.fillStyle = "#f0c674";
   ctx.beginPath();
@@ -284,10 +300,14 @@ function drawTop() {
   ctx.lineTo(com.x + body.vx * vScale, com.y - body.vy * vScale);
   ctx.stroke();
 
-  drawThrusters(ctx, (lx, ly, lz) => {
-    const w = bodyLocalWorld(lx, ly, lz);
-    return toScreen(w.x, w.y);
-  }, "xy");
+  drawThrusters(
+    ctx,
+    (lx, ly, lz) => {
+      const w = bodyLocalWorld(lx, ly, lz);
+      return toScreen(w.x, w.y);
+    },
+    "xy",
+  );
 }
 
 function drawSide() {
@@ -301,9 +321,10 @@ function drawSide() {
     return { x: ox + wx * scale, y: oy - wz * scale };
   }
 
-  // water plane z=0
   const waterY = oy;
-  ctx.strokeStyle = "#388bfd";
+  ctx.fillStyle = "rgba(56, 139, 253, 0.18)";
+  ctx.fillRect(0, waterY, canvas.width, canvas.height - waterY);
+  ctx.strokeStyle = "#58a6ff";
   ctx.setLineDash([6, 4]);
   ctx.beginPath();
   ctx.moveTo(0, waterY);
@@ -312,7 +333,7 @@ function drawSide() {
   ctx.setLineDash([]);
   ctx.fillStyle = "#8b949e";
   ctx.font = "10px ui-sans-serif, system-ui";
-  ctx.fillText("water z=0", 8, waterY - 6);
+  ctx.fillText("waterline z=0", 8, waterY - 6);
 
   const hull = [
     [1.2, 0, 0.15],
@@ -334,32 +355,36 @@ function drawSide() {
   ctx.lineWidth = 2;
   ctx.stroke();
 
-  const comW = bodyLocalWorld(0, 0, 0);
+  const comW = bodyLocalWorld(params.comX || 0, params.comY || 0, params.comZ || 0);
   const com = toScreen(comW.x, comW.z);
   ctx.fillStyle = "#f0c674";
   ctx.beginPath();
   ctx.arc(com.x, com.y, 5, 0, Math.PI * 2);
   ctx.fill();
+  ctx.fillStyle = "#9aa7b5";
+  ctx.fillText("CoM", com.x + 8, com.y - 6);
 
-  const noseW = bodyLocalWorld(1.4, 0, 0);
-  const nose = toScreen(noseW.x, noseW.z);
-  ctx.strokeStyle = "#7ee787";
+  const origin = toScreen(body.x, body.z);
+  const bScale = 0.004;
+  ctx.strokeStyle = "#3fb950";
   ctx.beginPath();
-  ctx.moveTo(com.x, com.y);
-  ctx.lineTo(nose.x, nose.y);
+  ctx.moveTo(origin.x - 12, origin.y);
+  ctx.lineTo(origin.x - 12, origin.y - (lastHydro.buoyancy || 0) * bScale);
+  ctx.stroke();
+  ctx.strokeStyle = "#f85149";
+  ctx.beginPath();
+  ctx.moveTo(origin.x + 12, origin.y);
+  ctx.lineTo(origin.x + 12, origin.y + (lastHydro.weight || 0) * bScale);
   ctx.stroke();
 
-  const vScale = 8;
-  ctx.strokeStyle = "#d2a8ff";
-  ctx.beginPath();
-  ctx.moveTo(com.x, com.y);
-  ctx.lineTo(com.x + body.vx * vScale, com.y - body.vz * vScale);
-  ctx.stroke();
-
-  drawThrusters(ctx, (lx, ly, lz) => {
-    const w = bodyLocalWorld(lx, ly, lz);
-    return toScreen(w.x, w.z);
-  }, "xz");
+  drawThrusters(
+    ctx,
+    (lx, ly, lz) => {
+      const w = bodyLocalWorld(lx, ly, lz);
+      return toScreen(w.x, w.z);
+    },
+    "xz",
+  );
 }
 
 function drawThrusters(ctx, project, plane) {
@@ -408,13 +433,17 @@ function drawThrusters(ctx, project, plane) {
 
 function renderHud(cmd) {
   const speed = Math.hypot(body.vx, body.vy, body.vz);
+  const bw = lastHydro.weight || 1;
+  const ratio = ((lastHydro.buoyancy || 0) / bw).toFixed(2);
   hud.innerHTML = `
     <div><b>cmd</b> fx=${cmd.fx} fy=${cmd.fy} tz=${cmd.tz}</div>
-    <div><b>alloc</b> ${allocMode} · <b>branch</b> ${lastBranch}</div>
+    <div><b>alloc</b> ${lastPath} · <b>branch</b> ${lastBranch}</div>
     <div><b>pose</b> x=${body.x.toFixed(2)} y=${body.y.toFixed(2)} z=${body.z.toFixed(2)}</div>
     <div><b>att</b> yaw=${((body.yaw * 180) / Math.PI).toFixed(1)}° pitch=${((body.pitch * 180) / Math.PI).toFixed(1)}° roll=${((body.roll * 180) / Math.PI).toFixed(1)}°</div>
     <div><b>vel</b> |v|=${speed.toFixed(2)} ωz=${body.wz.toFixed(2)}</div>
-    <div><b>wrench</b> Fx=${lastForces.Fx.toFixed(1)} Fy=${lastForces.Fy.toFixed(1)} Fz=${lastForces.Fz.toFixed(1)} Tz=${lastForces.Tz.toFixed(1)}</div>
+    <div><b>B/W</b> ${ratio} (B=${(lastHydro.buoyancy || 0).toFixed(0)} W=${(lastHydro.weight || 0).toFixed(0)})</div>
+    <div><b>wrench</b> Fx=${lastForces.Fx.toFixed(1)} Fy=${lastForces.Fy.toFixed(1)} Tz=${lastForces.Tz.toFixed(1)}</div>
+    <div><b>CoM</b> (${(params.comX || 0).toFixed(2)}, ${(params.comY || 0).toFixed(2)}, ${(params.comZ || 0).toFixed(2)})</div>
   `;
 
   dutyTable.innerHTML = control.thrusters
@@ -448,6 +477,7 @@ function frame(now) {
   if (running) {
     const r = step(body, control.thrusters, lastDuties, params, dt);
     body = r.body;
+    lastHydro = r.hydro || lastHydro;
   }
   drawTop();
   drawSide();
@@ -514,5 +544,5 @@ window.addEventListener("keyup", (e) => {
 jsonArea.value = JSON.stringify(control, null, 2);
 fillThrusterEditor();
 statusEl.textContent =
-  `Default: ${DEFAULT_FIXTURE} · W/S surge · A/D yaw · Z/C strafe · X stop · R reset (Reassembly + geometric)`;
+  `Default: ${DEFAULT_FIXTURE} · buoyancy+CoM · W/S A/D Z/C · X stop · R reset`;
 requestAnimationFrame(frame);

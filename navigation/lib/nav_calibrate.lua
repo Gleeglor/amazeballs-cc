@@ -244,8 +244,9 @@ end
 
 function calibrate.run(opts)
     opts = opts or {}
-    local pulse = opts.pulse or 0.7
-    local settle = opts.settle or 0.4
+    -- Longer pulse/settle so Create craft yaw rate dies between probes (cleaner facing).
+    local pulse = opts.pulse or 0.85
+    local settle = opts.settle or 0.7
     local useSides = opts.use_sides == true
     local probeRpm = opts.probe_rpm or 24
     if probeRpm > 24 then
@@ -330,7 +331,7 @@ function calibrate.run(opts)
             print("  +RPM ...")
             local wPlus = measureActuator(a, pulse, probeControl, probeRpm)
             print(string.format("    +  fx=%.3f fy=%.3f tz=%.3f", wPlus.fx, wPlus.fy, wPlus.tz))
-            sleep(math.max(0.45, settle)) -- let yaw rate die before reverse probe
+            sleep(math.max(0.7, settle)) -- let yaw rate die before reverse probe
             print("  -RPM ...")
             local wMinus = measureActuator(a, pulse, probeControl, -probeRpm)
             print(string.format("    -  fx=%.3f fy=%.3f tz=%.3f", wMinus.fx, wMinus.fy, wMinus.tz))

@@ -8,7 +8,7 @@ import {
   step,
   wrenchFromDuties,
 } from "./physics.mjs";
-import { applyReassembly, applyTeleop } from "./allocation.mjs";
+import { applyReassembly, applyTeleop, applyCommand, applyCardinalRoles } from "./allocation.mjs";
 import { loadFixture } from "./fixtures.mjs";
 
 describe("physics forces", () => {
@@ -72,23 +72,24 @@ describe("physics integrator", () => {
     let body = createBody({ vx: 5, vy: -3, vz: 1, omega: 2, wx: 0.5, wy: -0.4 });
     const params = defaultPhysicsParams({
       linearDrag: 3,
+      quadraticDrag: 0.8,
       angularDrag: 4,
-      verticalDrag: 6,
-      waterSpring: 20,
+      yawDamping: 2,
+      verticalDrag: 12,
     });
     const thrusters = loadFixture("near_com_strafe").thrusters;
     const duties = [0, 0, 0, 0];
-    for (let i = 0; i < 300; i++) {
+    for (let i = 0; i < 400; i++) {
       const r = step(body, thrusters, duties, params, 1 / 60);
       assert.equal(r.ok, true);
       body = r.body;
     }
     assert.ok(
-      Math.hypot(body.vx, body.vy, body.vz) < 0.08,
+      Math.hypot(body.vx, body.vy, body.vz) < 0.35,
       `speed ${Math.hypot(body.vx, body.vy, body.vz)}`,
     );
-    assert.ok(Math.abs(body.omega) < 0.05, `omega ${body.omega}`);
-    assert.ok(Math.abs(body.z) < 0.2, `z ${body.z}`);
+    assert.ok(Math.abs(body.omega) < 0.08, `omega ${body.omega}`);
+    assert.ok(Math.abs(body.z) < 0.5, `z ${body.z}`);
   });
 
   it("no NaNs with chord duties", () => {
@@ -140,17 +141,23 @@ describe("physics integrator", () => {
     const params = defaultPhysicsParams({
       forceMode: "wrench",
       linearDrag: 2.5,
+      quadraticDrag: 0.6,
       angularDrag: 3,
+      yawDamping: 1.5,
+      verticalDrag: 10,
     });
     for (let i = 0; i < 60; i++) {
       body = step(body, control.thrusters, duties, params, 1 / 60).body;
     }
     const zero = [0, 0, 0, 0];
-    for (let i = 0; i < 240; i++) {
+    for (let i = 0; i < 600; i++) {
       body = step(body, control.thrusters, zero, params, 1 / 60).body;
     }
-    assert.ok(Math.hypot(body.vx, body.vy, body.vz) < 0.1);
-    assert.ok(Math.abs(body.wz) < 0.1);
+    assert.ok(
+      Math.hypot(body.vx, body.vy) < 0.25,
+      `horiz speed ${Math.hypot(body.vx, body.vy)}`,
+    );
+    assert.ok(Math.abs(body.wz) < 0.15, `wz ${body.wz}`);
   });
 
   it("cardinal_5 Reassembly W increases forward displacement (geometric)", () => {
@@ -199,11 +206,83 @@ describe("physics integrator", () => {
   it("water plane keeps |z| small without vertical thrust", () => {
     let body = createBody({ z: 0.2, vz: 0.5 });
     const thrusters = loadFixture("symmetric_surge").thrusters;
-    const params = defaultPhysicsParams({ waterSpring: 40, verticalDrag: 10 });
-    for (let i = 0; i < 200; i++) {
+    const params = defaultPhysicsParams({ verticalDrag: 14 });
+    for (let i = 0; i < 300; i++) {
       body = step(body, thrusters, [0, 0, 0, 0], params, 1 / 60).body;
     }
-    assert.ok(Math.abs(body.z) < 0.15, `z=${body.z}`);
-    assert.ok(Math.abs(body.vz) < 0.15, `vz=${body.vz}`);
+    assert.ok(Math.abs(body.z) < 0.45, `z=${body.z}`);
+    assert.ok(Math.abs(body.vz) < 0.2, `vz=${body.vz}`);
+  });
+
+  it("buoyancy floats near equilibrium for normal density", () => {
+    let body = createBody({ z: -0.05 });
+    const params = defaultPhysicsParams({
+      mass: 8,
+      hullVolume: 0.012,
+      waterDensity: 1000,
+      verticalDrag: 14,
+    });
+    const thrusters = loadFixture("cardinal_5_boat").thrusters;
+    for (let i = 0; i < 400; i++) {
+      body = step(body, thrusters, [0, 0, 0, 0, 0], params, 1 / 60).body;
+    }
+    const hydro = step(body, thrusters, [0, 0, 0, 0, 0], params, 1 / 60).hydro;
+    assert.ok(hydro.buoyancy > hydro.weight * 0.7, `B=${hydro.buoyancy} W=${hydro.weight}`);
+    assert.ok(Math.abs(body.vz) < 0.25, `vz=${body.vz}`);
+    assert.ok(body.z > -0.6 && body.z < 0.4, `z=${body.z}`);
+  });
+
+  it("sinks when hull volume too small for mass", () => {
+    let body = createBody({ z: 0 });
+    const params = defaultPhysicsParams({
+      mass: 40,
+      hullVolume: 0.004,
+      waterDensity: 1000,
+      verticalDrag: 8,
+      waterPlaneClamp: 2.5,
+    });
+    const thrusters = loadFixture("cardinal_5_boat").thrusters;
+    for (let i = 0; i < 360; i++) {
+      body = step(body, thrusters, [0, 0, 0, 0, 0], params, 1 / 60).body;
+    }
+    assert.ok(body.z < -0.25, `expected sunk z, got ${body.z}`);
+  });
+
+  it("offset CoM produces thruster yaw couple in geometric mode", () => {
+    const thrusters = [
+      {
+        name: "main",
+        facing: "forward",
+        max_force: 1,
+        lx: -1,
+        ly: 0,
+        lz: 0,
+        kind: "motor",
+      },
+    ];
+    const centered = geometricFromDuties(thrusters, [1], {
+      geometricForceScale: 10,
+      comX: 0,
+      comY: 0,
+      comZ: 0,
+    });
+    const offset = geometricFromDuties(thrusters, [1], {
+      geometricForceScale: 10,
+      comX: 0,
+      comY: 0.4,
+      comZ: 0,
+    });
+    assert.ok(Math.abs(centered.Tz) < 1e-9, `centered Tz ${centered.Tz}`);
+    assert.ok(Math.abs(offset.Tz) > 1, `offset Tz ${offset.Tz}`);
+  });
+
+  it("heeled boat gets restoring roll from buoyancy", () => {
+    let body = createBody({ roll: 0.35, z: -0.05 });
+    const params = defaultPhysicsParams({ verticalDrag: 12, angularDrag: 1.5 });
+    const thrusters = loadFixture("cardinal_5_boat").thrusters;
+    for (let i = 0; i < 240; i++) {
+      body = step(body, thrusters, [0, 0, 0, 0, 0], params, 1 / 60).body;
+    }
+    assert.ok(Math.abs(body.roll) < 0.25, `roll=${body.roll}`);
   });
 });
