@@ -30,6 +30,10 @@
         "label": "calibrate - auto-map motors + relays",
         "dest": "calibrate.lua"
       },
+      "stopmotors.lua": {
+        "label": "stopmotors - force all electric motors to 0",
+        "dest": "stopmotors.lua"
+      },
       "lib": {
         "util.lua": {
           "label": "lib util",

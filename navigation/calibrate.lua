@@ -3,13 +3,13 @@
 -- Usage:
 --   calibrate              -- motors + normal RS (15=full, 0=off)
 --   calibrate invert       -- relays with analog transmission (0=full, 15=off)
---   calibrate rpm 192      -- motor probe / max RPM (default 128)
+--   calibrate rpm 64       -- motor probe / max RPM (default 64)
 package.path = package.path .. ";/lib/?.lua;/lib/?/init.lua"
 local calibrate = require("nav_calibrate")
 
 local args = { ... }
 local invert = false
-local probeRpm = 128
+local probeRpm = 64
 local i = 1
 while i <= #args do
     local a = string.lower(tostring(args[i]))

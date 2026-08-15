@@ -16,7 +16,7 @@ local LEGACY_AXES = {
 }
 
 function drive.loadControl()
-    return util.readJSON(CONTROL_PATH)
+    return drive.clampControlRpm(util.readJSON(CONTROL_PATH))
 end
 
 function drive.saveControl(data)
@@ -83,11 +83,29 @@ end
 -- Motors use a desired/sent queue: key handlers only set targets (cheap);
 -- flushMotors() pushes at most a few setRPM calls so CCA anti-spam + modem
 -- lag don't block the event loop (which felt like 0.5–1s input delay).
+--
+-- IMPORTANT: Create Addition motors KEEP their last RPM if the computer
+-- reboots/shuts off mid-command. Always stop() before exit; boot must zero them.
+local DEFAULT_MAX_RPM = 64 -- hard preference for this boat
 local motorDesired = {}
 local motorSent = {}
 local motorWrapCache = {}
 local lastMotorFlushAt = 0
 local MOTOR_FLUSH_GAP = 0.06 -- Create Addition global anti-spam is picky
+
+local function clampMotorRpm(rpm, maxRpm)
+    maxRpm = math.min(math.abs(tonumber(maxRpm) or DEFAULT_MAX_RPM), DEFAULT_MAX_RPM)
+    if maxRpm < 1 then
+        maxRpm = DEFAULT_MAX_RPM
+    end
+    rpm = math.floor((tonumber(rpm) or 0) + 0.5)
+    if rpm > maxRpm then
+        rpm = maxRpm
+    elseif rpm < -maxRpm then
+        rpm = -maxRpm
+    end
+    return rpm
+end
 
 local function getMotor(name)
     local m = motorWrapCache[name]
@@ -110,13 +128,15 @@ local function writeMotorRpm(name, rpm)
     if not m then
         return false
     end
-    rpm = math.floor((tonumber(rpm) or 0) + 0.5)
+    rpm = clampMotorRpm(rpm, DEFAULT_MAX_RPM)
     local ok, err = pcall(function()
         if math.abs(rpm) < 1 then
+            -- Both: some CCA builds ignore stop() or ignore setRPM(0) alone
+            if m.setRPM then
+                m.setRPM(0)
+            end
             if m.stop then
                 m.stop()
-            elseif m.setRPM then
-                m.setRPM(0)
             end
         elseif m.setRPM then
             m.setRPM(rpm)
@@ -143,8 +163,26 @@ function drive.setMotorRpm(name, rpm)
     if not name then
         return false
     end
-    motorDesired[name] = math.floor((tonumber(rpm) or 0) + 0.5)
+    motorDesired[name] = clampMotorRpm(rpm, DEFAULT_MAX_RPM)
     return true
+end
+
+function drive.defaultMaxRpm()
+    return DEFAULT_MAX_RPM
+end
+
+--- Cap control file RPM fields to the hard max (mutates in-memory config).
+function drive.clampControlRpm(control)
+    if type(control) ~= "table" then
+        return control
+    end
+    control.default_motor_rpm = math.min(tonumber(control.default_motor_rpm) or DEFAULT_MAX_RPM, DEFAULT_MAX_RPM)
+    if type(control.thrusters) == "table" then
+        for _, t in ipairs(control.thrusters) do
+            t.max_rpm = math.min(tonumber(t.max_rpm) or control.default_motor_rpm, DEFAULT_MAX_RPM)
+        end
+    end
+    return control
 end
 
 --- Block until this motor's desired RPM is sent (for calibrate pulses).
@@ -250,10 +288,30 @@ function drive.stopAllMotors(opts)
     for _, name in ipairs(names) do
         motorDesired[name] = 0
         motorSent[name] = nil -- force re-send
+        -- Immediate hard stop attempt (don't wait for flush queue)
+        local m = getMotor(name)
+        if m then
+            pcall(function()
+                if m.setRPM then
+                    m.setRPM(0)
+                end
+                if m.stop then
+                    m.stop()
+                end
+            end)
+            motorSent[name] = 0
+        end
     end
     drive.flushMotors(1)
-    if opts.drain then
-        local deadline = os.clock() + (opts.drain_timeout or 0.35)
+    local doDrain = opts.drain ~= false -- default drain on stop-all
+    if opts.drain == false then
+        doDrain = false
+    end
+    if opts.quick then
+        doDrain = false
+    end
+    if doDrain then
+        local deadline = os.clock() + (opts.drain_timeout or 0.5)
         while drive.motorsPending() and os.clock() < deadline do
             drive.flushMotors(1)
             sleep(MOTOR_FLUSH_GAP)
@@ -264,7 +322,10 @@ end
 function drive.setThrustLevel(control, name, logicalLevel)
     local invert = drive.isInvert(control)
     if getMotor(name) then
-        local maxRpm = (control and control.default_motor_rpm) or 256
+        local maxRpm = math.min(
+            (control and control.default_motor_rpm) or DEFAULT_MAX_RPM,
+            DEFAULT_MAX_RPM
+        )
         local u = util.clamp((tonumber(logicalLevel) or 0) / 15, 0, 1)
         drive.setMotorRpm(name, u * maxRpm)
         drive.flushMotors(1)
@@ -290,7 +351,10 @@ function drive.setActuator(control, thruster, duty)
     end
 
     if kind == "motor" then
-        local maxRpm = thruster.max_rpm or (control and control.default_motor_rpm) or 256
+        local maxRpm = math.min(
+            thruster.max_rpm or (control and control.default_motor_rpm) or DEFAULT_MAX_RPM,
+            DEFAULT_MAX_RPM
+        )
         local rpmSign = thruster.rpm_sign or 1
         duty = util.clamp(tonumber(duty) or 0, -1, 1)
         if math.abs(duty) < 0.03 then
@@ -850,6 +914,7 @@ function drive.manualLoop(control, opts)
     if wrenchMode and drive.healYawThrusters(control) then
         print("Note: calib had weak yaw — using differential forward thrusters for turn")
     end
+    drive.clampControlRpm(control)
 
     drive.allOff(control)
 

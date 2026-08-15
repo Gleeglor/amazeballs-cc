@@ -217,9 +217,11 @@ local function menu(cfg)
 end
 
 -- main
+-- Motors keep last RPM when the computer dies — always zero on boot.
+print("Zeroing electric motors...")
+drive.stopAllMotors({ drain_timeout = 0.75 })
+
 local cfg = loadConfig()
--- Kill runaway motors as soon as the boat computer boots
-drive.stopAllMotors()
 
 local hasModem = protocol.open()
 if hasModem then

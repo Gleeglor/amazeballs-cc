@@ -13,7 +13,7 @@ function calibrate.listActuators(useSides)
     table.sort(names)
     for _, name in ipairs(names) do
         if peripheral.hasType(name, "electric_motor") then
-            list[#list + 1] = { name = name, kind = "motor", max_rpm = 256 }
+            list[#list + 1] = { name = name, kind = "motor", max_rpm = 64 }
         end
     end
     for _, name in ipairs(names) do
@@ -69,7 +69,7 @@ end
 
 local function pulseOne(actuator, duration, control, probeRpm)
     if actuator.kind == "motor" then
-        drive.setMotorRpmNow(actuator.name, probeRpm or actuator.max_rpm or 128)
+        drive.setMotorRpmNow(actuator.name, probeRpm or actuator.max_rpm or 64)
         sleep(duration)
         drive.setMotorRpmNow(actuator.name, 0)
     else
@@ -119,7 +119,7 @@ function calibrate.run(opts)
     local pulse = opts.pulse or 0.7
     local settle = opts.settle or 0.4
     local useSides = opts.use_sides == true
-    local probeRpm = opts.probe_rpm or 128
+    local probeRpm = opts.probe_rpm or 64
     local linFloor = (opts.thresholds and opts.thresholds.linear) or 0.04
     local yawFloor = (opts.thresholds and opts.thresholds.yaw) or 0.025
 
