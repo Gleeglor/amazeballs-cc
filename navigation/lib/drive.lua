@@ -684,22 +684,21 @@ function drive.applyReassembly(control, fx, fy, tz)
     if gain < 1e-6 then
         gain = 1
     end
-    -- Cost weights (sqrt applied below). Pure surge uses light yaw nulling +
-    -- a hard deadband so we don't spin "stabilizer" motors that stick after release.
+    -- Cost weights (sqrt applied below). Autopilot path — teleop uses applyTeleop.
     local axW = { 1.0, 1.0, 1.0 }
     local dutyDeadband = 0.08
     if math.abs(fy) >= 0.5 and math.abs(fx) + math.abs(tz) < 0.25 then
-        -- Strafe: kill CoM yaw couple (and leftover surge)
+        -- Strafe: kill CoM yaw couple
         axW = { 2.8, 1.0, 6.0 }
         dutyDeadband = 0.10
     elseif math.abs(fx) >= 0.5 and math.abs(fy) + math.abs(tz) < 0.25 then
-        -- Surge: drive fx thrusters; drop tiny cancel duties (no sticky yaw motors)
-        axW = { 1.0, 2.2, 1.4 }
-        dutyDeadband = 0.14
-    elseif math.abs(tz) >= 0.5 and math.abs(fx) + math.abs(fy) < 0.25 then
-        -- Yaw: kill leftover translation
-        axW = { 2.8, 2.8, 1.0 }
+        -- Surge: null yaw hard so path-follow doesn't spin
+        axW = { 1.0, 2.2, 5.0 }
         dutyDeadband = 0.10
+    elseif math.abs(tz) >= 0.5 and math.abs(fx) + math.abs(fy) < 0.25 then
+        -- Yaw: allow translation residual (near-CoM thrusters always couple)
+        axW = { 0.8, 0.8, 1.0 }
+        dutyDeadband = 0.06
     end
     local sw = {
         math.sqrt(axW[1]),
@@ -816,12 +815,90 @@ function drive.flushMotorsAll(maxCalls)
     return n
 end
 
---- Direct (non-greedy) allocation for teleop — more predictable yaw/strafe.
--- Maps command (-1..1) onto thrusters by wrench projection, then normalizes.
-function drive.applyDirect(control, fx, fy, tz)
+--- Physical side score: +starboard / -port (from calib, not peripheral list order).
+function drive.thrusterSide(t)
+    if type(t) ~= "table" then
+        return 0
+    end
+    if t.side_score ~= nil then
+        return tonumber(t.side_score) or 0
+    end
+    local fy = tonumber(t.fy) or 0
+    if math.abs(fy) >= 0.02 then
+        return fy
+    end
+    local lever = tonumber(t.lever_est)
+    if lever and math.abs(lever) >= 0.05 then
+        return lever
+    end
+    -- Forward force on the port side (negative right) yields +tz ≈ -ry*fx
+    local fx = tonumber(t.fx) or 0
+    local tz = tonumber(t.tz) or 0
+    if math.abs(fx) >= 0.02 and math.abs(tz) >= 0.004 then
+        return -tz / fx
+    end
+    if math.abs(tz) >= 0.008 then
+        return tz
+    end
+    return 0
+end
+
+--- Side-aware yaw levers when calib tz is too weak (never alternate by name order).
+function drive.healYawThrusters(control)
+    if not control or type(control.thrusters) ~= "table" then
+        return false
+    end
+    local maxTz, maxFx, maxFy = 0, 0, 0
+    for _, t in ipairs(control.thrusters) do
+        maxTz = math.max(maxTz, math.abs(t.tz or 0))
+        maxFx = math.max(maxFx, math.abs(t.fx or 0))
+        maxFy = math.max(maxFy, math.abs(t.fy or 0))
+    end
+    if maxTz >= 0.02 and maxTz >= math.max(maxFx, maxFy) * 0.12 then
+        return false
+    end
+
+    local ranked = {}
+    for i, t in ipairs(control.thrusters) do
+        ranked[#ranked + 1] = { i = i, s = drive.thrusterSide(t), t = t }
+    end
+    table.sort(ranked, function(a, b)
+        if a.s == b.s then
+            return a.i < b.i
+        end
+        return a.s < b.s
+    end)
+
+    local n = #ranked
+    if n < 2 then
+        return false
+    end
+    local base = math.max(0.25, maxFx, maxFy * 0.5, maxTz)
+    local healed = 0
+    for idx, row in ipairs(ranked) do
+        local t = row.t
+        if t.kind == "motor" or math.abs(t.fx or 0) > 0.01 or math.abs(t.fy or 0) > 0.01 then
+            -- Left half of sorted sides → negative tz lever, right half → positive
+            local sign = (idx <= (n / 2)) and -1 or 1
+            if row.s ~= 0 then
+                sign = (row.s < 0) and -1 or 1
+            end
+            t.tz = sign * base * 0.5
+            t.side_score = sign
+            t.mag = math.sqrt((t.fx or 0) ^ 2 + (t.fy or 0) ^ 2 + (t.tz or 0) ^ 2)
+            healed = healed + 1
+        end
+    end
+    return healed > 0
+end
+
+--- Teleop mixer: predictable W/S surge, A/D yaw via physical sides (not LS nulling).
+-- Pure surge uses fx only (equal push if fx is weak) so W does not invent a turn.
+-- Pure yaw uses side levers so A/D always differential-spin even when calib tz is tiny.
+function drive.applyTeleop(control, fx, fy, tz)
     control = control or drive.loadControl()
     if not drive.isWrenchMode(control) then
-        return drive.applyWrench(control, fx, fy, tz)
+        return false
     end
 
     fx, fy, tz = fx or 0, fy or 0, tz or 0
@@ -831,89 +908,147 @@ function drive.applyDirect(control, fx, fy, tz)
         return true
     end
 
-    local wx = (control.weights and control.weights.fx) or 1
-    local wy = (control.weights and control.weights.fy) or 1
-    local wz = (control.weights and control.weights.tz) or 3.0
+    local thrusters = control.thrusters
+    local n = #thrusters
+    if n == 0 then
+        return false
+    end
 
-    local scores = {}
-    local maxAbs = 0
-    for i, t in ipairs(control.thrusters) do
-        local s = wx * fx * (t.fx or 0) + wy * fy * (t.fy or 0) + wz * tz * (t.tz or 0)
-        scores[i] = s
-        if math.abs(s) > maxAbs then
-            maxAbs = math.abs(s)
+    local sides = {}
+    local maxFx, maxFy, maxTz = 0, 0, 0
+    for i, t in ipairs(thrusters) do
+        sides[i] = drive.thrusterSide(t)
+        maxFx = math.max(maxFx, math.abs(t.fx or 0))
+        maxFy = math.max(maxFy, math.abs(t.fy or 0))
+        maxTz = math.max(maxTz, math.abs(t.tz or 0))
+    end
+    -- If every side_score is ~0, invent from sorted index so yaw still works
+    local anySide = false
+    for i = 1, n do
+        if math.abs(sides[i]) > 1e-6 then
+            anySide = true
+            break
+        end
+    end
+    if not anySide then
+        local ranked = {}
+        for i = 1, n do
+            ranked[i] = i
+        end
+        table.sort(ranked, function(a, b)
+            return tostring(thrusters[a].name) < tostring(thrusters[b].name)
+        end)
+        for idx, i in ipairs(ranked) do
+            sides[i] = (idx <= (n / 2)) and -1 or 1
         end
     end
 
-    -- Always mix differential yaw on forward motors (calib tz is often weak/wrong)
-    if math.abs(tz) > 0.08 then
-        local side = 1
-        for i, t in ipairs(control.thrusters) do
-            if t.kind == "motor" then
-                local forwardish = math.abs(t.fx or 0)
-                if forwardish < 1e-4 then
-                    forwardish = 0.2 -- still participate in turn if unlabeled
+    local scores = {}
+    local pureSurge = math.abs(fx) >= 0.5 and math.abs(fy) + math.abs(tz) < 0.25
+    local pureYaw = math.abs(tz) >= 0.5 and math.abs(fx) + math.abs(fy) < 0.25
+    local pureStrafe = math.abs(fy) >= 0.5 and math.abs(fx) + math.abs(tz) < 0.25
+
+    if pureSurge then
+        -- Forward/back only: use calibrated fx. If calib is all-strafe, push every motor equally
+        -- (symmetric boat → net surge, not a forced differential turn).
+        local useEqual = maxFx < math.max(0.04, maxFy * 0.35, maxTz * 0.35)
+        for i, t in ipairs(thrusters) do
+            if useEqual then
+                scores[i] = fx
+            else
+                scores[i] = fx * (t.fx or 0)
+            end
+        end
+    elseif pureYaw then
+        -- Turn: differential by physical side. Prefer calib tz when it has real authority.
+        local useCalibTz = maxTz >= 0.02 and maxTz >= math.max(maxFx, maxFy) * 0.1
+        for i, t in ipairs(thrusters) do
+            if useCalibTz then
+                scores[i] = tz * (t.tz or 0)
+            else
+                local s = sides[i]
+                if math.abs(s) < 1e-6 then
+                    s = 1
                 end
-                scores[i] = (scores[i] or 0) + tz * side * forwardish * 2.0
-                side = -side
+                scores[i] = tz * ((s >= 0) and 1 or -1)
+            end
+        end
+    elseif pureStrafe then
+        local useEqual = maxFy < 0.04
+        for i, t in ipairs(thrusters) do
+            if useEqual then
+                local s = sides[i]
+                scores[i] = fy * ((s >= 0) and 1 or -1)
+            else
+                scores[i] = fy * (t.fy or 0)
+            end
+        end
+    else
+        -- Chords: blend surge/strafe/yaw with side-aware yaw lever
+        for i, t in ipairs(thrusters) do
+            local yawLever = t.tz or 0
+            if math.abs(yawLever) < 0.02 then
+                local s = sides[i]
+                yawLever = ((s >= 0) and 1 or -1) * math.max(0.25, math.abs(t.fx or 0), math.abs(t.fy or 0))
+            end
+            scores[i] = fx * (t.fx or 0) + fy * (t.fy or 0) + tz * yawLever
+        end
+    end
+
+    local maxAbs = 0
+    for i = 1, n do
+        maxAbs = math.max(maxAbs, math.abs(scores[i] or 0))
+    end
+    if maxAbs < 1e-8 then
+        -- Last resort: surge → all equal; yaw → name-split differential
+        if math.abs(fx) >= math.abs(fy) and math.abs(fx) >= math.abs(tz) then
+            for i = 1, n do
+                scores[i] = fx
+            end
+        else
+            for i = 1, n do
+                local s = sides[i]
+                scores[i] = (tz ~= 0 and tz or fy) * ((s >= 0) and 1 or -1)
             end
         end
         maxAbs = 0
-        for i = 1, #scores do
-            if math.abs(scores[i] or 0) > maxAbs then
-                maxAbs = math.abs(scores[i])
-            end
+        for i = 1, n do
+            maxAbs = math.max(maxAbs, math.abs(scores[i] or 0))
         end
     end
-
-    if maxAbs < 1e-6 then
+    if maxAbs < 1e-8 then
         drive.hardStopThrusters(control)
         return false
     end
 
     local scale = math.min(1, cmdMag)
-    for i, t in ipairs(control.thrusters) do
+    for i, t in ipairs(thrusters) do
         local duty = ((scores[i] or 0) / maxAbs) * scale
-        if t.kind == "motor" then
-            drive.setActuator(control, t, duty)
-        else
-            drive.setActuator(control, t, math.max(0, duty))
+        if math.abs(duty) < 0.08 then
+            duty = 0
+        end
+        drive.setActuator(control, t, duty)
+    end
+
+    for name, rpm in pairs(motorDesired) do
+        if math.abs(rpm or 0) < 2 then
+            motorDesired[name] = 0
+            motorSent[name] = nil
         end
     end
-    drive.applyPowerBudget(control)
-    drive.flushMotors(2)
+    for name, want in pairs(motorDesired) do
+        if (want or 0) == 0 then
+            writeMotorRpm(name, 0)
+        end
+    end
+    drive.commitMotorsNow()
     return true
 end
 
---- If calibration wiped yaw, invent differential levers so A/D can still turn.
-function drive.healYawThrusters(control)
-    if not control or type(control.thrusters) ~= "table" then
-        return false
-    end
-    local maxTz, maxFx = 0, 0
-    for _, t in ipairs(control.thrusters) do
-        maxTz = math.max(maxTz, math.abs(t.tz or 0))
-        maxFx = math.max(maxFx, math.abs(t.fx or 0))
-    end
-    -- Heal when yaw is missing OR much weaker than surge (bad reverse-avg calib)
-    if maxTz >= 0.02 and maxTz >= maxFx * 0.15 then
-        return false
-    end
-    local side = 1
-    local healed = 0
-    for _, t in ipairs(control.thrusters) do
-        if math.abs(t.fx or 0) > 0.01 or t.kind == "motor" then
-            local base = math.abs(t.fx or 0)
-            if base < 0.01 then
-                base = 0.25
-            end
-            t.tz = side * base * 0.5
-            t.mag = math.sqrt((t.fx or 0) ^ 2 + (t.fy or 0) ^ 2 + (t.tz or 0) ^ 2)
-            side = -side
-            healed = healed + 1
-        end
-    end
-    return healed > 0
+--- Direct (non-greedy) allocation for teleop — more predictable yaw/strafe.
+-- Maps command (-1..1) onto thrusters by wrench projection, then normalizes.
+function drive.applyDirect(control, fx, fy, tz)
+    return drive.applyTeleop(control, fx, fy, tz)
 end
 
 --- Continuous greedy allocation. Motors get signed RPM; relays get 0-15.
@@ -1238,14 +1373,14 @@ function drive.manualLoop(control, opts)
         end
     end
 
-    print("Manual control (Reassembly wrench):")
+    print("Manual control (teleop mixer):")
     print("  W/S surge | A/D or arrows or J/L yaw | Z/C strafe")
     print("  X panic-stop | Q quit")
     if wrenchMode then
         print("  Thrusters: " .. #control.thrusters .. " (" .. nMotor .. " motors)")
     end
     if healedYaw then
-        print("  (healed weak yaw levers from surge thrusters)")
+        print("  (side-aware yaw levers assigned)")
     end
     print()
 
@@ -1310,7 +1445,8 @@ function drive.manualLoop(control, opts)
         end
         lastCmdSig = sig
         if wrenchMode then
-            drive.applyReassembly(control, cmd.fx, cmd.fy, cmd.tz)
+            -- Teleop mixer: equal/fx surge (no invented turn), side-aware A/D yaw
+            drive.applyTeleop(control, cmd.fx, cmd.fy, cmd.tz)
         else
             drive.setAxis(control, "thrust_forward", cmd.fx > 0)
             drive.setAxis(control, "thrust_reverse", cmd.fx < 0)
