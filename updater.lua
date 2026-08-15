@@ -458,7 +458,7 @@ local function pullFiles(cfg)
             failCount = failCount + 1
         else
             local url = base .. src
-            write(src .. " -> " .. dest .. " ... ")
+            write(src .. " to " .. dest .. " ... ")
             local body, err = httpGet(url)
             if not body then
                 print("FAIL (" .. tostring(err) .. ")")
