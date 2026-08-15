@@ -120,7 +120,7 @@ function calibrate.parseArgs(args)
     local opts = {
         invert_analog = false,
         probe_rpm = 24,
-        power_budget_rf = 45,
+        power_budget_rf = 0,
         fe_per_rpm = 1,
     }
     local i = 1
@@ -159,8 +159,8 @@ function calibrate.printReport(control)
     print()
     print("Saved /boat_control.json  (version " .. tostring(control.version)
         .. ", mode=" .. tostring(control.mode)
-        .. ", max_rpm=" .. tostring(control.default_motor_rpm)
-        .. ", power=" .. tostring(control.power_budget_rf) .. " RF/t)")
+        .. ", max_rpm/motor=" .. tostring(control.default_motor_rpm)
+        .. ", shared_power=" .. tostring(control.power_budget_rf) .. " RF/t)")
     print("Thrusters (" .. #control.thrusters .. "):")
     for _, t in ipairs(control.thrusters) do
         local kind = t.kind or "?"
@@ -178,7 +178,7 @@ function calibrate.printReport(control)
         print("Unused: " .. table.concat(control.unused, ", "))
     end
     print("Motors reverse for strafe/turn when needed; idle = 0 RPM.")
-    print("Power budget scales simultaneous motor RPM to fit RF/t.")
+    print("Max " .. tostring(control.default_motor_rpm) .. " RPM per motor (not a shared total).")
 end
 
 function calibrate.run(opts)
@@ -190,7 +190,7 @@ function calibrate.run(opts)
     if probeRpm > 24 then
         probeRpm = 24
     end
-    local powerBudget = opts.power_budget_rf or 45
+    local powerBudget = opts.power_budget_rf or 0
     local fePerRpm = opts.fe_per_rpm or 1
     local linFloor = (opts.thresholds and opts.thresholds.linear) or 0.03
     local yawFloor = (opts.thresholds and opts.thresholds.yaw) or 0.008

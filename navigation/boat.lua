@@ -183,7 +183,7 @@ local function runCalibrate(argStr)
     local opts = navCal.parseArgs(splitArgs(argStr))
     print("=== Calibrate (from boat menu) ===")
     print("Open water, props submerged. Q from control first if you were piloting.")
-    print(string.format("rpm=%s  power=%s RF/t", tostring(opts.probe_rpm), tostring(opts.power_budget_rf)))
+    print(string.format("rpm/motor=%s  shared_power=%s RF/t (0=off)", tostring(opts.probe_rpm), tostring(opts.power_budget_rf)))
     print()
     drive.stopAllMotors({ drain_timeout = 0.5 })
     local control, err = navCal.run({

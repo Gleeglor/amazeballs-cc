@@ -86,8 +86,8 @@ end
 --
 -- IMPORTANT: Create Addition motors KEEP their last RPM if the computer
 -- reboots/shuts off mid-command. Always stop() before exit; boot must zero them.
-local DEFAULT_MAX_RPM = 24 -- hard cap per motor for this boat
-local DEFAULT_POWER_BUDGET_RF = 45
+local DEFAULT_MAX_RPM = 24 -- per motor (NOT a shared total across thrusters)
+local DEFAULT_POWER_BUDGET_RF = 0 -- 0 = off; shared RF cap is opt-in only
 local DEFAULT_FE_PER_RPM = 1 -- CCA-ish: ~1 FE/t per RPM (pack-dependent)
 local motorDesired = {}
 local motorSent = {}
@@ -264,16 +264,23 @@ function drive.panicStop(control)
 end
 
 --- Cap control file RPM fields to the hard max (mutates in-memory config).
+-- 24 RPM is per motor. Shared power_budget_rf is off unless enforce_power_budget.
 function drive.clampControlRpm(control)
     if type(control) ~= "table" then
         return control
     end
     control.default_motor_rpm = math.min(tonumber(control.default_motor_rpm) or DEFAULT_MAX_RPM, DEFAULT_MAX_RPM)
-    if control.power_budget_rf == nil then
-        control.power_budget_rf = DEFAULT_POWER_BUDGET_RF
-    end
     if control.fe_per_rpm == nil then
         control.fe_per_rpm = DEFAULT_FE_PER_RPM
+    end
+    -- Old calibrations wrote power_budget_rf=45 and scaled all motors as one pool —
+    -- that was wrong for this boat. Opt in with enforce_power_budget=true.
+    if control.enforce_power_budget == true then
+        if control.power_budget_rf == nil then
+            control.power_budget_rf = DEFAULT_POWER_BUDGET_RF
+        end
+    else
+        control.power_budget_rf = 0
     end
     if type(control.thrusters) == "table" then
         for _, t in ipairs(control.thrusters) do
@@ -283,14 +290,19 @@ function drive.clampControlRpm(control)
     return control
 end
 
---- Scale queued motor RPMs so sum(|rpm|)*fe_per_rpm <= power_budget_rf.
+--- Optional: scale queued motor RPMs so sum(|rpm|)*fe_per_rpm <= power_budget_rf.
+-- Disabled unless control.enforce_power_budget and power_budget_rf > 0.
+-- Normal limit is DEFAULT_MAX_RPM (24) on each motor individually.
 function drive.applyPowerBudget(control)
     control = control or drive.loadControl()
-    local budget = tonumber(control and control.power_budget_rf)
+    if not control or control.enforce_power_budget ~= true then
+        return false
+    end
+    local budget = tonumber(control.power_budget_rf)
     if not budget or budget <= 0 then
         return false
     end
-    local fePer = tonumber(control and control.fe_per_rpm) or DEFAULT_FE_PER_RPM
+    local fePer = tonumber(control.fe_per_rpm) or DEFAULT_FE_PER_RPM
     if fePer < 1e-6 then
         fePer = DEFAULT_FE_PER_RPM
     end
@@ -762,7 +774,7 @@ function drive.applyReassembly(control, fx, fy, tz)
         end
     end
 
-    -- Keep yaw couples intact (don't unevenly shrink one diagonal)
+    -- Per-motor RPM only (no shared RF pool scaling)
     if not (math.abs(tz) >= 0.5 and math.abs(fx) + math.abs(fy) < 0.25) then
         drive.applyPowerBudget(control)
     end

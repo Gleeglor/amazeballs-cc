@@ -15,8 +15,8 @@ print("=== Boat thruster calibrate (Reassembly-style) ===")
 print("Open water, props submerged, FE on motors.")
 print("Attach wired modems to each electric_motor (and relays if any).")
 print("Each actuator is one thruster; we measure push + yaw torque.")
-print("Motor probe/max RPM: " .. tostring(opts.probe_rpm))
-print("Power budget: " .. tostring(opts.power_budget_rf) .. " RF/t")
+print("Motor probe/max RPM (each motor): " .. tostring(opts.probe_rpm))
+print("Shared power budget: " .. tostring(opts.power_budget_rf) .. " RF/t (0 = off)")
 if opts.invert_analog then
     print("Relay mode: INVERT (analog transmission — RS 0 = full, 15 = off)")
 else
