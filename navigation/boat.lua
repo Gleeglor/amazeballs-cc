@@ -180,10 +180,10 @@ local function menu(cfg)
         cmd = cmd and string.lower(cmd) or ""
         a = a and string.match(a, "^%s*(.-)%s*$") or ""
         if cmd == "quit" or cmd == "exit" then
-            drive.allOff()
+            drive.allOff(nil, { scan_all = true })
             break
         elseif cmd == "stop" or cmd == "halt" then
-            drive.allOff()
+            drive.allOff(nil, { scan_all = true })
             print("All thrusters / motors stopped")
         elseif cmd == "list" then
             for _, n in ipairs(path.list()) do
@@ -231,7 +231,7 @@ end
 
 local args = { ... }
 if args[1] == "stop" or args[1] == "halt" then
-    drive.allOff()
+    drive.allOff(nil, { scan_all = true })
     print("All thrusters / motors stopped")
 elseif args[1] == "run" then
     if not hasModem then

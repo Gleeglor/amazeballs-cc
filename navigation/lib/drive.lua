@@ -79,10 +79,31 @@ end
 
 --- Set thruster by logical strength 0=off .. 15=full (honors invert_analog).
 -- For thruster tables prefer drive.setActuator.
+local motorRpmCache = {}
+local motorRpmLastSet = {}
+local motorWrapCache = {}
+local actuatorDutyCache = {}
+
+local function getMotor(name)
+    local m = motorWrapCache[name]
+    if m then
+        return m
+    end
+    if not peripheral.isPresent(name) then
+        return nil
+    end
+    m = peripheral.wrap(name)
+    if not m or (not m.setRPM and not m.setSpeed and not m.stop) then
+        return nil
+    end
+    motorWrapCache[name] = m
+    return m
+end
+
 function drive.setThrustLevel(control, name, logicalLevel)
     local invert = drive.isInvert(control)
-    -- Motor names look like "electric_motor_N"
-    if peripheral.isPresent(name) and peripheral.hasType(name, "electric_motor") then
+    -- Prefer motor API when this peripheral is a motor (cached wrap)
+    if getMotor(name) then
         local maxRpm = (control and control.default_motor_rpm) or 256
         local u = util.clamp((tonumber(logicalLevel) or 0) / 15, 0, 1)
         return drive.setMotorRpm(name, u * maxRpm)
@@ -90,27 +111,27 @@ function drive.setThrustLevel(control, name, logicalLevel)
     return drive.setRelayPhysical(name, drive.logicalToPhysical(logicalLevel, invert))
 end
 
-local motorRpmCache = {}
-local motorRpmLastSet = {}
-
 function drive.setMotorRpm(name, rpm)
-    if not name or not peripheral.isPresent(name) then
+    if not name then
         return false
     end
-    if not peripheral.hasType(name, "electric_motor") then
+    local m = getMotor(name)
+    if not m then
         return false
     end
     rpm = math.floor((tonumber(rpm) or 0) + 0.5)
-    -- Anti-spam: skip tiny changes / too-frequent updates
     local now = os.clock()
     local lastT = motorRpmLastSet[name] or 0
     local lastR = motorRpmCache[name]
-    if lastR ~= nil and math.abs(lastR - rpm) < 1 and (now - lastT) < 0.12 then
+    -- Skip identical command
+    if lastR ~= nil and lastR == rpm then
         return true
     end
-    local m = peripheral.wrap(name)
-    if not m then
-        return false
+    -- CCA anti-spam: allow large changes ASAP, small tweaks need a short gap
+    local dt = now - lastT
+    local delta = lastR and math.abs(lastR - rpm) or 999
+    if dt < 0.04 and delta < 8 then
+        return true
     end
     local ok, err = pcall(function()
         if math.abs(rpm) < 1 and m.stop then
@@ -127,10 +148,10 @@ function drive.setMotorRpm(name, rpm)
         motorRpmCache[name] = rpm
         motorRpmLastSet[name] = now
     else
-        -- still record attempt time so we don't spam errors
         motorRpmLastSet[name] = now
+        -- Drop bad wrap so next call re-wraps (modem reconnect)
         if err and not string.find(tostring(err), "Anti Spam") then
-            -- silent for anti-spam; others ignored during control loop
+            motorWrapCache[name] = nil
         end
     end
     return ok
@@ -140,12 +161,12 @@ function drive.stopAllMotors()
     for _, name in ipairs(peripheral.getNames()) do
         if peripheral.hasType(name, "electric_motor") then
             drive.setMotorRpm(name, 0)
-            -- also try stop()
-            local m = peripheral.wrap(name)
+            local m = getMotor(name)
             if m and m.stop then
                 pcall(m.stop)
             end
             motorRpmCache[name] = 0
+            actuatorDutyCache[name] = 0
         end
     end
 end
@@ -158,7 +179,7 @@ function drive.setActuator(control, thruster, duty)
     local name = thruster.name
     local kind = thruster.kind
     if not kind then
-        if peripheral.isPresent(name) and peripheral.hasType(name, "electric_motor") then
+        if getMotor(name) then
             kind = "motor"
         else
             kind = "relay"
@@ -169,9 +190,17 @@ function drive.setActuator(control, thruster, duty)
         local maxRpm = thruster.max_rpm or (control and control.default_motor_rpm) or 256
         duty = util.clamp(tonumber(duty) or 0, -1, 1)
         if math.abs(duty) < 0.03 then
-            return drive.setMotorRpm(name, 0)
+            duty = 0
         end
-        return drive.setMotorRpm(name, duty * maxRpm)
+        local prev = actuatorDutyCache[name]
+        if prev ~= nil and math.abs(prev - duty) < 0.02 then
+            return true
+        end
+        local ok = drive.setMotorRpm(name, duty * maxRpm)
+        if ok then
+            actuatorDutyCache[name] = duty
+        end
+        return ok
     end
 
     duty = util.clamp(tonumber(duty) or 0, 0, 1)
@@ -179,7 +208,15 @@ function drive.setActuator(control, thruster, duty)
     if duty >= 0.04 then
         level = math.max(1, math.floor(duty * 15 + 0.5))
     end
-    return drive.setThrustLevel(control, name, level)
+    local prev = actuatorDutyCache[name]
+    if prev ~= nil and math.abs(prev - duty) < 0.02 then
+        return true
+    end
+    local ok = drive.setThrustLevel(control, name, level)
+    if ok then
+        actuatorDutyCache[name] = duty
+    end
+    return ok
 end
 
 --- Back-compat name: treats boolean/"level" as logical (full or off) unless number given.
@@ -202,8 +239,9 @@ function drive.isWrenchMode(control)
         and #control.thrusters > 0
 end
 
-function drive.allOff(control)
+function drive.allOff(control, opts)
     control = control or drive.loadControl()
+    opts = opts or {}
     if type(control) == "table" and type(control.thrusters) == "table" then
         for _, t in ipairs(control.thrusters) do
             drive.setActuator(control, t, 0)
@@ -219,7 +257,10 @@ function drive.allOff(control)
             end
         end
     end
-    drive.stopAllMotors()
+    -- Full network scan only when explicitly requested (boot / stop / calibrate)
+    if opts.scan_all then
+        drive.stopAllMotors()
+    end
 end
 
 function drive.setAxis(control, axis, on)
@@ -278,7 +319,10 @@ function drive.applyWrench(control, fx, fy, tz)
     local desired = { fx = fx or 0, fy = fy or 0, tz = tz or 0 }
     local desMag = math.sqrt(desired.fx ^ 2 + desired.fy ^ 2 + desired.tz ^ 2)
     if desMag < 1e-4 then
-        drive.allOff(control)
+        -- Zero known thrusters only — avoid peripheral.getNames scan every idle tick
+        for _, t in ipairs(control.thrusters) do
+            drive.setActuator(control, t, 0)
+        end
         return true
     end
 
@@ -551,7 +595,9 @@ function drive.manualLoop(control, opts)
 
     local quitKey = opts.quit_key or keys.q
     local interval = opts.interval or 0.25
-    local tick = opts.tick or 0.1
+    -- Background trim / hold refresh; key changes apply immediately
+    local tick = opts.tick or 0.05
+    local trimEvery = opts.trim_every or 0.2
     local recordName = opts.recordName
     local held = {}
     local waypoints = {}
@@ -560,8 +606,12 @@ function drive.manualLoop(control, opts)
     local stop = false
     local trimState = {}
     local wrenchMode = drive.isWrenchMode(control)
+    local idleApplied = false
+    local lastTrimAt = 0
+    local lastCmdKey = nil
 
     drive.allOff(control)
+    idleApplied = true
 
     local nMotor = 0
     if wrenchMode then
@@ -599,20 +649,44 @@ function drive.manualLoop(control, opts)
         return { fx = fx, fy = fy, tz = tz }
     end
 
-    local function refresh(dt)
+    local function refresh(dt, reason)
         local cmd = commandFromKeys()
-        if wrenchMode then
-            local trimmed
-            trimmed, trimState = drive.trimCommand(control, cmd, trimState, dt)
-            -- Keep manual yaw/strafe authority when keys held
-            if math.abs(cmd.tz) >= 0.08 then
-                trimmed.tz = cmd.tz
+        local idle = math.abs(cmd.fx) + math.abs(cmd.fy) + math.abs(cmd.tz) < 0.01
+        local cmdKey = string.format("%d%d%d", cmd.fx, cmd.fy, cmd.tz)
+        local now = os.clock()
+        local keysChanged = cmdKey ~= lastCmdKey
+        lastCmdKey = cmdKey
+
+        if idle then
+            if not idleApplied or reason == "stop" then
+                drive.allOff(control)
+                idleApplied = true
             end
-            if math.abs(cmd.fy) >= 0.08 then
-                trimmed.fy = cmd.fy
+            return
+        end
+        idleApplied = false
+
+        if wrenchMode then
+            local doTrim = (now - lastTrimAt) >= trimEvery
+            local trimmed = cmd
+            if doTrim then
+                trimmed, trimState = drive.trimCommand(control, cmd, trimState, dt)
+                lastTrimAt = now
+                -- Keep manual yaw/strafe authority when keys held
+                if math.abs(cmd.tz) >= 0.08 then
+                    trimmed.tz = cmd.tz
+                end
+                if math.abs(cmd.fy) >= 0.08 then
+                    trimmed.fy = cmd.fy
+                end
+            elseif not keysChanged and reason ~= "key" then
+                return
             end
             drive.applyWrench(control, trimmed.fx, trimmed.fy, trimmed.tz)
         else
+            if not keysChanged and reason ~= "key" and reason ~= "stop" then
+                return
+            end
             drive.setAxis(control, "thrust_forward", cmd.fx > 0)
             drive.setAxis(control, "thrust_reverse", cmd.fx < 0)
             drive.setAxis(control, "steer_left", cmd.tz > 0)
@@ -630,6 +704,8 @@ function drive.manualLoop(control, opts)
         if key == keys.x then
             held = {}
             drive.allOff(control)
+            idleApplied = true
+            lastCmdKey = "000"
             return
         end
         if key == keys.w or key == keys.s or key == keys.a or key == keys.d
@@ -648,6 +724,8 @@ function drive.manualLoop(control, opts)
             elseif key == keys.c and isHeld then
                 held[keys.z] = nil
             end
+            -- Apply thrust immediately on key change (main lag fix)
+            refresh(tick, "key")
         end
     end
 
@@ -670,7 +748,8 @@ function drive.manualLoop(control, opts)
             break
         end
 
-        refresh(tick)
+        -- Periodic yaw/strafe trim while thrusting (keys already applied immediately)
+        refresh(tick, "tick")
 
         if recordName then
             local now = os.clock()
