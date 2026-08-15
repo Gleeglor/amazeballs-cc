@@ -135,16 +135,35 @@ local function writeMotorRpm(name, rpm)
         return false
     end
     rpm = clampMotorRpm(rpm, DEFAULT_MAX_RPM)
-    local ok, err = pcall(function()
-        if math.abs(rpm) < 1 then
-            -- Both: some CCA builds ignore stop() or ignore setRPM(0) alone
-            if m.setRPM then
+
+    -- Zero path: setRPM(0) and stop() independently. If one hits CCA anti-spam,
+    -- the other may still land — never skip stop() because setRPM failed.
+    if math.abs(rpm) < 1 then
+        local okRpm, errRpm = false, nil
+        local okStop, errStop = false, nil
+        if m.setRPM then
+            okRpm, errRpm = pcall(function()
                 m.setRPM(0)
-            end
-            if m.stop then
+            end)
+        end
+        if m.stop then
+            okStop, errStop = pcall(function()
                 m.stop()
-            end
-        elseif m.setRPM then
+            end)
+        end
+        if okRpm or okStop then
+            motorSent[name] = 0
+            return true
+        end
+        local err = errRpm or errStop
+        if err and not string.find(tostring(err), "Anti Spam") then
+            motorWrapCache[name] = nil
+        end
+        return false
+    end
+
+    local ok, err = pcall(function()
+        if m.setRPM then
             m.setRPM(rpm)
         elseif m.setSpeed then
             m.setSpeed(rpm)
@@ -154,18 +173,13 @@ local function writeMotorRpm(name, rpm)
     end)
     if ok then
         motorSent[name] = rpm
-        -- Stops do not advance the non-zero anti-spam clock (burst zero all thrusters)
-        if math.abs(rpm) >= 1 then
-            lastMotorFlushAt = os.clock()
-        end
+        lastMotorFlushAt = os.clock()
         return true
     end
     if err and not string.find(tostring(err), "Anti Spam") then
         motorWrapCache[name] = nil
     end
-    if math.abs(rpm) >= 1 then
-        lastMotorFlushAt = os.clock()
-    end
+    lastMotorFlushAt = os.clock()
     return false
 end
 
@@ -670,20 +684,22 @@ function drive.applyReassembly(control, fx, fy, tz)
     if gain < 1e-6 then
         gain = 1
     end
-    -- Cost weights (sqrt applied below): boost nulling of uncommanded axes
-    -- only for pure-axis commands so surge (W) isn't crushed by yaw-coupling.
+    -- Cost weights (sqrt applied below). Pure surge uses light yaw nulling +
+    -- a hard deadband so we don't spin "stabilizer" motors that stick after release.
     local axW = { 1.0, 1.0, 1.0 }
-    local dutyDeadband = 0.06
+    local dutyDeadband = 0.08
     if math.abs(fy) >= 0.5 and math.abs(fx) + math.abs(tz) < 0.25 then
         -- Strafe: kill CoM yaw couple (and leftover surge)
-        axW = { 2.8, 1.0, 5.5 }
-    elseif math.abs(fx) >= 0.5 and math.abs(fy) + math.abs(tz) < 0.25 then
-        -- Surge: prefer strong fx thrusters; harder deadband drops tiny cancel duties
-        axW = { 1.0, 2.8, 3.5 }
+        axW = { 2.8, 1.0, 6.0 }
         dutyDeadband = 0.10
+    elseif math.abs(fx) >= 0.5 and math.abs(fy) + math.abs(tz) < 0.25 then
+        -- Surge: drive fx thrusters; drop tiny cancel duties (no sticky yaw motors)
+        axW = { 1.0, 2.2, 1.4 }
+        dutyDeadband = 0.14
     elseif math.abs(tz) >= 0.5 and math.abs(fx) + math.abs(fy) < 0.25 then
         -- Yaw: kill leftover translation
         axW = { 2.8, 2.8, 1.0 }
+        dutyDeadband = 0.10
     end
     local sw = {
         math.sqrt(axW[1]),
@@ -754,26 +770,23 @@ function drive.applyReassembly(control, fx, fy, tz)
             duty = 0
         end
         drive.setActuator(control, t, duty)
-        -- Ensure idle thrusters actually get a stop command this frame
-        if duty == 0 and t.kind == "motor" and t.name then
-            motorDesired[t.name] = 0
-            if motorSent[t.name] ~= 0 then
-                motorSent[t.name] = nil
-            end
-        end
     end
 
     -- Per-motor RPM only (no shared RF pool scaling)
     if not (math.abs(tz) >= 0.5 and math.abs(fx) + math.abs(fy) < 0.25) then
         drive.applyPowerBudget(control)
     end
-    -- After budget, re-zero tiny RPMs and force-stop anything that should be off
+    -- After budget, scrub creep RPMs and immediately write every stop
     for name, rpm in pairs(motorDesired) do
         if math.abs(rpm or 0) < 2 then
             motorDesired[name] = 0
-            if motorSent[name] ~= 0 then
-                motorSent[name] = nil
-            end
+            motorSent[name] = nil
+        end
+    end
+    -- Stops first (no anti-spam), then a few thrust writes
+    for name, want in pairs(motorDesired) do
+        if (want or 0) == 0 then
+            writeMotorRpm(name, 0)
         end
     end
     drive.commitMotorsNow()
@@ -1193,15 +1206,14 @@ function drive.manualLoop(control, opts)
     local interval = opts.interval or 0.25
     local tick = opts.tick or 0.05
     local recordName = opts.recordName
-    local down = {}
-    local pendingUp = {}
+    local held = {}
     local waypoints = {}
     local t0 = os.clock()
     local lastSample = 0
     local stop = false
     local wrenchMode = drive.isWrenchMode(control)
-    local lastIdleStopAt = 0
-    local CHORD_GRACE = 0.15
+    local lastCmdSig = ""
+    local lastIdleBurst = 0
 
     local YAW_L = { [keys.a] = true, [keys.left] = true, [keys.j] = true }
     local YAW_R = { [keys.d] = true, [keys.right] = true, [keys.l] = true }
@@ -1214,6 +1226,7 @@ function drive.manualLoop(control, opts)
     }
 
     drive.clampControlRpm(control)
+    local healedYaw = wrenchMode and drive.healYawThrusters(control)
     drive.hardStopThrusters(control)
 
     local nMotor = 0
@@ -1225,64 +1238,77 @@ function drive.manualLoop(control, opts)
         end
     end
 
-    print("Manual control (Reassembly wrench alloc):")
+    print("Manual control (Reassembly wrench):")
     print("  W/S surge | A/D or arrows or J/L yaw | Z/C strafe")
     print("  X panic-stop | Q quit")
     if wrenchMode then
         print("  Thrusters: " .. #control.thrusters .. " (" .. nMotor .. " motors)")
     end
+    if healedYaw then
+        print("  (healed weak yaw levers from surge thrusters)")
+    end
     print()
 
-    local function forgetKey(key)
-        down[key] = nil
-        pendingUp[key] = nil
-    end
-
-    local function otherMoveDown(exceptKey)
-        for k, _ in pairs(down) do
-            if k ~= exceptKey and MOVE[k] then
-                return true
-            end
-        end
-        return false
-    end
-
     local function commandFromKeys()
-        local fx = (down[keys.w] and 1 or 0) + (down[keys.s] and -1 or 0)
-        local fy = (down[keys.c] and 1 or 0) + (down[keys.z] and -1 or 0)
+        local fx = (held[keys.w] and 1 or 0) + (held[keys.s] and -1 or 0)
+        local fy = (held[keys.c] and 1 or 0) + (held[keys.z] and -1 or 0)
         local yawL, yawR = false, false
         for k, _ in pairs(YAW_L) do
-            if down[k] then yawL = true break end
+            if held[k] then
+                yawL = true
+                break
+            end
         end
         for k, _ in pairs(YAW_R) do
-            if down[k] then yawR = true break end
+            if held[k] then
+                yawR = true
+                break
+            end
         end
         local tz = (yawL and 1 or 0) - (yawR and 1 or 0)
         return { fx = fx, fy = fy, tz = tz }
     end
 
     local function clearOpposites(key)
-        if key == keys.w then forgetKey(keys.s)
-        elseif key == keys.s then forgetKey(keys.w)
+        if key == keys.w then
+            held[keys.s] = nil
+        elseif key == keys.s then
+            held[keys.w] = nil
         elseif YAW_L[key] then
-            for k, _ in pairs(YAW_R) do forgetKey(k) end
+            for k, _ in pairs(YAW_R) do
+                held[k] = nil
+            end
         elseif YAW_R[key] then
-            for k, _ in pairs(YAW_L) do forgetKey(k) end
-        elseif key == keys.z then forgetKey(keys.c)
-        elseif key == keys.c then forgetKey(keys.z)
+            for k, _ in pairs(YAW_L) do
+                held[k] = nil
+            end
+        elseif key == keys.z then
+            held[keys.c] = nil
+        elseif key == keys.c then
+            held[keys.z] = nil
         end
     end
 
-    local lastCmd = { fx = 0, fy = 0, tz = 0 }
+    local function cmdSig(cmd)
+        return tostring(cmd.fx) .. "," .. tostring(cmd.fy) .. "," .. tostring(cmd.tz)
+    end
 
-    local function applyThrust()
+    local function applyThrust(force)
         local cmd = commandFromKeys()
-        if cmd.fx == 0 and cmd.fy == 0 and cmd.tz == 0 then
+        local sig = cmdSig(cmd)
+        local idle = cmd.fx == 0 and cmd.fy == 0 and cmd.tz == 0
+        if idle then
             drive.forceStopAllThrusters(control)
-            lastIdleStopAt = os.clock()
-            lastCmd = { fx = 0, fy = 0, tz = 0 }
+            lastCmdSig = sig
+            lastIdleBurst = os.clock()
             return
         end
+        -- Skip identical realloc unless forced (hold reassert / pending flush)
+        if not force and sig == lastCmdSig then
+            drive.flushMotors(4)
+            return
+        end
+        lastCmdSig = sig
         if wrenchMode then
             drive.applyReassembly(control, cmd.fx, cmd.fy, cmd.tz)
         else
@@ -1292,21 +1318,6 @@ function drive.manualLoop(control, opts)
             drive.setAxis(control, "steer_right", cmd.tz < 0)
             drive.setAxis(control, "strafe_left", cmd.fy < 0)
             drive.setAxis(control, "strafe_right", cmd.fy > 0)
-        end
-        lastCmd = { fx = cmd.fx, fy = cmd.fy, tz = cmd.tz }
-    end
-
-    local function flushPendingUps()
-        local now = os.clock()
-        local changed = false
-        for key, at in pairs(pendingUp) do
-            if now >= at then
-                forgetKey(key)
-                changed = true
-            end
-        end
-        if changed then
-            applyThrust()
         end
     end
 
@@ -1320,56 +1331,49 @@ function drive.manualLoop(control, opts)
             elseif ev[1] == "key" then
                 local key, isRepeat = ev[2], ev[3] and true or false
                 if MOVE[key] then
-                    if isRepeat and not down[key] and not pendingUp[key] then
-                        -- ignore late repeat after full release
-                    else
-                        pendingUp[key] = nil
-                        down[key] = true
-                        if not isRepeat then
-                            clearOpposites(key)
-                            applyThrust() -- snappy press
-                        end
+                    if not held[key] then
+                        held[key] = true
+                        clearOpposites(key)
+                        applyThrust(true)
+                    elseif isRepeat then
+                        -- Same command: only drain pending motor writes (no realloc spam)
+                        applyThrust(false)
                     end
                 elseif (not isRepeat) and key == quitKey then
                     stop = true
                     break
                 elseif (not isRepeat) and key == keys.x then
                     print("Panic stop")
-                    down = {}
-                    pendingUp = {}
-                    lastCmd = { fx = 0, fy = 0, tz = 0 }
+                    held = {}
+                    lastCmdSig = ""
                     drive.panicStop(control)
-                    lastIdleStopAt = os.clock()
+                    lastIdleBurst = os.clock()
                 end
             elseif ev[1] == "key_up" then
                 local key = ev[2]
-                if MOVE[key] then
-                    -- Chord: defer clear (CC spuriously ups held keys). Solo: clear + stop now.
-                    if otherMoveDown(key) then
-                        pendingUp[key] = os.clock() + CHORD_GRACE
-                    else
-                        forgetKey(key)
-                        applyThrust() -- snappy release / full force-stop when idle
-                    end
+                if MOVE[key] and held[key] then
+                    held[key] = nil
+                    applyThrust(true) -- release → realloc or hard stop
                 end
             elseif ev[1] == "timer" and ev[2] == timerId then
                 break
             end
         end
-        if stop then break end
-
-        -- Tick: chord grace + drain any pending stop/thrust writes (no full realloc while held)
-        flushPendingUps()
+        if stop then
+            break
+        end
 
         local cmd = commandFromKeys()
         local idle = cmd.fx == 0 and cmd.fy == 0 and cmd.tz == 0
         if idle then
-            if drive.motorsPending() or (os.clock() - lastIdleStopAt) >= 0.25 then
+            -- Keep hammering stops while idle (CCA anti-spam / sticky RPM)
+            if drive.motorsPending() or (os.clock() - lastIdleBurst) >= 0.2 then
                 drive.forceStopAllThrusters(control)
-                lastIdleStopAt = os.clock()
-                lastCmd = { fx = 0, fy = 0, tz = 0 }
+                lastIdleBurst = os.clock()
+                lastCmdSig = "0,0,0"
             end
         else
+            applyThrust(false)
             drive.flushMotors(4)
         end
 
@@ -1385,7 +1389,7 @@ function drive.manualLoop(control, opts)
         end
     end
 
-    down = {}
+    held = {}
     drive.forceStopAllThrusters(control)
 
     if recordName then
