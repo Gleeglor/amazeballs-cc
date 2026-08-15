@@ -192,13 +192,41 @@ function drive.hardStopThrusters(control)
             end
         end
     end
-    -- Clear any queued RPM for motors no longer in the list
     for name, _ in pairs(motorDesired) do
         motorDesired[name] = 0
         motorSent[name] = nil
         motorWrapCache[name] = nil
     end
-    drive.stopAllMotors({ quick = true })
+    -- Stop every electric_motor, and verify via getRPM when available
+    for _, name in ipairs(peripheral.getNames()) do
+        if peripheral.hasType(name, "electric_motor") then
+            motorDesired[name] = 0
+            local m = peripheral.wrap(name)
+            if m then
+                pcall(function()
+                    if m.setRPM then
+                        m.setRPM(0)
+                    end
+                    if m.setSpeed then
+                        m.setSpeed(0)
+                    end
+                    if m.stop then
+                        m.stop()
+                    end
+                    -- Second shot if still spinning
+                    if m.getRPM and math.abs(m.getRPM() or 0) >= 1 then
+                        if m.setRPM then
+                            m.setRPM(0)
+                        end
+                        if m.stop then
+                            m.stop()
+                        end
+                    end
+                end)
+            end
+            motorSent[name] = 0
+        end
+    end
 end
 
 --- Panic stop for X / idle: slower but hits every motor past CCA anti-spam.
@@ -980,18 +1008,18 @@ function drive.manualLoop(control, opts)
     local interval = opts.interval or 0.25
     local tick = opts.tick or 0.05
     local recordName = opts.recordName
-    local held = {}
-    local suppressed = {} -- after key_up: ignore stale key-repeats (sticky-key fix)
-    local lastSeen = {} -- heartbeat if key_up is lost
+    local down = {} -- keycode -> true while physically held (from key/key_up only)
     local waypoints = {}
     local t0 = os.clock()
     local lastSample = 0
     local stop = false
     local wrenchMode = drive.isWrenchMode(control)
-    local lastCmdKey = nil
-    local HOLD_TIMEOUT = 0.7 -- release if no key/repeat for this long (missed key_up)
     local lastIdleStopAt = 0
+    local lastApplyAt = 0
 
+    -- Yaw: A/D, arrows, and J/L (A/D are flaky on some setups)
+    local YAW_L = { [keys.a] = true, [keys.left] = true, [keys.j] = true }
+    local YAW_R = { [keys.d] = true, [keys.right] = true, [keys.l] = true }
     local MOVE = {
         [keys.w] = true,
         [keys.s] = true,
@@ -1001,35 +1029,14 @@ function drive.manualLoop(control, opts)
         [keys.c] = true,
         [keys.left] = true,
         [keys.right] = true,
+        [keys.j] = true,
+        [keys.l] = true,
     }
 
-    local function clearOpposite(key)
-        local function clear(k)
-            held[k] = nil
-            suppressed[k] = true
-        end
-        if key == keys.w then
-            clear(keys.s)
-        elseif key == keys.s then
-            clear(keys.w)
-        elseif key == keys.a or key == keys.left then
-            clear(keys.d)
-            clear(keys.right)
-        elseif key == keys.d or key == keys.right then
-            clear(keys.a)
-            clear(keys.left)
-        elseif key == keys.z then
-            clear(keys.c)
-        elseif key == keys.c then
-            clear(keys.z)
-        end
-    end
-
-    if wrenchMode and drive.healYawThrusters(control) then
-        print("Note: weak yaw in calib — differential turn enabled")
+    if wrenchMode then
+        drive.healYawThrusters(control)
     end
     drive.clampControlRpm(control)
-
     drive.hardStopThrusters(control)
 
     local nMotor = 0
@@ -1041,57 +1048,86 @@ function drive.manualLoop(control, opts)
         end
     end
 
-    print("Manual control (hold keys):")
-    print("  W/S  forward / reverse")
-    print("  A/D or arrows  yaw left / right")
-    print("  Z/C  strafe left / right")
-    print("  X    all stop")
-    print("  Q    quit" .. (recordName and (" + save path '" .. recordName .. "'") or ""))
+    print("Manual control:")
+    print("  W/S forward/back | A/D or arrows or J/L turn | Z/C strafe")
+    print("  X = panic stop all motors | Q = quit")
     if wrenchMode then
         print("  Thrusters: " .. #control.thrusters .. (nMotor > 0 and (" (" .. nMotor .. " motors)") or ""))
-        if nMotor > 0 then
-            print(string.format(
-                "  Motors: max %s RPM, power budget %s RF/t",
-                tostring(control.default_motor_rpm or 24),
-                tostring(control.power_budget_rf or 45)
-            ))
-        end
     end
+    print("  (key-repeat ignored; release must send key_up)")
     print()
 
-    local function commandFromKeys()
-        local fx = (held[keys.w] and 1 or 0) + (held[keys.s] and -1 or 0)
-        local fy = (held[keys.c] and 1 or 0) + (held[keys.z] and -1 or 0)
-        local yawL = (held[keys.a] or held[keys.left]) and 1 or 0
-        local yawR = (held[keys.d] or held[keys.right]) and 1 or 0
-        return { fx = fx, fy = fy, tz = yawL - yawR }
+    local function anyDown()
+        for _, v in pairs(down) do
+            if v then
+                return true
+            end
+        end
+        return false
     end
 
-    local function forceIdle(panic)
-        lastCmdKey = "0,0,0"
+    local function yawLeft()
+        for k, _ in pairs(YAW_L) do
+            if down[k] then
+                return true
+            end
+        end
+        return false
+    end
+
+    local function yawRight()
+        for k, _ in pairs(YAW_R) do
+            if down[k] then
+                return true
+            end
+        end
+        return false
+    end
+
+    local function commandFromKeys()
+        local fx = (down[keys.w] and 1 or 0) + (down[keys.s] and -1 or 0)
+        local fy = (down[keys.c] and 1 or 0) + (down[keys.z] and -1 or 0)
+        local tz = (yawLeft() and 1 or 0) - (yawRight() and 1 or 0)
+        return { fx = fx, fy = fy, tz = tz }
+    end
+
+    local function clearOpposites(key)
+        if key == keys.w then
+            down[keys.s] = nil
+        elseif key == keys.s then
+            down[keys.w] = nil
+        elseif YAW_L[key] then
+            for k, _ in pairs(YAW_R) do
+                down[k] = nil
+            end
+        elseif YAW_R[key] then
+            for k, _ in pairs(YAW_L) do
+                down[k] = nil
+            end
+        elseif key == keys.z then
+            down[keys.c] = nil
+        elseif key == keys.c then
+            down[keys.z] = nil
+        end
+    end
+
+    local function doIdleStop(panic)
+        down = {}
         if panic then
-            held = {}
-            suppressed = {}
-            lastSeen = {}
             drive.panicStop(control)
         else
             drive.hardStopThrusters(control)
         end
+        lastIdleStopAt = os.clock()
     end
 
-    local function applyCommand()
+    local function applyThrust()
         local cmd = commandFromKeys()
-        local cmdKey = string.format("%d,%d,%d", cmd.fx, cmd.fy, cmd.tz)
-        if cmdKey == lastCmdKey then
-            return
-        end
-        lastCmdKey = cmdKey
-
         if cmd.fx == 0 and cmd.fy == 0 and cmd.tz == 0 then
-            forceIdle()
+            drive.hardStopThrusters(control)
+            lastIdleStopAt = os.clock()
             return
         end
-
         if wrenchMode then
             drive.applyDirect(control, cmd.fx, cmd.fy, cmd.tz)
         else
@@ -1102,48 +1138,7 @@ function drive.manualLoop(control, opts)
             drive.setAxis(control, "strafe_left", cmd.fy < 0)
             drive.setAxis(control, "strafe_right", cmd.fy > 0)
         end
-    end
-
-    local function onMoveDown(key)
-        suppressed[key] = nil
-        held[key] = true
-        lastSeen[key] = os.clock()
-        clearOpposite(key)
-        applyCommand()
-    end
-
-    local function onMoveRepeat(key)
-        -- Never re-arm a released key (stale repeats were the sticky-motor bug)
-        if suppressed[key] or not held[key] then
-            return
-        end
-        lastSeen[key] = os.clock()
-    end
-
-    local function onMoveUp(key)
-        held[key] = nil
-        suppressed[key] = true
-        lastSeen[key] = nil
-        applyCommand() -- immediate hard stop for this axis
-    end
-
-    local function heartbeatReleases()
-        local now = os.clock()
-        local changed = false
-        for key, _ in pairs(MOVE) do
-            if held[key] then
-                local seen = lastSeen[key] or 0
-                if (now - seen) > HOLD_TIMEOUT then
-                    held[key] = nil
-                    suppressed[key] = true
-                    lastSeen[key] = nil
-                    changed = true
-                end
-            end
-        end
-        if changed then
-            applyCommand()
-        end
+        lastApplyAt = os.clock()
     end
 
     while not stop do
@@ -1151,28 +1146,29 @@ function drive.manualLoop(control, opts)
         while true do
             local ev = { os.pullEventRaw() }
             if ev[1] == "terminate" then
-                forceIdle()
+                doIdleStop(true)
                 error("Terminated", 0)
             elseif ev[1] == "key" then
                 local key, isRepeat = ev[2], ev[3] and true or false
-                if MOVE[key] then
-                    if isRepeat then
-                        onMoveRepeat(key)
-                    else
-                        onMoveDown(key)
-                    end
-                elseif not isRepeat then
-                    if key == quitKey then
-                        stop = true
-                        break
-                    elseif key == keys.x then
-                        print("Panic stop — zeroing all electric motors...")
-                        forceIdle(true)
-                    end
+                -- IGNORE key-repeat entirely (root of sticky + "yaw dies while held")
+                if isRepeat then
+                    -- ignore
+                elseif MOVE[key] then
+                    down[key] = true
+                    clearOpposites(key)
+                    applyThrust()
+                elseif key == quitKey then
+                    stop = true
+                    break
+                elseif key == keys.x then
+                    print("Panic stop — all motors")
+                    doIdleStop(true)
                 end
             elseif ev[1] == "key_up" then
-                if MOVE[ev[2]] then
-                    onMoveUp(ev[2])
+                local key = ev[2]
+                if MOVE[key] then
+                    down[key] = nil
+                    applyThrust()
                 end
             elseif ev[1] == "timer" and ev[2] == timerId then
                 break
@@ -1182,21 +1178,19 @@ function drive.manualLoop(control, opts)
             break
         end
 
-        heartbeatReleases()
-
-        local cmd = commandFromKeys()
-        if cmd.fx == 0 and cmd.fy == 0 and cmd.tz == 0 then
-            if lastCmdKey ~= "0,0,0" then
-                forceIdle()
-                lastIdleStopAt = os.clock()
-            elseif (os.clock() - lastIdleStopAt) > 0.3 then
-                -- Occasional re-assert stop (CCA can ignore a single setRPM(0))
+        -- Every tick: if no keys, keep forcing motors off (CCA forgets setRPM(0))
+        if not anyDown() then
+            if (os.clock() - lastIdleStopAt) >= 0.15 then
                 drive.hardStopThrusters(control)
                 lastIdleStopAt = os.clock()
             end
-            lastCmdKey = "0,0,0"
         else
-            drive.flushMotors(2)
+            -- Re-apply while held so turn doesn't die after first packet
+            if (os.clock() - lastApplyAt) >= 0.12 then
+                applyThrust()
+            else
+                drive.flushMotors(2)
+            end
         end
 
         if recordName then
@@ -1214,7 +1208,7 @@ function drive.manualLoop(control, opts)
         end
     end
 
-    forceIdle()
+    doIdleStop(true)
 
     if recordName then
         if #waypoints < 2 then
@@ -1234,5 +1228,6 @@ function drive.manualLoop(control, opts)
     end
     return nil, "ok"
 end
+
 
 return drive
