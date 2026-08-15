@@ -101,6 +101,10 @@ local function clampMotorRpm(rpm, maxRpm)
         maxRpm = DEFAULT_MAX_RPM
     end
     rpm = math.floor((tonumber(rpm) or 0) + 0.5)
+    -- Never leave 1–2 RPM creep (looks "stuck on" in CCA UI)
+    if math.abs(rpm) < 2 then
+        rpm = 0
+    end
     if rpm > maxRpm then
         rpm = maxRpm
     elseif rpm < -maxRpm then
@@ -169,31 +173,81 @@ function drive.setMotorRpm(name, rpm)
     return true
 end
 
---- Immediately zero known thruster motors (bypasses flush queue / anti-spam lag).
+--- Immediately zero EVERY electric_motor on the network (not just calibrated thrusters).
+-- Orphan/unused motors were staying at 1 RPM because X only stopped the thruster list.
 function drive.hardStopThrusters(control)
     control = control or drive.loadControl()
-    if type(control) ~= "table" or type(control.thrusters) ~= "table" then
-        drive.stopAllMotors({ quick = true })
-        return
-    end
-    for _, t in ipairs(control.thrusters) do
-        if t.kind == "motor" or (t.name and getMotor(t.name)) then
-            motorDesired[t.name] = 0
-            motorSent[t.name] = 0
-            local m = getMotor(t.name)
-            if m then
-                pcall(function()
-                    if m.setRPM then
-                        m.setRPM(0)
-                    end
-                    if m.stop then
-                        m.stop()
-                    end
-                end)
+    if type(control) == "table" and type(control.thrusters) == "table" then
+        for _, t in ipairs(control.thrusters) do
+            if t.name then
+                motorDesired[t.name] = 0
             end
-        else
-            drive.setActuator(control, t, 0)
+            if t.kind ~= "motor" and t.name then
+                drive.setActuator(control, t, 0)
+            end
         end
+        if type(control.unused) == "table" then
+            for _, name in ipairs(control.unused) do
+                motorDesired[name] = 0
+            end
+        end
+    end
+    -- Clear any queued RPM for motors no longer in the list
+    for name, _ in pairs(motorDesired) do
+        motorDesired[name] = 0
+        motorSent[name] = nil
+        motorWrapCache[name] = nil
+    end
+    drive.stopAllMotors({ quick = true })
+end
+
+--- Panic stop for X / idle: slower but hits every motor past CCA anti-spam.
+function drive.panicStop(control)
+    drive.hardStopThrusters(control)
+    local names = {}
+    local seen = {}
+    local function add(name)
+        if name and not seen[name] and peripheral.isPresent(name) then
+            seen[name] = true
+            names[#names + 1] = name
+        end
+    end
+    for _, name in ipairs(peripheral.getNames()) do
+        if peripheral.hasType(name, "electric_motor") then
+            add(name)
+        end
+    end
+    if type(control) == "table" then
+        if type(control.thrusters) == "table" then
+            for _, t in ipairs(control.thrusters) do
+                add(t.name)
+            end
+        end
+        if type(control.unused) == "table" then
+            for _, name in ipairs(control.unused) do
+                add(name)
+            end
+        end
+    end
+    for _, name in ipairs(names) do
+        motorDesired[name] = 0
+        motorWrapCache[name] = nil
+        local m = peripheral.wrap(name)
+        if m then
+            pcall(function()
+                if m.setRPM then
+                    m.setRPM(0)
+                end
+                if m.setSpeed then
+                    m.setSpeed(0)
+                end
+                if m.stop then
+                    m.stop()
+                end
+            end)
+        end
+        motorSent[name] = 0
+        sleep(0.05)
     end
 end
 
@@ -239,6 +293,9 @@ function drive.applyPowerBudget(control)
     local scale = maxUnits / total
     for name, rpm in pairs(motorDesired) do
         local nextRpm = math.floor((rpm or 0) * scale + (rpm >= 0 and 0.5 or -0.5))
+        if math.abs(nextRpm) < 2 then
+            nextRpm = 0
+        end
         if nextRpm ~= motorDesired[name] then
             motorDesired[name] = nextRpm
             motorSent[name] = nil
@@ -419,7 +476,7 @@ function drive.setActuator(control, thruster, duty)
         )
         local rpmSign = thruster.rpm_sign or 1
         duty = util.clamp(tonumber(duty) or 0, -1, 1)
-        if math.abs(duty) < 0.03 then
+        if math.abs(duty) < 0.08 then
             duty = 0
         end
         drive.setMotorRpm(name, duty * maxRpm * rpmSign)
@@ -1010,12 +1067,15 @@ function drive.manualLoop(control, opts)
         return { fx = fx, fy = fy, tz = yawL - yawR }
     end
 
-    local function forceIdle()
+    local function forceIdle(panic)
         lastCmdKey = "0,0,0"
-        if wrenchMode then
-            drive.hardStopThrusters(control)
+        if panic then
+            held = {}
+            suppressed = {}
+            lastSeen = {}
+            drive.panicStop(control)
         else
-            drive.allOff(control)
+            drive.hardStopThrusters(control)
         end
     end
 
@@ -1106,10 +1166,8 @@ function drive.manualLoop(control, opts)
                         stop = true
                         break
                     elseif key == keys.x then
-                        held = {}
-                        suppressed = {}
-                        lastSeen = {}
-                        forceIdle()
+                        print("Panic stop — zeroing all electric motors...")
+                        forceIdle(true)
                     end
                 end
             elseif ev[1] == "key_up" then
