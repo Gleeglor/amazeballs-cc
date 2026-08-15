@@ -83,7 +83,10 @@ Easiest: in setup, open `navigation/`, select every file under it, then set boot
 2. Run `calibrate` in open water (props submerged). Writes `/boat_control.json`.
 3. Pilot routes; run `recorder to_port_a` / `recorder to_port_b` (press **Q** to save). Paths land in `/paths/`.
 4. Edit `/boat_config.json` (`boat_id`, `route` path names, optional `cargo` / `tidy_cargo` peripherals).
-5. Boot `boat`, then `run` for the A↔B loop (or `follow <path>` / `dock <port_id>`).
+5. Boot `boat`. Useful commands:
+   - `control` — keyboard drive (W/S thrust, A/D steer, Z/C strafe, X stop, Q quit)
+   - `record to_port_b` — drive with those keys and save a path (Q finishes)
+   - `run` — autopilot A↔B loop
 
 Dock-assist uses forward/back, yaw, and strafe (if calibrated) near the last waypoint.
 
