@@ -121,6 +121,7 @@ async function main() {
 
   // Run exhaustive on boat (safe without package global)
   console.log("  running exhaustive on boat (motors will move)…");
+  console.log("  running exhaustive (motors will move)…");
   const summary = await rpcRetry(
     "exec",
     {
@@ -129,20 +130,14 @@ local h = fs.open("/tests/exhaustive.lua", "r")
 if not h then error("missing /tests/exhaustive.lua") end
 local src = h.readAll()
 h.close()
-local env = {
-  require = require, keys = keys, peripheral = peripheral, sleep = sleep,
-  os = os, fs = fs, textutils = textutils, shell = shell, package = package,
-  math = math, table = table, string = string, pairs = pairs, ipairs = ipairs,
-  tonumber = tonumber, tostring = tostring, type = type, select = select,
-  pcall = pcall, error = error, assert = assert, print = print,
-  load = load, loadfile = loadfile, _G = _G,
-}
-setmetatable(env, { __index = _G })
-local chunk, err = load(src, "@/tests/exhaustive.lua", "t", env)
+-- Load into this agent env so require/shell/keys exist
+local chunk, err = load(src, "@/tests/exhaustive.lua", "t", _ENV)
 if not chunk then error(tostring(err)) end
 local okMod, mod = pcall(chunk)
 if not okMod then error(tostring(mod)) end
-if type(mod) ~= "table" or type(mod.run) ~= "function" then error("no module") end
+if type(mod) ~= "table" or type(mod.run) ~= "function" then
+  error("exhaustive did not return module (got " .. type(mod) .. ")")
+end
 local ok, summary = pcall(mod.run, {})
 if not ok then error(tostring(summary)) end
 return summary

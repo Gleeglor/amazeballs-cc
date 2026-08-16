@@ -356,25 +356,51 @@ function M.run(opts)
     )
     waitSettle(names, 2.5)
 
-    -- --- W surge: user W must increase pose-forward speed (regardless of duty sign) ---
-    local baseline = sampleForward(0.3)
+    -- --- W surge: must move BOW-ward in world (position delta · forward > 0) ---
+    local craft0 = pose.get()
+    local baseline = sampleForward(0.25)
     local wCmd = surgeW
-    local wRes = applyAxes(thrusters, wCmd, 0, 0, 1.0)
+    local wRes = applyAxes(thrusters, wCmd, 0, 0, 1.1)
+    local craft1 = pose.get()
+    local dx = (craft1 and craft1.x or 0) - (craft0 and craft0.x or 0)
+    local dz = (craft1 and craft1.z or 0) - (craft0 and craft0.z or 0)
+    local fw = craft1 and craft1.forward or { x = 0, z = 1 }
+    local along = dx * (fw.x or 0) + dz * (fw.z or 0)
     check(
         "live.W_motors_spin",
         wRes.max_actual >= 4 or wRes.max_sent >= 4,
-        string.format("max_actual=%.1f mode=%s duties=%.2f cmd=%s", wRes.max_actual, tostring(wRes.mode), wRes.max_duty, tostring(wCmd))
+        string.format("max_actual=%.1f mode=%s cmd=%s", wRes.max_actual, tostring(wRes.mode), tostring(wCmd))
     )
     check(
-        "live.W_goes_forward",
+        "live.W_forward_speed",
         wRes.mean_forward > baseline + 0.05 or wRes.mean_forward > 0.08,
+        string.format("baseline=%.3f during=%.3f (pose.forward speed)", baseline, wRes.mean_forward)
+    )
+    check(
+        "live.W_world_along_bow",
+        along > 0.05,
         string.format(
-            "baseline=%.3f during=%.3f cmd=%s surge_sign=%s (flip surge_sign if W goes backward)",
-            baseline,
-            wRes.mean_forward,
-            tostring(wCmd),
-            tostring(surgeSign)
+            "delta·forward=%.3f dxz=(%.2f,%.2f) — W must move bow-ward; flip pose yaw or surge_sign",
+            along,
+            dx,
+            dz
         )
+    )
+
+    -- S must oppose W (stern-ward)
+    waitSettle(names, 2.0)
+    local craftS0 = pose.get()
+    local sCmd = -wCmd
+    local sRes = applyAxes(thrusters, sCmd, 0, 0, 0.9)
+    local craftS1 = pose.get()
+    local sdx = (craftS1 and craftS1.x or 0) - (craftS0 and craftS0.x or 0)
+    local sdz = (craftS1 and craftS1.z or 0) - (craftS0 and craftS0.z or 0)
+    local sfw = craftS1 and craftS1.forward or fw
+    local salong = sdx * (sfw.x or 0) + sdz * (sfw.z or 0)
+    check(
+        "live.S_world_along_stern",
+        salong < -0.03 or (along > 0.05 and salong < along * 0.2),
+        string.format("W_along=%.3f S_along=%.3f (S must not go bow-ward)", along, salong)
     )
     waitSettle(names, 3.0)
     local zeroOk, speeds, bad = allSpeedsNearZero(names, 1)
@@ -411,7 +437,7 @@ function M.run(opts)
         samples = {
             A = { rate = aRes.mean_yaw_rate, cmd = aCmd },
             D = { rate = dRes.mean_yaw_rate, cmd = dCmd },
-            W = { forward = wRes.mean_forward, baseline = baseline, cmd = wCmd },
+            W = { forward = wRes.mean_forward, baseline = baseline, cmd = wCmd, along = along, s_along = salong },
         },
     }
     print(string.format("exhaustive: %d/%d passed", summary.passed, summary.total))
@@ -424,7 +450,27 @@ if prog and tostring(prog):find("exhaustive") then
     local ok, summary = pcall(M.run, {})
     if not ok then
         print("exhaustive CRASH: " .. tostring(summary))
+        local ef = fs.open("/exhaustive_last.json", "w")
+        if ef then
+            ef.write(textutils.serialiseJSON({ ok = false, error = tostring(summary) }))
+            ef.close()
+        end
         error(tostring(summary), 0)
+    end
+    local out = {
+        ok = summary.ok,
+        passed = summary.passed,
+        failed = summary.failed,
+        total = summary.total,
+        yaw_sign = summary.yaw_sign,
+        surge_sign = summary.surge_sign,
+        samples = summary.samples,
+        results = summary.results,
+    }
+    local ef = fs.open("/exhaustive_last.json", "w")
+    if ef then
+        ef.write(textutils.serialiseJSON(out))
+        ef.close()
     end
     if textutils and textutils.serialiseJSON then
         print(textutils.serialiseJSON({

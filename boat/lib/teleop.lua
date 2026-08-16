@@ -48,7 +48,7 @@ end
 
 function teleop.commandFromHeld(held, yawSign, surgeSign)
     yawSign = tonumber(yawSign) or 1
-    surgeSign = tonumber(surgeSign) or -1 -- live: +duty was reverse of pose.forward
+    surgeSign = tonumber(surgeSign) or 1 -- W = +surge along pose.forward (bow)
     local surge, strafe, yaw = 0, 0, 0
     if held[keys.w] then
         surge = surge + 1
@@ -187,7 +187,7 @@ function teleop.begin()
     local session = {
         thrusters = thrusters,
         yawSign = (control and control.yaw_sign) or 1,
-        surgeSign = (control and control.surge_sign) or -1,
+        surgeSign = (control and control.surge_sign) or 1,
         held = {},
         seen = {},
         duties = {},

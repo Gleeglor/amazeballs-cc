@@ -180,7 +180,7 @@ function calibrate.run(opts)
         version = 2,
         max_rpm = motors.MAX_RPM,
         yaw_sign = 1, -- A = yaw-; set to -1 if A/D feel mirrored
-        surge_sign = -1, -- W = +surge after sign; flip to 1 if W goes backward
+        surge_sign = 1, -- W = +surge along bow; set -1 only if W still goes stern-first after pose fix
         thrusters = thrusters,
         unused = unused,
         calibrated_at = tostring(os.epoch and os.epoch("utc") or os.clock()),

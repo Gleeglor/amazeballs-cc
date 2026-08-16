@@ -3,14 +3,18 @@
 -- Prefer /lib so boot programs named like calibrate never shadow library modules.
 package.path = "/lib/?.lua;/lib/?/init.lua;./lib/?.lua;" .. package.path
 
-local util = require("util")
-local motors = require("motors")
-local pose = require("pose")
-local ui = require("ui")
-local calibrate = require("boat_calibrate")
-local teleop = require("teleop")
-local dock = require("dock")
-local route = require("route")
+-- Capture shell-injected APIs (not on _G) for exec()/tests.
+local _require = require
+local _shell = shell
+
+local util = _require("util")
+local motors = _require("motors")
+local pose = _require("pose")
+local ui = _require("ui")
+local calibrate = _require("boat_calibrate")
+local teleop = _require("teleop")
+local dock = _require("dock")
+local route = _require("route")
 
 local REPO_BASE = "https://raw.githubusercontent.com/gleeglor/amazeballs-cc/main/"
 local RENDEZVOUS_URL = REPO_BASE .. "boat/rendezvous.json"
@@ -108,8 +112,12 @@ local function handleRpc(ws, msg)
         if type(code) ~= "string" then
             reply(ws, id, false, nil, "code required")
         else
-            -- Use _G so require/package/peripheral work (not a bare _ENV sandbox).
-            local fn, err = load(code, "exec", "t", _G)
+            local env = {
+                require = _require,
+                shell = _shell,
+            }
+            setmetatable(env, { __index = _ENV })
+            local fn, err = load(code, "exec", "t", env)
             if not fn then
                 reply(ws, id, false, nil, err)
             else

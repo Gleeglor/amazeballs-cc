@@ -91,9 +91,11 @@ function pose.toEuler(q)
 end
 
 --- Body axes in world from orientation.
--- Minecraft/Sable horizontal: yaw 0 faces +Z (south); increasing yaw turns toward -X (west).
+-- Minecraft horizontal: yaw 0 faces +Z (south); increasing yaw turns toward -X (west).
+-- CC:Sable Advanced Math toEuler yaw is opposite that sense for our craft — negate for bow = forward.
 function pose.forwardRightUp(q)
     local pitch, yaw, _roll = pose.toEuler(q)
+    yaw = -(tonumber(yaw) or 0)
     local cp, sp = math.cos(pitch), math.sin(pitch)
     local cy, sy = math.cos(yaw), math.sin(yaw)
     -- forward includes pitch; right is horizontal
@@ -114,7 +116,7 @@ end
 
 function pose.yawFromQuat(q)
     local _p, yaw = pose.toEuler(q)
-    return yaw or 0
+    return -(tonumber(yaw) or 0)
 end
 
 function pose.getRaw()
