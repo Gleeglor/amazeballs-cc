@@ -483,10 +483,10 @@ function test_teleop_repeat_keepalive() {
 }
 
 function test_teleop_yaw_sign() {
-  const a = commandFromHeld({ [KEYS.a]: true }, -1);
-  const d = commandFromHeld({ [KEYS.d]: true }, -1);
-  assert.equal(a.yaw, 1, "A with yaw_sign=-1 → +yaw");
-  assert.equal(d.yaw, -1, "D with yaw_sign=-1 → -yaw");
+  const a = commandFromHeld({ [KEYS.a]: true }, 1);
+  const d = commandFromHeld({ [KEYS.d]: true }, 1);
+  assert.equal(a.yaw, -1, "A with yaw_sign=1 → -yaw");
+  assert.equal(d.yaw, 1, "D with yaw_sign=1 → +yaw");
   console.log("  test_teleop_yaw_sign OK");
 }
 

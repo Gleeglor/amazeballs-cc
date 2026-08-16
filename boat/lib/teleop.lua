@@ -47,7 +47,7 @@ local function loadThrusters()
 end
 
 function teleop.commandFromHeld(held, yawSign)
-    yawSign = tonumber(yawSign) or -1
+    yawSign = tonumber(yawSign) or 1
     local surge, strafe, yaw = 0, 0, 0
     if held[keys.w] then
         surge = surge + 1
@@ -184,7 +184,7 @@ function teleop.begin()
     end
     local session = {
         thrusters = thrusters,
-        yawSign = (control and control.yaw_sign) or -1,
+        yawSign = (control and control.yaw_sign) or 1,
         held = {},
         seen = {},
         duties = {},
