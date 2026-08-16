@@ -39,7 +39,7 @@ Pulls `boat.lua` → `followNamed` → `drive.followPath` with:
 
 `test_agent` status heartbeats now include **pose** so host can monitor nav without superseding the active cmd.
 
-**Commit:** see git HEAD after this push (message starts with point-and-go cruise).
+**Commit:** `5f68858` — Prove live boat nav with point-and-go cruise and pose heartbeats.
 
 ---
 
