@@ -4,12 +4,15 @@
  *
  *   node overnight_loop.mjs
  *   node overnight_loop.mjs --once
+ *
+ * Multiplayer: bridge.json mode=http + npm run serve in another terminal.
+ * Local discover will not find a remote boat.
  */
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { discoverComputers, resolveComputer, defaultMinecraftRoot } from "./discover.mjs";
-import { ping, sendCommand, stopMotors, readStatus } from "./bridge.mjs";
+import { discoverComputers, defaultMinecraftRoot, loadBridgeConfig } from "./discover.mjs";
+import { openSession, resolveBridgeMode, readStatus } from "./bridge.mjs";
 import { spawn } from "node:child_process";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -28,17 +31,41 @@ function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-function findAgentComputer() {
-  const all = discoverComputers(defaultMinecraftRoot());
+async function openLiveSession() {
+  const mode = resolveBridgeMode();
+  if (mode === "http") {
+    const session = openSession({ mode: "http" });
+    let st = null;
+    try {
+      st = await session.readStatus();
+    } catch {
+      st = null;
+    }
+    return { session, status: st, mode };
+  }
+
+  // FS: prefer heartbeat, else resolveComputer via openSession
+  const { config } = loadBridgeConfig();
+  const root = config?.root || defaultMinecraftRoot();
+  const all = discoverComputers(root);
   for (const c of all) {
     const st = readStatus(c.dir);
-    if (st?.alive) return { ...c, status: st, source: "heartbeat" };
+    if (st?.alive) {
+      const session = openSession({
+        mode: "fs",
+        world: c.world,
+        computerId: c.id,
+        minecraftRoot: root,
+      });
+      return { session, status: st, mode: "fs", target: c };
+    }
   }
-  // Prefer boat-ish even without heartbeat
   try {
-    return { ...resolveComputer({}), status: readStatus(resolveComputer({}).dir) };
+    const session = openSession({ mode: "fs" });
+    const st = await session.readStatus();
+    return { session, status: st, mode: "fs" };
   } catch {
-    return null;
+    return { session: null, status: null, mode: "fs" };
   }
 }
 
@@ -61,11 +88,10 @@ function runNpmTest() {
   });
 }
 
-async function goDock(dir) {
+async function goDock(session) {
   console.log(`\n=== navigate_to dock (${DOCK.x}, ${DOCK.z}) ===`);
-  await stopMotors(dir, { timeoutMs: 10000 });
-  const res = await sendCommand(
-    dir,
+  await session.stopMotors({ timeoutMs: 10000 });
+  const res = await session.sendCommand(
     {
       cmd: "navigate_to",
       x: DOCK.x,
@@ -76,44 +102,57 @@ async function goDock(dir) {
     },
     { timeoutMs: 150000 },
   );
-  await stopMotors(dir, { timeoutMs: 10000 });
+  await session.stopMotors({ timeoutMs: 10000 });
   return res;
 }
 
 async function cycle(once) {
-  writeStatus({ phase: "waiting_for_agent", dock: DOCK });
-  console.log("Overnight loop — waiting for test_agent (realtime_status.json alive)…");
+  const mode = resolveBridgeMode();
+  writeStatus({ phase: "waiting_for_agent", dock: DOCK, mode });
+  console.log(`Overnight loop (${mode}) — waiting for test_agent…`);
   console.log("Dock target:", DOCK);
+  if (mode === "http") {
+    console.log("Expect: npm run serve + boat /realtime_bridge.json base_url");
+  }
 
   for (;;) {
-    const target = findAgentComputer();
-    if (!target?.dir) {
-      writeStatus({ phase: "no_computer", message: "No CC computers scored; open world + place boat computer" });
+    const live = await openLiveSession();
+    if (!live.session) {
+      writeStatus({
+        phase: "no_computer",
+        mode,
+        message:
+          mode === "http"
+            ? "HTTP bridge not reachable or no agent yet"
+            : "No local boat computer; MP boats need mode=http",
+      });
       if (once) return { blocked: "no_computer" };
       await sleep(POLL_MS);
       continue;
     }
 
-    const st = readStatus(target.dir);
+    const st = live.status || (await live.session.readStatus().catch(() => null));
     if (!st?.alive) {
       writeStatus({
         phase: "waiting_for_agent",
-        world: target.world,
-        computer_id: target.id,
-        dir: target.dir,
-        hint: "On boat: updater (select test_agent) then run test_agent",
+        mode,
+        target: live.session.describe(),
+        hint:
+          mode === "http"
+            ? "On boat: updater + /realtime_bridge.json then test_agent; host: npm run serve"
+            : "On boat: updater then test_agent",
       });
-      console.log(`[${new Date().toISOString()}] no agent heartbeat at ${target.dir}`);
-      if (once) return { blocked: "agent_not_running", target };
+      console.log(`[${new Date().toISOString()}] no agent heartbeat (${live.session.describe()})`);
+      if (once) return { blocked: "agent_not_running", target: live.session.describe() };
       await sleep(POLL_MS);
       continue;
     }
 
-    console.log(`Agent live: world=${target.world} id=${target.id}`);
-    writeStatus({ phase: "testing", world: target.world, computer_id: target.id });
+    console.log(`Agent live: ${live.session.describe()}`);
+    writeStatus({ phase: "testing", mode, target: live.session.describe() });
 
     try {
-      await ping(target.dir);
+      await live.session.ping();
     } catch (e) {
       writeStatus({ phase: "ping_fail", error: String(e.message || e) });
       if (once) return { blocked: "ping_fail", error: String(e.message || e) };
@@ -126,9 +165,9 @@ async function cycle(once) {
       writeStatus({
         phase: "tests_failed",
         exit: test.code,
-        note: "Fix Lua, deploy_to_computer or updater, re-run test_agent",
+        note: "Fix Lua, updater on boat, ensure HTTP whitelist + serve",
       });
-      console.error("Tests failed — will retry after deploy window");
+      console.error("Tests failed — will retry");
       if (once) return { blocked: "tests_failed", exit: test.code };
       await sleep(POLL_MS * 2);
       continue;
@@ -137,7 +176,7 @@ async function cycle(once) {
     writeStatus({ phase: "navigating", dock: DOCK });
     let nav;
     try {
-      nav = await goDock(target.dir);
+      nav = await goDock(live.session);
     } catch (e) {
       writeStatus({ phase: "nav_error", error: String(e.message || e) });
       if (once) return { blocked: "nav_error", error: String(e.message || e) };

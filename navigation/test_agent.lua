@@ -1,7 +1,9 @@
--- Realtime host bridge: poll /realtime_inbox.json, run drive/pose commands,
--- write /realtime_outbox.json. Force-stops motors between cases + on watchdog.
+-- Realtime host bridge: FS inbox/outbox (SP/sshfs) or HTTP poll (multiplayer).
+-- Force-stops motors between cases + on watchdog.
 --
--- Host (outside Minecraft) writes inbox; this agent replies on outbox.
+-- Multiplayer: write /realtime_bridge.json { "mode":"http", "base_url":"http://HOST:8765" }
+--   then host runs: npm run serve  (navigation/realtime_tests)
+-- Singleplayer: omit that file (or mode=fs); host writes /realtime_inbox.json
 -- Run: test_agent   or   boat → testagent
 package.path = package.path .. ";/lib/?.lua;/lib/?/init.lua"
 
@@ -12,6 +14,7 @@ local pose = require("pose")
 local INBOX = "/realtime_inbox.json"
 local OUTBOX = "/realtime_outbox.json"
 local STATUS = "/realtime_status.json"
+local BRIDGE_CFG = "/realtime_bridge.json"
 local POLL = 0.08
 local WATCHDOG_SEC = 3.0
 local HOLD_MAX_SEC = 4.0
@@ -20,6 +23,76 @@ local lastId = nil
 local lastAlive = os.clock()
 local thrusting = false
 local running = true
+
+-- Transport: "fs" (default) or "http"
+local transport = {
+    mode = "fs",
+    base_url = nil,
+    poll = POLL,
+}
+
+local function loadBridgeConfig()
+    local cfg = util.readJSON(BRIDGE_CFG)
+    if type(cfg) ~= "table" then
+        return
+    end
+    local mode = string.lower(tostring(cfg.mode or "fs"))
+    if mode == "http" then
+        local base = tostring(cfg.base_url or cfg.baseUrl or "")
+        base = string.gsub(base, "/+$", "")
+        if base == "" then
+            print("ERROR: /realtime_bridge.json mode=http needs base_url")
+            return
+        end
+        transport.mode = "http"
+        transport.base_url = base
+        local p = tonumber(cfg.poll)
+        if p and p >= 0.1 and p <= 2.0 then
+            transport.poll = p
+        else
+            transport.poll = 0.3
+        end
+    end
+end
+
+local function httpGetJson(url)
+    if not http or not http.get then
+        return nil, "http API unavailable"
+    end
+    local res, err = http.get(url, { ["Accept"] = "application/json" })
+    if not res then
+        return nil, err or "http.get failed"
+    end
+    local body = res.readAll()
+    res.close()
+    if not body or body == "" then
+        return nil, "empty body"
+    end
+    local ok, data = pcall(textutils.unserialiseJSON, body)
+    if not ok or type(data) ~= "table" then
+        return nil, "bad JSON"
+    end
+    return data
+end
+
+local function httpPostJson(url, payload)
+    if not http or not http.post then
+        return false, "http API unavailable"
+    end
+    local okEnc, encoded = pcall(textutils.serialiseJSON, payload)
+    if not okEnc then
+        return false, "encode failed"
+    end
+    local res, err = http.post(url, encoded, {
+        ["Content-Type"] = "application/json",
+        ["Accept"] = "application/json",
+    })
+    if not res then
+        return false, err or "http.post failed"
+    end
+    res.close()
+    return true
+end
 
 local function safeStop()
     pcall(function()
@@ -88,6 +161,13 @@ end
 
 local function writeOut(payload)
     payload.ts = os.epoch("utc")
+    if transport.mode == "http" then
+        local ok, err = httpPostJson(transport.base_url .. "/v1/result", payload)
+        if not ok then
+            print("result POST failed: " .. tostring(err))
+        end
+        return
+    end
     util.writeJSON(OUTBOX, payload)
 end
 
@@ -99,13 +179,41 @@ local function writeStatus(extra)
         ts = os.epoch("utc"),
         computer_id = os.getComputerID and os.getComputerID() or nil,
         label = os.getComputerLabel and os.getComputerLabel() or nil,
+        bridge = transport.mode,
     }
     if type(extra) == "table" then
         for k, v in pairs(extra) do
             st[k] = v
         end
     end
+    if transport.mode == "http" then
+        local ok, err = httpPostJson(transport.base_url .. "/v1/status", st)
+        if not ok then
+            -- Keep trying; don't spam every poll failure hard.
+            if extra and extra.boot then
+                print("status POST failed: " .. tostring(err))
+            end
+        end
+        return
+    end
     util.writeJSON(STATUS, st)
+end
+
+local function pollNextCommand()
+    if transport.mode == "http" then
+        local data, err = httpGetJson(transport.base_url .. "/v1/cmd")
+        if not data then
+            return nil, err
+        end
+        if data.cmd == nil or data.cmd == false then
+            return nil
+        end
+        if type(data) == "table" and data.id and data.cmd then
+            return data
+        end
+        return nil
+    end
+    return util.readJSON(INBOX)
 end
 
 local function reply(req, ok, result, err)
@@ -359,18 +467,32 @@ local function handle(req)
 end
 
 -- Boot: always stop motors first.
+loadBridgeConfig()
 print("Realtime test agent")
-print("  inbox  " .. INBOX)
-print("  outbox " .. OUTBOX)
+if transport.mode == "http" then
+    print("  mode    http")
+    print("  base    " .. tostring(transport.base_url))
+    print("  poll    " .. tostring(transport.poll) .. "s")
+    if not http then
+        print("ERROR: http API disabled — ask server admin to enable CC http + whitelist host")
+    end
+else
+    print("  mode    fs")
+    print("  inbox   " .. INBOX)
+    print("  outbox  " .. OUTBOX)
+end
 print("  Q / shutdown command stops agent")
 print("Zeroing motors...")
 safeStop()
 writeStatus({ boot = true })
 
 local quitKey = keys.q
+local pollSec = transport.poll or POLL
+local statusEvery = 0
+local STATUS_INTERVAL = 1.0
 
 while running do
-    local timer = os.startTimer(POLL)
+    local timer = os.startTimer(pollSec)
     while true do
         local ev = { os.pullEventRaw() }
         if ev[1] == "terminate" then
@@ -395,7 +517,7 @@ while running do
         writeStatus({ watchdog = true })
     end
 
-    local req = util.readJSON(INBOX)
+    local req = pollNextCommand()
     if type(req) == "table" and req.id and req.id ~= lastId and req.cmd then
         lastId = req.id
         lastAlive = os.clock()
@@ -411,14 +533,21 @@ while running do
             })
             safeStop()
         end
-        pcall(function()
-            if fs.exists(INBOX) then
-                fs.delete(INBOX)
-            end
-        end)
+        if transport.mode == "fs" then
+            pcall(function()
+                if fs.exists(INBOX) then
+                    fs.delete(INBOX)
+                end
+            end)
+        end
         writeStatus({ last_cmd = req.cmd })
+        statusEvery = os.clock()
     else
-        writeStatus({})
+        -- Heartbeat: FS every poll; HTTP ~1/s to avoid flooding.
+        if transport.mode == "fs" or (os.clock() - statusEvery) >= STATUS_INTERVAL then
+            writeStatus({})
+            statusEvery = os.clock()
+        end
     end
 end
 

@@ -82,13 +82,16 @@ Easiest: in setup, open `navigation/`, select every file under it (skip `sim/`),
 
 HTML/unit sim under `navigation/sim/` is **deprecated as authority** — green Node tests there do not prove in-game A/D/W.
 
-Use the filesystem bridge instead (host ↔ boat computer files in the world save):
+**Multiplayer:** the boat is not under local Prism `saves/` — use the HTTP poll bridge (`npm run serve` + boat `/realtime_bridge.json`). Local `npm run list` will not find it.
 
-1. `updater` on the boat; ensure `test_agent.lua` is selected.
-2. In-game: `test_agent` (leave it running; chunk loaded).
-3. On the host: `cd navigation/realtime_tests && npm run list` then `npm test`.
+**Singleplayer:** FS inbox/outbox under the world computer folder.
 
-See `navigation/realtime_tests/README.md`.
+1. Host: `cd navigation/realtime_tests && cp bridge.example.json bridge.json && npm run serve`
+2. Boat: `/realtime_bridge.json` with LAN `base_url`; `updater` → `test_agent`; run `test_agent`
+3. Server admin: allow host IP:8765 in `computercraft-server.toml` `http.rules` (before `$private` deny)
+4. Host: `npm test` (then overnight dock to 340,165)
+
+See `navigation/realtime_tests/README.md` and `navigation/OVERNIGHT.md`.
 
 ### Boat setup
 
@@ -98,7 +101,7 @@ See `navigation/realtime_tests/README.md`.
 4. Edit `/boat_config.json` (`boat_id`, `route` path names, optional `cargo` / `tidy_cargo` peripherals).
 5. Boot `boat`. Useful commands:
    - `control` — keyboard drive (W/S thrust, A/D steer, Z/C strafe, X stop, Q quit)
-   - `testagent` — host FS bridge for realtime A/D/W tests (`realtime_tests/`)
+   - `testagent` — host bridge for realtime A/D/W tests (`realtime_tests/`; HTTP on MP)
    - `record to_port_b` — drive with those keys and save a path (Q finishes)
    - `run` — autopilot A↔B loop
 

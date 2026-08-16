@@ -1,0 +1,6 @@
+{
+  "mode": "http",
+  "base_url": "http://192.168.1.50:8765",
+  "poll": 0.3,
+  "comment": "Copy to the boat computer as /realtime_bridge.json. base_url must be reachable from the Minecraft SERVER (CC http runs server-side). Use your PC LAN IP or a tunnel hostname — not 127.0.0.1."
+}

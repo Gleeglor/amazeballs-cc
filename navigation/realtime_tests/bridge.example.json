@@ -1,5 +1,6 @@
 {
-  "world": "New World (3)",
-  "computer_id": "0",
-  "comment": "Copy to bridge.json. Find ids with: npm run list. Prefer a computer that has boat.lua / boat_control.json / lib/drive.lua."
+  "mode": "http",
+  "listen": "0.0.0.0:8765",
+  "base_url": "http://127.0.0.1:8765",
+  "comment": "MULTIPLAYER (preferred): npm run serve, then npm test. Boat needs /realtime_bridge.json with your LAN IP (not 127.0.0.1). Local discover will NOT find a remote boat."
 }

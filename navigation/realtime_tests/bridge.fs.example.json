@@ -1,0 +1,6 @@
+{
+  "mode": "fs",
+  "world": "New World",
+  "computer_id": "0",
+  "comment": "SINGLEPLAYER / local saves only. Optional sshfs: set root to the mounted server computer tree (see README). Do not use fs mode expecting a multiplayer boat under Prism saves."
+}

@@ -3,6 +3,7 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "serve": "node http_server.mjs",
     "test": "node run_tests.mjs",
     "list": "node run_tests.mjs --list",
     "discover": "node run_tests.mjs --list",

@@ -1,15 +1,16 @@
 /**
- * Real in-game boat tests via CC filesystem bridge.
+ * Real in-game boat tests via CC bridge (HTTP for multiplayer, FS for local/sshfs).
  *
- * Prerequisites:
- *   1. Minecraft open, boat computer loaded, calibrated (/boat_control.json)
- *   2. On boat: updater (select test_agent.lua) then run `test_agent` or `boat` → testagent
- *   3. Host: cd navigation/realtime_tests && npm test
+ * Multiplayer:
+ *   1. Host: npm run serve
+ *   2. Boat: /realtime_bridge.json with base_url → updater → test_agent
+ *   3. Host: npm test
  *
- * Config (optional): copy bridge.example.json → bridge.json with world + computer_id
+ * Singleplayer / sshfs:
+ *   bridge.json mode=fs (default), test_agent without HTTP config
  */
-import { resolveComputer, discoverComputers, defaultMinecraftRoot } from "./discover.mjs";
-import { sendCommand, stopMotors, ping, readStatus } from "./bridge.mjs";
+import { discoverComputers, defaultMinecraftRoot, loadBridgeConfig } from "./discover.mjs";
+import { openSession, resolveBridgeMode } from "./bridge.mjs";
 
 const FAIL = [];
 const PASS = [];
@@ -40,16 +41,25 @@ function sidesLit(thrusters) {
   return { port, stbd };
 }
 
-async function between(dir) {
-  await stopMotors(dir, { timeoutMs: 10000 });
+async function between(session) {
+  await session.stopMotors({ timeoutMs: 10000 });
   await new Promise((r) => setTimeout(r, 250));
 }
 
 async function main() {
   const args = process.argv.slice(2);
   if (args.includes("--list") || args.includes("-l")) {
-    const root = defaultMinecraftRoot();
-    console.log("Minecraft root:", root);
+    const mode = resolveBridgeMode();
+    console.log("Bridge mode:", mode);
+    if (mode === "http") {
+      console.log("HTTP mode — local discover will not find a multiplayer boat.");
+      console.log('Start server: npm run serve');
+      console.log("Boat needs /realtime_bridge.json { \"mode\":\"http\", \"base_url\":\"http://HOST:8765\" }");
+      return;
+    }
+    const { config } = loadBridgeConfig();
+    const root = config?.root || defaultMinecraftRoot();
+    console.log("Minecraft/FS root:", root);
     for (const c of discoverComputers(root)) {
       console.log(`  score=${c.score}  world=${JSON.stringify(c.world)}  id=${c.id}`);
       console.log(`           ${c.dir}`);
@@ -57,22 +67,26 @@ async function main() {
     return;
   }
 
-  let target;
+  let session;
   try {
-    target = resolveComputer({});
+    session = openSession({});
   } catch (e) {
     console.error(String(e.message || e));
     process.exit(2);
   }
 
   console.log("Bridge target:");
-  console.log(`  world=${JSON.stringify(target.world)}  computer_id=${target.id}  (${target.source})`);
-  console.log(`  ${target.dir}`);
+  console.log(`  ${session.describe()}  (mode=${session.mode})`);
 
-  const status = readStatus(target.dir);
+  let status = null;
+  try {
+    status = await session.readStatus();
+  } catch (e) {
+    console.warn("Could not read status:", e.message || e);
+  }
   if (!status?.alive) {
     console.warn(
-      "\nWARNING: realtime_status.json not alive. Start test_agent on the boat computer first.\n",
+      "\nWARNING: agent status not alive. Start test_agent on the boat (HTTP: with /realtime_bridge.json + npm run serve on host).\n",
     );
   } else {
     console.log(`  agent alive (last_cmd=${status.last_cmd || "?"})`);
@@ -80,7 +94,7 @@ async function main() {
 
   console.log("\n=== ping ===");
   try {
-    const p = await ping(target.dir);
+    const p = await session.ping();
     ok("ping", p.ok === true, `computer_id=${p.result?.computer_id}`);
   } catch (e) {
     ok("ping", false, String(e.message || e));
@@ -89,8 +103,8 @@ async function main() {
   }
 
   console.log("\n=== load_control ===");
-  await between(target.dir);
-  const loaded = await sendCommand(target.dir, { cmd: "load_control" }, { timeoutMs: 10000 });
+  await between(session);
+  const loaded = await session.sendCommand({ cmd: "load_control" }, { timeoutMs: 10000 });
   ok("load_control", loaded.ok === true, loaded.ok ? `v${loaded.result?.version} yaw_sign=${loaded.result?.yaw_sign} n=${loaded.result?.n_thrusters}` : loaded.error);
   if (!loaded.ok) {
     console.error("Need /boat_control.json on the boat (run calibrate).");
@@ -98,16 +112,15 @@ async function main() {
   }
 
   console.log("\n=== idle stop ===");
-  await between(target.dir);
-  const idle = await sendCommand(target.dir, { cmd: "apply", fx: 0, fy: 0, tz: 0 });
+  await between(session);
+  const idle = await session.sendCommand({ cmd: "apply", fx: 0, fy: 0, tz: 0 });
   const idleDuties = idle.result?.duties || [];
   const idleMax = Math.max(0, ...idleDuties.map((d) => Math.abs(d || 0)));
   ok("idle_zero_duties", idle.ok && idleMax < 0.08, `maxDuty=${idleMax}`);
 
   console.log("\n=== W surge (hold 1.0s) ===");
-  await between(target.dir);
-  const w = await sendCommand(
-    target.dir,
+  await between(session);
+  const w = await session.sendCommand(
     { cmd: "hold_apply", fx: 1, fy: 0, tz: 0, seconds: 1.0 },
     { timeoutMs: 15000 },
   );
@@ -119,11 +132,9 @@ async function main() {
   );
 
   console.log("\n=== A yaw left (hold 1.2s) ===");
-  await between(target.dir);
-  // Settle after W
+  await between(session);
   await new Promise((r) => setTimeout(r, 800));
-  const a = await sendCommand(
-    target.dir,
+  const a = await session.sendCommand(
     { cmd: "hold_apply", fx: 0, fy: 0, tz: 1, seconds: 1.2 },
     { timeoutMs: 15000 },
   );
@@ -134,7 +145,6 @@ async function main() {
     aSides.port && aSides.stbd || (a.result?.duties || []).filter((d) => Math.abs(d) >= 0.08).length >= 2,
     `port=${aSides.port} stbd=${aSides.stbd} duties=${JSON.stringify(a.result?.duties)}`,
   );
-  // Pilot A = craft-left. Minecraft ω·up is often CW+; report Δyaw sign for diagnosis.
   const aDyaw = a.result?.delta_yaw_deg;
   ok(
     "A_yaw_nonzero",
@@ -146,10 +156,9 @@ async function main() {
   );
 
   console.log("\n=== D yaw right (hold 1.2s) ===");
-  await between(target.dir);
+  await between(session);
   await new Promise((r) => setTimeout(r, 800));
-  const d = await sendCommand(
-    target.dir,
+  const d = await session.sendCommand(
     { cmd: "hold_apply", fx: 0, fy: 0, tz: -1, seconds: 1.2 },
     { timeoutMs: 15000 },
   );
@@ -163,7 +172,7 @@ async function main() {
   console.log(`  note  D Δyaw°=${dDyaw?.toFixed?.(2)} — expect craft RIGHT turn`);
 
   console.log("\n=== final stop ===");
-  await between(target.dir);
+  await between(session);
   ok("final_stop", true);
 
   console.log(`\n${PASS.length} passed, ${FAIL.length} failed`);
