@@ -51,6 +51,49 @@ describe("sign convention: A = left (+tz = +Tz)", () => {
     assert.ok(Math.abs(wa.Tz + wd.Tz) < 0.05, "A/D should be mirrors");
   });
 
+  it("HARD: A (+tz) → positive planar yaw rate on cardinal_5 and asymmetric", () => {
+    // Convention: A = turn left = +tz = CCW from above. Wrong yaw_sign / mixer must fail.
+    for (const name of ["cardinal_5_boat", "asymmetric_cardinal", "offcenter_mass_asym"]) {
+      const control = loadFixture(name);
+      assert.equal(getYawSign(control), 1, `${name} default yaw_sign`);
+      const a = applyCommand(JSON.parse(JSON.stringify(control)), 0, 0, 1);
+      const d = applyCommand(JSON.parse(JSON.stringify(control)), 0, 0, -1);
+      const wa = netWrench(control.thrusters, a.duties);
+      const wd = netWrench(control.thrusters, d.duties);
+      assert.ok(wa.Tz > 0.04, `${name} A Tz=${wa.Tz} (want + / left)`);
+      assert.ok(wd.Tz < -0.04, `${name} D Tz=${wd.Tz} (want − / right)`);
+
+      let body = createBody({ z: -0.05 });
+      const params = defaultPhysicsParams({
+        forceMode: "geometric",
+        comX: control.com_x,
+        comY: control.com_y,
+        comZ: control.com_z,
+        geometricForceScale: 40,
+        linearDrag: 0.5,
+        angularDrag: 1.2,
+      });
+      let yawU = 0;
+      let prev = body.yaw;
+      for (let i = 0; i < 90; i++) {
+        body = step(body, control.thrusters, a.duties, params, 1 / 60).body;
+        body.roll = 0;
+        body.pitch = 0;
+        body.wx = 0;
+        body.wy = 0;
+        let dy = body.yaw - prev;
+        if (dy > Math.PI) dy -= 2 * Math.PI;
+        if (dy < -Math.PI) dy += 2 * Math.PI;
+        yawU += dy;
+        prev = body.yaw;
+      }
+      assert.ok(
+        yawU > 0.12 && body.wz > 0.05,
+        `${name} A planar Δyaw=${((yawU * 180) / Math.PI).toFixed(1)}° wz=${body.wz} (want + / left)`,
+      );
+    }
+  });
+
   it("yaw_sign: −1 flips A/D", () => {
     const control = loadFixture("cardinal_5_boat");
     control.yaw_sign = -1;

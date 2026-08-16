@@ -53,7 +53,8 @@ local function sampleMotion()
     local vel = pose.getVelocity()
     local ang = pose.getAngularVelocity()
     local localV = pose.worldToLocal(vel, craft)
-    local yawRate = ang.x * craft.up.x + ang.y * craft.up.y + ang.z * craft.up.z
+    -- +yaw = CCW / craft-left (see pose.yawRate); raw ω·up is CW in Y-up Minecraft.
+    local yawRate = pose.yawRate(craft, ang)
     return {
         forward = localV.forward,
         right = localV.right,
@@ -456,10 +457,11 @@ function calibrate.run(opts)
     end
 
     local control = {
-        version = 6,
+        version = 7,
         mode = "wrench",
         alloc_mode = "reassembly",
-        -- +tz = CCW = A / craft-left. Set to -1 only if A still turns right after recalibrate.
+        -- +tz = CCW from above = A / craft-left (pose.yawRate negates Minecraft ω·up).
+        -- Override to -1 only if motors are wired backwards after a fresh recalibrate.
         yaw_sign = 1,
         com_compensate = true,
         invert_analog = invert,

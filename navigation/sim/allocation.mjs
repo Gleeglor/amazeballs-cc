@@ -250,10 +250,10 @@ export function allocateWithComCancel(allocFn, control, fx, fy, tz, opts = {}) {
     };
   }
 
-  const maxIter = Math.max(1, Number(opts.cancelIters ?? control.com_cancel_iters) || 4);
-  const gain = Number(opts.cancelGain ?? control.com_cancel_gain) || 0.55;
-  const ratioLim = Number(opts.cancelRatioLimit) || 0.12;
-  const absLim = Number(opts.cancelAbsLimit) || 0.08;
+  const maxIter = Math.max(1, Number(opts.cancelIters ?? control.com_cancel_iters) || 6);
+  const gain = Number(opts.cancelGain ?? control.com_cancel_gain) || 0.65;
+  const ratioLim = Number(opts.cancelRatioLimit) || 0.04;
+  const absLim = Number(opts.cancelAbsLimit) || 0.02;
 
   let tzCmd = pilotTz;
   let r = allocFn(control, fx, fy, tzCmd);
@@ -284,6 +284,9 @@ export function allocateWithComCancel(allocFn, control, fx, fy, tz, opts = {}) {
       cmdFx: fx,
       cmdFy: fy,
       minPrimaryFraction: 0.55,
+      targetRatio: 0.035,
+      targetAbs: 0.012,
+      steps: 20,
     });
     r = { ...r, duties: polished };
     residualTz = netWrench(control.thrusters, r.duties).Tz;
@@ -400,12 +403,15 @@ function dutiesAlive(duties, eps = DUTY_DEADBAND) {
  * Nudge duties to kill residual Tz without a full LS solve.
  * Never drives the commanded primary (Fx for surge / Fy for strafe) below
  * minPrimaryFraction of the pre-null baseline — yaw cancel must not kill surge.
+ *
+ * Targets are tight: prior 0.12 / 0.06 stopped cancel while planar physics still
+ * yawed ~10–15° over 2s on asymmetric / weird fixtures.
  */
 export function nullResidualYaw(thrusters, duties, opts = {}) {
   const out = duties.map((d) => d || 0);
-  const maxSteps = Math.max(1, Number(opts.steps) || 10);
-  const targetRatio = Number(opts.targetRatio) || 0.12;
-  const targetAbs = Number(opts.targetAbs) || 0.06;
+  const maxSteps = Math.max(1, Number(opts.steps) || 20);
+  const targetRatio = Number(opts.targetRatio) || 0.035;
+  const targetAbs = Number(opts.targetAbs) || 0.012;
   const minFrac = Number(opts.minPrimaryFraction) || 0.55;
   const cmdFx = Number(opts.cmdFx);
   const cmdFy = Number(opts.cmdFy);
@@ -419,9 +425,23 @@ export function nullResidualYaw(thrusters, duties, opts = {}) {
     Math.abs(basePrimary) < 1e-6
       ? 0
       : Math.sign(basePrimary) * Math.abs(basePrimary) * minFrac;
+  // Allow modest lateral for cancel — pure W with offset CoM needs L/R nudge,
+  // but keep it below the Fy ratio tests (~0.22·Fx).
   const lateralCap =
-    Math.max(Math.abs(basePrimary) * 0.22, 0.1) +
+    Math.max(Math.abs(basePrimary) * 0.2, 0.1) +
     Math.abs(surgeIntent ? baseline.Fy : baseline.Fx) * 0.5;
+
+  const facingOf = (t) => String(t.facing || t.role || "").toLowerCase();
+  const isYawHelper = (t) => {
+    const f = facingOf(t);
+    return (
+      f === "left" ||
+      f === "right" ||
+      f === "port" ||
+      f === "starboard" ||
+      f === "stbd"
+    );
+  };
 
   for (let step = 0; step < maxSteps; step++) {
     const w = netWrench(thrusters, out);
@@ -429,31 +449,30 @@ export function nullResidualYaw(thrusters, duties, opts = {}) {
     if (Math.abs(w.Tz) < targetAbs && Math.abs(w.Tz) / primary < targetRatio) {
       break;
     }
-    // Pick thruster whose tz best reduces residual with least primary/lateral damage.
+    // Score all thrusters; bias yaw-helpers but never skip surge thrusters that
+    // cancel Tz with little/no lateral (common on asymmetric stern pairs).
     let bestI = -1;
-    let bestScore = 0;
+    let bestScore = -1e9;
     let bestDelta = 0;
     for (let i = 0; i < thrusters.length; i++) {
       const t = thrusters[i];
       const tz = Number(t.tz) || 0;
-      if (Math.abs(tz) < 0.01) continue;
+      if (Math.abs(tz) < 0.008) continue;
       const reversible = t.kind === "motor";
-      let delta = (-w.Tz / tz) * 0.55;
-      const next = clamp(out[i] + delta, reversible ? -1 : 0, 1);
+      let delta = (-w.Tz / tz) * 0.85;
+      let next = clamp(out[i] + delta, reversible ? -1 : 0, 1);
       delta = next - out[i];
       if (Math.abs(delta) < 1e-4) continue;
 
-      // Trial wrench
       const trial = out.slice();
       trial[i] = next;
-      const tw = netWrench(thrusters, trial);
+      let tw = netWrench(thrusters, trial);
       const trialPrimary = primaryOf(tw);
       if (Math.abs(basePrimary) >= 1e-4) {
         if (Math.sign(trialPrimary) !== Math.sign(basePrimary) && Math.abs(trialPrimary) > 1e-4) {
           continue;
         }
         if (Math.abs(trialPrimary) + 1e-9 < Math.abs(minPrimary)) {
-          // Scale delta so primary lands on the floor instead of rejecting entirely.
           const p0 = primaryOf(w);
           const dP = trialPrimary - p0;
           if (Math.abs(dP) < 1e-9) continue;
@@ -461,26 +480,36 @@ export function nullResidualYaw(thrusters, duties, opts = {}) {
           const scale = clamp(need / dP, 0, 1);
           if (scale < 0.05) continue;
           delta *= scale;
-          trial[i] = clamp(out[i] + delta, reversible ? -1 : 0, 1);
-          const tw2 = netWrench(thrusters, trial);
-          if (Math.abs(primaryOf(tw2)) + 1e-9 < Math.abs(minPrimary)) continue;
+          next = clamp(out[i] + delta, reversible ? -1 : 0, 1);
+          trial[i] = next;
+          tw = netWrench(thrusters, trial);
+          if (Math.abs(primaryOf(tw)) + 1e-9 < Math.abs(minPrimary)) continue;
         }
       }
       const lat = surgeIntent ? Math.abs(tw.Fy) : Math.abs(tw.Fx);
-      if (lat > lateralCap + 0.05) continue;
+      // Tight lateral budget — cancel must not turn W into a strafe.
+      if (lat > lateralCap + 0.04) continue;
 
-      // Prefer yaw authority over surge/strafe force; heavily penalize lateral bleed.
+      const latPerTz =
+        Math.abs(surgeIntent ? t.fy || 0 : t.fx || 0) / Math.max(Math.abs(tz), 1e-3);
       const couple =
         Math.abs(tz) /
-        (0.15 + Math.abs(t.fx || 0) + Math.abs(t.fy || 0));
-      const twFinal = netWrench(thrusters, trial);
-      const tzDrop = Math.abs(w.Tz) - Math.abs(twFinal.Tz);
-      const latBleed = surgeIntent ? Math.abs(twFinal.Fy) : Math.abs(twFinal.Fx);
-      const primaryKeep = Math.abs(primaryOf(twFinal)) / Math.max(Math.abs(basePrimary), 1e-3);
+        (0.08 + Math.abs(t.fx || 0) * 0.25 + Math.abs(t.fy || 0) * 0.5);
+      const tzDrop = Math.abs(w.Tz) - Math.abs(tw.Tz);
+      if (tzDrop <= 1e-6) continue;
+      const latBleed = surgeIntent ? Math.abs(tw.Fy) : Math.abs(tw.Fx);
+      const latIncrease = Math.max(0, latBleed - Math.abs(surgeIntent ? w.Fy : w.Fx));
+      const primaryKeep =
+        Math.abs(primaryOf(tw)) / Math.max(Math.abs(basePrimary), 1e-3);
+      const helperBias = isYawHelper(t) ? 0.35 : 0;
+      // Prefer high Tz authority with low lateral; reward pure surge/aft cancels.
       const score =
-        couple * 0.35 +
-        Math.max(0, tzDrop) * 3 -
-        latBleed * 2.5 +
+        couple * 0.45 +
+        Math.max(0, tzDrop) * 6 +
+        helperBias -
+        latBleed * 3.2 -
+        latIncrease * 4 -
+        latPerTz * 0.8 +
         primaryKeep * 0.4;
       if (score > bestScore) {
         bestScore = score;
@@ -490,27 +519,30 @@ export function nullResidualYaw(thrusters, duties, opts = {}) {
     }
     if (bestI < 0) break;
     const prev = out[bestI];
-    out[bestI] = clamp(out[bestI] + bestDelta, thrusters[bestI].kind === "motor" ? -1 : 0, 1);
+    out[bestI] = clamp(
+      out[bestI] + bestDelta,
+      thrusters[bestI].kind === "motor" ? -1 : 0,
+      1,
+    );
     if (Math.abs(out[bestI] - prev) < 1e-4) break;
   }
-  // Deadband scrub — but never wipe the last primary contributor.
+
+  // Deadband scrub: zero tiny duties only when it does not worsen |Tz| or
+  // kill primary. Never boost sub-deadband cancel nudges back up to 0.08
+  // (that previously re-introduced residual yaw).
   const beforeScrub = netWrench(thrusters, out);
-  for (let i = 0; i < out.length; i++) {
-    if (Math.abs(out[i]) < DUTY_DEADBAND) out[i] = 0;
+  const scrubbed = out.slice();
+  for (let i = 0; i < scrubbed.length; i++) {
+    if (Math.abs(scrubbed[i]) < DUTY_DEADBAND) scrubbed[i] = 0;
   }
-  const afterScrub = netWrench(thrusters, out);
-  if (
-    Math.abs(basePrimary) >= 0.1 &&
-    Math.abs(primaryOf(afterScrub)) + 1e-9 < Math.abs(minPrimary) &&
-    Math.abs(primaryOf(beforeScrub)) >= Math.abs(minPrimary) * 0.9
-  ) {
-    // Restore pre-scrub duties if deadband wiped surge/strafe.
-    for (let i = 0; i < duties.length; i++) {
-      const d = duties[i] || 0;
-      if (Math.abs(out[i]) < DUTY_DEADBAND && Math.abs(d) >= DUTY_DEADBAND) {
-        out[i] = Math.sign(d) * Math.max(DUTY_DEADBAND, Math.abs(d) * 0.5);
-      }
-    }
+  const afterScrub = netWrench(thrusters, scrubbed);
+  const primaryOk =
+    Math.abs(basePrimary) < 0.1 ||
+    Math.abs(primaryOf(afterScrub)) + 1e-9 >= Math.abs(minPrimary) ||
+    Math.abs(primaryOf(beforeScrub)) < Math.abs(minPrimary) * 0.9;
+  const tzOk = Math.abs(afterScrub.Tz) <= Math.abs(beforeScrub.Tz) + 0.003;
+  if (primaryOk && tzOk) {
+    for (let i = 0; i < out.length; i++) out[i] = scrubbed[i];
   }
   return out;
 }
@@ -543,6 +575,9 @@ export function applyCardinalRoles(control, fx = 0, fy = 0, tz = 0, opts = {}) {
         cmdFx: fx,
         cmdFy: fy,
         minPrimaryFraction: 0.55,
+        targetRatio: 0.035,
+        targetAbs: 0.012,
+        steps: 20,
       });
       const residualTz = netWrench(control.thrusters, duties).Tz;
       return {
@@ -620,6 +655,9 @@ export function applyCardinalRoles(control, fx = 0, fy = 0, tz = 0, opts = {}) {
       cmdFx: fx,
       cmdFy: fy,
       minPrimaryFraction: 0.55,
+      targetRatio: 0.035,
+      targetAbs: 0.012,
+      steps: 20,
     });
   }
 
@@ -674,16 +712,35 @@ export function applyCommand(control, fx = 0, fy = 0, tz = 0, opts = {}) {
       cmdFx: fx,
       cmdFy: fy,
       minPrimaryFraction: 0.55,
+      targetRatio: 0.035,
+      targetAbs: 0.012,
+      steps: 20,
     });
-    const after = netWrench(control.thrusters, duties);
+    let after = netWrench(control.thrusters, duties);
     if (Math.sign(after.Fx) !== Math.sign(fx) || Math.abs(after.Fx) < 0.35) {
       duties = ensureSurgeDuties(control.thrusters, duties, fx);
       duties = nullResidualYaw(control.thrusters, duties, {
         cmdFx: fx,
         cmdFy: fy,
         minPrimaryFraction: 0.6,
-        targetRatio: 0.2,
-        targetAbs: 0.1,
+        targetRatio: 0.04,
+        targetAbs: 0.015,
+        steps: 16,
+      });
+      after = netWrench(control.thrusters, duties);
+    }
+    // Second pass: if yaw still material, allow slightly more primary trade.
+    if (
+      Math.abs(after.Tz) > Math.max(0.015, Math.abs(after.Fx) * 0.04) &&
+      Math.abs(after.Fx) >= 0.4
+    ) {
+      duties = nullResidualYaw(control.thrusters, duties, {
+        cmdFx: fx,
+        cmdFy: fy,
+        minPrimaryFraction: 0.5,
+        targetRatio: 0.03,
+        targetAbs: 0.01,
+        steps: 24,
       });
     }
     return { ...r, duties };
@@ -1142,7 +1199,8 @@ export function applyReassembly(control, fx = 0, fy = 0, tz = 0, opts = {}) {
     axW = [2.2, 3.0, 2.5];
     dutyDeadband = 0.1;
   } else if (pureSurge || surgePriority) {
-    axW = [4.0, 1.5, 0.9];
+    // Keep Fx dominant but give Tz enough weight that LS leaves less residual yaw.
+    axW = [3.8, 1.6, 1.6];
     dutyDeadband = 0.1;
   } else if (absTz >= 0.5 && absFx + absFy < 0.25) {
     axW = [0.8, 0.8, 1.0];

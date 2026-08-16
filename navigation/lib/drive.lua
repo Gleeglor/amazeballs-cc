@@ -612,6 +612,7 @@ end
 --- Duty-space yaw null for pure surge/strafe (CoM couple cancel).
 -- Never drives commanded primary (Fx surge / Fy strafe) below minPrimaryFraction
 -- of the pre-null baseline — yaw cancel must not kill forward surge.
+-- Tight targets (0.035 / 0.012): older 0.12 / 0.06 left ~10–15° planar yaw on W.
 -- opts: cmdFx, cmdFy, minPrimaryFraction, targetRatio, targetAbs, steps
 function drive.nullResidualYaw(thrusters, duties, opts)
     opts = opts or {}
@@ -619,9 +620,9 @@ function drive.nullResidualYaw(thrusters, duties, opts)
     for i, d in ipairs(duties) do
         out[i] = d or 0
     end
-    local maxSteps = math.max(1, tonumber(opts.steps) or 10)
-    local targetRatio = tonumber(opts.targetRatio) or 0.12
-    local targetAbs = tonumber(opts.targetAbs) or 0.06
+    local maxSteps = math.max(1, tonumber(opts.steps) or 20)
+    local targetRatio = tonumber(opts.targetRatio) or 0.035
+    local targetAbs = tonumber(opts.targetAbs) or 0.012
     local minFrac = tonumber(opts.minPrimaryFraction) or 0.55
     local cmdFx = tonumber(opts.cmdFx)
     local cmdFy = tonumber(opts.cmdFy)
@@ -643,11 +644,16 @@ function drive.nullResidualYaw(thrusters, duties, opts)
     if math.abs(basePrimary) >= 1e-6 then
         minPrimary = (basePrimary >= 0 and 1 or -1) * math.abs(basePrimary) * minFrac
     end
-    local lateralCap = math.max(math.abs(basePrimary) * 0.22, 0.1)
+    local lateralCap = math.max(math.abs(basePrimary) * 0.2, 0.1)
     if surgeIntent then
         lateralCap = lateralCap + math.abs(baseline.fy) * 0.5
     else
         lateralCap = lateralCap + math.abs(baseline.fx) * 0.5
+    end
+
+    local function isYawHelper(t)
+        local f = t.facing or t.role or ""
+        return f == "left" or f == "right" or f == "port" or f == "starboard" or f == "stbd"
     end
 
     for _ = 1, maxSteps do
@@ -656,12 +662,12 @@ function drive.nullResidualYaw(thrusters, duties, opts)
         if math.abs(w.tz) < targetAbs and math.abs(w.tz) / primary < targetRatio then
             break
         end
-        local bestI, bestScore, bestDelta = nil, 0, 0
+        local bestI, bestScore, bestDelta = nil, -1e9, 0
         for i, t in ipairs(thrusters) do
             local tz = tonumber(t.tz) or 0
-            if math.abs(tz) >= 0.01 then
+            if math.abs(tz) >= 0.008 then
                 local reversible = t.kind == "motor"
-                local delta = (-w.tz / tz) * 0.55
+                local delta = (-w.tz / tz) * 0.85
                 local lo, hi = reversible and -1 or 0, 1
                 local nextDuty = util.clamp((out[i] or 0) + delta, lo, hi)
                 delta = nextDuty - (out[i] or 0)
@@ -699,20 +705,33 @@ function drive.nullResidualYaw(thrusters, duties, opts)
                         end
                     end
                     local lat = surgeIntent and math.abs(tw.fy) or math.abs(tw.fx)
-                    if accept and lat > lateralCap + 0.05 then
+                    if accept and lat > lateralCap + 0.04 then
                         accept = false
                     end
                     if accept then
-                        local couple = math.abs(tz) / (0.15 + math.abs(t.fx or 0) + math.abs(t.fy or 0))
-                        local twFinal = drive.netWrench(thrusters, trial)
-                        local tzDrop = math.abs(w.tz) - math.abs(twFinal.tz)
-                        local latBleed = surgeIntent and math.abs(twFinal.fy) or math.abs(twFinal.fx)
-                        local primaryKeep = math.abs(primaryOf(twFinal)) / math.max(math.abs(basePrimary), 1e-3)
-                        local score = couple * 0.35 + math.max(0, tzDrop) * 3 - latBleed * 2.5 + primaryKeep * 0.4
-                        if score > bestScore then
-                            bestScore = score
-                            bestI = i
-                            bestDelta = trial[i] - (out[i] or 0)
+                        local latPerTz = math.abs(surgeIntent and (t.fy or 0) or (t.fx or 0))
+                            / math.max(math.abs(tz), 1e-3)
+                        local couple = math.abs(tz)
+                            / (0.08 + math.abs(t.fx or 0) * 0.25 + math.abs(t.fy or 0) * 0.5)
+                        local tzDrop = math.abs(w.tz) - math.abs(tw.tz)
+                        if tzDrop > 1e-6 then
+                            local latBleed = surgeIntent and math.abs(tw.fy) or math.abs(tw.fx)
+                            local lat0 = surgeIntent and math.abs(w.fy) or math.abs(w.fx)
+                            local latIncrease = math.max(0, latBleed - lat0)
+                            local primaryKeep = math.abs(primaryOf(tw)) / math.max(math.abs(basePrimary), 1e-3)
+                            local helperBias = isYawHelper(t) and 0.35 or 0
+                            local score = couple * 0.45
+                                + math.max(0, tzDrop) * 6
+                                + helperBias
+                                - latBleed * 3.2
+                                - latIncrease * 4
+                                - latPerTz * 0.8
+                                + primaryKeep * 0.4
+                            if score > bestScore then
+                                bestScore = score
+                                bestI = i
+                                bestDelta = trial[i] - (out[i] or 0)
+                            end
                         end
                     end
                 end
@@ -731,22 +750,18 @@ function drive.nullResidualYaw(thrusters, duties, opts)
     end
 
     local beforeScrub = drive.netWrench(thrusters, out)
+    local scrubbed = {}
     for i = 1, #out do
-        if math.abs(out[i] or 0) < 0.08 then
-            out[i] = 0
-        end
+        scrubbed[i] = (math.abs(out[i] or 0) < 0.08) and 0 or out[i]
     end
-    local afterScrub = drive.netWrench(thrusters, out)
-    if math.abs(basePrimary) >= 0.1
-        and math.abs(primaryOf(afterScrub)) + 1e-9 < math.abs(minPrimary)
-        and math.abs(primaryOf(beforeScrub)) >= math.abs(minPrimary) * 0.9
-    then
-        for i = 1, #duties do
-            local d = duties[i] or 0
-            if math.abs(out[i] or 0) < 0.08 and math.abs(d) >= 0.08 then
-                local s = (d >= 0) and 1 or -1
-                out[i] = s * math.max(0.08, math.abs(d) * 0.5)
-            end
+    local afterScrub = drive.netWrench(thrusters, scrubbed)
+    local primaryOk = math.abs(basePrimary) < 0.1
+        or math.abs(primaryOf(afterScrub)) + 1e-9 >= math.abs(minPrimary)
+        or math.abs(primaryOf(beforeScrub)) < math.abs(minPrimary) * 0.9
+    local tzOk = math.abs(afterScrub.tz) <= math.abs(beforeScrub.tz) + 0.003
+    if primaryOk and tzOk then
+        for i = 1, #out do
+            out[i] = scrubbed[i]
         end
     end
     return out
@@ -938,6 +953,30 @@ end
 function drive.enrichControl(control)
     if not control or type(control.thrusters) ~= "table" then
         return control
+    end
+    -- Pre-v7 boat_control.json used raw Minecraft ω·up as tz (CW+ / right-positive)
+    -- when levers were absent. Teleop A is +tz = left; flip yaw_sign so old calib
+    -- still turns correctly until recalibrate (v7+ writes CCW+ tz via pose.yawRate).
+    -- If lx/ly exist, syncThrusterFacing already rebuilds CCW+ geometric tz — leave sign.
+    local ver = tonumber(control.version) or 0
+    if ver > 0 and ver < 7 and control._yaw_migrated ~= true then
+        local anyLever = false
+        for _, t in ipairs(control.thrusters) do
+            local lx = tonumber(t.lx) or 0
+            local ly = tonumber(t.ly) or 0
+            local lz = tonumber(t.lz) or 0
+            if math.sqrt(lx * lx + ly * ly + lz * lz) >= 1e-4 then
+                anyLever = true
+                break
+            end
+        end
+        if not anyLever then
+            local ys = tonumber(control.yaw_sign)
+            if ys == nil or ys == 0 or ys == 1 then
+                control.yaw_sign = -1
+            end
+        end
+        control._yaw_migrated = true
     end
     if control.yaw_sign == nil then
         control.yaw_sign = 1
@@ -1309,7 +1348,8 @@ function drive.applyReassembly(control, fx, fy, tz)
         axW = { 2.2, 3.0, 2.5 }
         dutyDeadband = 0.10
     elseif pureSurge or surgePriority then
-        axW = { 4.0, 1.5, 0.9 }
+        -- Fx dominant but enough Tz weight so LS leaves less residual yaw.
+        axW = { 3.8, 1.6, 1.6 }
         dutyDeadband = 0.10
     elseif absTz >= 0.5 and absFx + absFy < 0.25 then
         axW = { 0.8, 0.8, 1.0 }
@@ -1849,7 +1889,8 @@ function drive.trimCommand(control, command, trimState, dt)
     local vel = pose.getVelocity()
     local ang = pose.getAngularVelocity()
     local localV = pose.worldToLocal(vel, craft)
-    local yawRate = ang.x * craft.up.x + ang.y * craft.up.y + ang.z * craft.up.z
+    -- +yawRate = CCW / left (matches +tz); see pose.yawRate.
+    local yawRate = pose.yawRate(craft, ang)
 
     local fx = command.fx or 0
     local fy = command.fy or 0

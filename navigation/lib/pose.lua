@@ -44,6 +44,17 @@ function pose.getAngularVelocity()
     return sublevel.getAngularVelocity()
 end
 
+--- Yaw rate with + = CCW from above = craft-left (matches teleop +tz / A).
+-- Minecraft / CC:Sable are Y-up: raw ω·up is CW-positive when viewed from above
+-- (right-hand about +Y looks clockwise from above). We negate so calib +tz and
+-- command A both mean turn left — without this, Reassembly A spins the wrong way.
+function pose.yawRate(craft, ang)
+    craft = craft or pose.get()
+    ang = ang or pose.getAngularVelocity()
+    local raw = (ang.x or 0) * craft.up.x + (ang.y or 0) * craft.up.y + (ang.z or 0) * craft.up.z
+    return -raw
+end
+
 --- Project a world-space vector into craft-local forward/right/up scalars.
 function pose.worldToLocal(worldVec, craft)
     craft = craft or pose.get()

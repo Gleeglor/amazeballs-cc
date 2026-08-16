@@ -7,7 +7,7 @@ Interactive top+side play-space and unit tests for Amazeballs ComputerCraft boat
 2. if LS fails **or all duties deadband to 0** → `applyTeleop` (same cancel)
 3. if still dead → `applyCardinalRoles` (facing mixer + yaw null; no calib `tz` needed)
 
-**Sign convention:** `+tz` = CCW from above = **A / craft-left**. `boat_control.yaw_sign` (default `+1`) flips A/D in one place if motors are inverted.
+**Sign convention:** `+tz` = CCW from above = **A / craft-left**. In-game, `pose.yawRate` negates Minecraft/CC:Sable `ω·up` (Y-up is CW-positive from above) so calib `tz` matches this. `boat_control.yaw_sign` (default `+1` after v7 recalibrate) flips A/D in one place if motors are inverted. Pre-v7 saves without lever arms auto-migrate to `yaw_sign=-1` until recalibrate.
 
 Physics is a **boat on water**: multi-point buoyancy, gravity at offset CoM, hull linear/quadratic drag, yaw damping. Thruster torque is τ = (r − r_com) × F in geometric mode. Sim sidebar CoM is fed into allocation.
 
@@ -70,7 +70,8 @@ Covers allocation, physics, **user CoM bugs** (`com_bugs.test.mjs`), and **in-ga
 3. `boat` → `control` smoke: W / S / A (left) / D (right) / Z / C / release (X)
 
 Optional in `/boat_control.json`:
-- `"yaw_sign": -1` — only if A still turns right after recalibrate
+- `"yaw_sign": -1` — only if A still turns right after a **fresh** recalibrate (v7+)
+- Pre-v7 saves: `enrichControl` auto-sets `yaw_sign=-1` when thrusters have no lever arms (old CW+ calib) until you recalibrate
 - `"com_x" / "com_y" / "com_z"` — hull CoM for τ about CoM
 - `"com_compensate": false` — disable yaw-null polish
 
