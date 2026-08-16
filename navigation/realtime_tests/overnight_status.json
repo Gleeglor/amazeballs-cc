@@ -1,0 +1,8 @@
+{
+  "phase": "waiting_for_agent",
+  "world": "New World (1)",
+  "computer_id": "1",
+  "dir": "/home/gleeglor/.var/app/org.prismlauncher.PrismLauncher/data/PrismLauncher/instances/Amazeballs/minecraft/saves/New World (1)/computercraft/computer/1",
+  "hint": "On boat: updater (select test_agent) then run test_agent",
+  "updated_at": "2026-08-16T00:51:06.371Z"
+}

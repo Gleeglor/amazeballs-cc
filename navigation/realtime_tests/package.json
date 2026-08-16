@@ -1,0 +1,13 @@
+{
+  "name": "amazeballs-realtime-tests",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node run_tests.mjs",
+    "list": "node run_tests.mjs --list",
+    "discover": "node run_tests.mjs --list",
+    "deploy": "node deploy_to_computer.mjs",
+    "overnight": "node overnight_loop.mjs",
+    "overnight:once": "node overnight_loop.mjs --once"
+  }
+}

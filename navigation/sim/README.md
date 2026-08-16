@@ -1,5 +1,8 @@
 # Boat allocation + watercraft physics sim
 
+> **DEPRECATED as source of truth.** Sim/unit tests can go green while in-game controls are wrong.
+> Use **`navigation/realtime_tests/`** (filesystem bridge + `test_agent.lua` on the boat) for real A/D/W / motor / pose checks.
+
 Interactive top+side play-space and unit tests for Amazeballs ComputerCraft boat drive logic.
 
 **Default allocation** mirrors `navigation/lib/drive.lua` `applyCommand`:

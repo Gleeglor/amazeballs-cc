@@ -19,8 +19,10 @@ const DUTY_DEADBAND = 0.08;
  *   +tz = yaw CCW = craft-left turn (A / port)
  *   −tz = yaw CW = craft-right turn (D / starboard)
  *
- * boat_control.yaw_sign (default +1) multiplies the commanded tz once in
- * applyCommand / compensate so a single flip fixes inverted A/D in-game.
+ * boat_control.yaw_sign multiplies the commanded tz once in allocateWithComCancel
+ * (same as Lua applyReassembly / applyTeleop / applyCardinalRoles).
+ * Convention: pilot A → +tz. Missing yaw_sign defaults to −1 (v8 raw ω·up);
+ * sim fixtures that use geometric left+ tz must set yaw_sign=+1 explicitly.
  */
 
 export const FACING_DIRS = {
@@ -46,9 +48,10 @@ export function getCom(control, opts = {}) {
 
 export function getYawSign(control) {
   const s = Number(control && control.yaw_sign);
-  // Sim fixtures use pilot/geometric left+ tz with yaw_sign=+1.
-  // In-game v8 raw-ω calib writes yaw_sign=-1 explicitly.
-  return Number.isFinite(s) && s !== 0 ? Math.sign(s) : 1;
+  // Match drive.getYawSign: missing → −1 (v8 Minecraft raw ω·up).
+  // Geometric / HTML fixtures must set yaw_sign=+1 explicitly.
+  if (Number.isFinite(s) && s !== 0) return Math.sign(s);
+  return -1;
 }
 
 /** Net body wrench from duties × thruster fx/fy/tz (allocation units). */

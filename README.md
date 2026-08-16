@@ -70,12 +70,25 @@ Boat logistics between two docks. Select **all** `navigation/lib/*` files plus t
 
 | Computer | Select | Boot program |
 |----------|--------|--------------|
-| Boat | `boat.lua` + entire `lib/` | `boat` |
+| Boat | `boat.lua` + entire `lib/` (+ `test_agent.lua` for host tests) | `boat` |
 | Port (shore) | `port.lua` + `lib/` (util, protocol, filters, xfer, schedule) | `port` |
 | Calibrate (once) | `calibrate.lua` + lib (util, pose, drive, nav_calibrate, path) | `calibrate` or run manually |
 | Recorder (once) | `recorder.lua` + lib (util, pose, path) | run manually: `recorder to_port_b` |
+| Realtime tests | `test_agent.lua` + lib (drive, pose, util, …) | run `test_agent` (or `boat` → `testagent`) |
 
-Easiest: in setup, open `navigation/`, select every file under it, then set boot to `boat` or `port`.
+Easiest: in setup, open `navigation/`, select every file under it (skip `sim/`), then set boot to `boat` or `port`.
+
+### Realtime control tests (source of truth)
+
+HTML/unit sim under `navigation/sim/` is **deprecated as authority** — green Node tests there do not prove in-game A/D/W.
+
+Use the filesystem bridge instead (host ↔ boat computer files in the world save):
+
+1. `updater` on the boat; ensure `test_agent.lua` is selected.
+2. In-game: `test_agent` (leave it running; chunk loaded).
+3. On the host: `cd navigation/realtime_tests && npm run list` then `npm test`.
+
+See `navigation/realtime_tests/README.md`.
 
 ### Boat setup
 
@@ -85,6 +98,7 @@ Easiest: in setup, open `navigation/`, select every file under it, then set boot
 4. Edit `/boat_config.json` (`boat_id`, `route` path names, optional `cargo` / `tidy_cargo` peripherals).
 5. Boot `boat`. Useful commands:
    - `control` — keyboard drive (W/S thrust, A/D steer, Z/C strafe, X stop, Q quit)
+   - `testagent` — host FS bridge for realtime A/D/W tests (`realtime_tests/`)
    - `record to_port_b` — drive with those keys and save a path (Q finishes)
    - `run` — autopilot A↔B loop
 
@@ -122,9 +136,12 @@ The **multiplayer server** must allow ComputerCraft HTTP to `raw.githubuserconte
 ## Layout
 
 ```text
-catalog.json     # tree shown in setup
-install.lua      # wget bootstrap / reinstall
-updater.lua      # setup + pull + self-update
-cannon/          # hub, fire, ammo scripts
-navigation/      # boat, port, recorder, calibrate + lib/
+catalog.json / catalog.v2.json
+install.lua / updater.lua
+cannon/
+navigation/
+  boat.lua, calibrate.lua, test_agent.lua, …
+  lib/                 # drive, pose, …
+  realtime_tests/      # host Node runner — in-game truth
+  sim/                 # DEPRECATED as authority (local HTML only)
 ```

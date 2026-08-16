@@ -160,25 +160,35 @@ function calibrate.facingMagnitude(w)
 end
 
 --- Optional: snap force to cardinal unit × magnitude; keep measured tz lever.
-function calibrate.applyFacingLabels(t)
+-- Do NOT write side_score=0 on forward/back — that blocked thrusterSide tz fallback
+-- and made pure-yaw one-sided. Set side from measured tz when known (v8 yaw_sign=-1).
+function calibrate.applyFacingLabels(t, yawSign)
     local facing = calibrate.classifyFacing(t)
     t.facing = facing
     t.role = facing
     local mag = calibrate.facingMagnitude(t)
+    local ys = tonumber(yawSign) or -1
+    if ys == 0 then
+        ys = -1
+    end
     if facing ~= "mixed" and mag >= 0.02 then
         t.max_force = mag
         if facing == "forward" then
             t.fx, t.fy = mag, 0
-            t.side_score = 0
         elseif facing == "back" then
             t.fx, t.fy = -mag, 0
-            t.side_score = 0
         elseif facing == "left" then
             t.fx, t.fy = 0, -mag
             t.side_score = -1
         elseif facing == "right" then
             t.fx, t.fy = 0, mag
             t.side_score = 1
+        end
+        -- Surge thrusters: side from measured tz in pilot frame.
+        -- geometric left+: port → +tz → side=-sign(tz); raw (ys=-1): port → −tz → side=-sign(tz)*ys
+        if (facing == "forward" or facing == "back") and math.abs(tonumber(t.tz) or 0) >= 0.004 then
+            local tz = tonumber(t.tz) or 0
+            t.side_score = -((tz >= 0) and 1 or -1) * ys
         end
         t.mag = math.sqrt((t.fx or 0) ^ 2 + (t.fy or 0) ^ 2 + (t.tz or 0) ^ 2)
     elseif mag >= 0.02 then
@@ -432,7 +442,7 @@ function calibrate.run(opts)
             print(string.format("  -> unused  fx=%.3f fy=%.3f tz=%.3f", w.fx, w.fy, w.tz))
         else
             thrusters[#thrusters + 1] = w
-            calibrate.applyFacingLabels(w)
+            calibrate.applyFacingLabels(w, -1)
             local lever = w.lever_est and string.format(" lever~%.2f", w.lever_est) or ""
             local rev = w.reversible and " reversible" or ""
             local face = w.facing and (" facing=" .. w.facing) or ""

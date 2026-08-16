@@ -897,6 +897,7 @@ end
 function drive.ensureYawDifferential(thrusters, duties, tzCmd, opts)
     opts = opts or {}
     local deadband = opts.deadband or 0.08
+    local sideOpts = { yaw_sign = opts.yaw_sign or -1 }
     if not thrusters or not duties or math.abs(tzCmd or 0) < 0.5 then
         return duties
     end
@@ -907,7 +908,7 @@ function drive.ensureYawDifferential(thrusters, duties, tzCmd, opts)
     local portIdx, stbdIdx = {}, {}
     local portMax, stbdMax = 0, 0
     for i, t in ipairs(thrusters) do
-        local s = drive.thrusterSide(t)
+        local s = drive.thrusterSide(t, sideOpts)
         if s < -0.05 then
             portIdx[#portIdx + 1] = i
             portMax = math.max(portMax, math.abs(out[i]))
@@ -931,7 +932,7 @@ function drive.ensureYawDifferential(thrusters, duties, tzCmd, opts)
     for _, i in ipairs(cold) do
         local t = thrusters[i]
         local tz = tonumber(t.tz) or 0
-        local auth = drive.yawAuthority(t, drive.thrusterSide(t))
+        local auth = drive.yawAuthority(t, drive.thrusterSide(t, sideOpts))
         local contrib = math.max(math.abs(tz), math.abs(auth) * 0.35)
         if contrib > bestContrib then
             bestContrib = contrib
@@ -947,7 +948,7 @@ function drive.ensureYawDifferential(thrusters, duties, tzCmd, opts)
     if math.abs(tz) >= 0.015 then
         dutySign = ((tzCmd * tz) >= 0) and 1 or -1
     else
-        local auth = drive.yawAuthority(t, drive.thrusterSide(t))
+        local auth = drive.yawAuthority(t, drive.thrusterSide(t, sideOpts))
         if auth == 0 then
             return out
         end
@@ -1089,12 +1090,43 @@ function drive.enrichControl(control)
                 drive.syncThrusterFacing(t, control)
             end
         end
+        -- Migrate calib side_score=0 on surge thrusters → infer from tz + yaw_sign
+        local ss = tonumber(t.side_score)
+        if (ss == nil or math.abs(ss) < 0.05)
+            and (t.facing == "forward" or t.facing == "back" or t.role == "forward" or t.role == "back")
+            and math.abs(tonumber(t.tz) or 0) >= 0.004
+        then
+            local tz = tonumber(t.tz) or 0
+            local ys = drive.getYawSign(control)
+            t.side_score = -((tz >= 0) and 1 or -1) * ys
+        end
     end
     return control
 end
 
 --- Collect duties from actuators without writing motors (sim-style). Internal.
 local lastDuties = {}
+
+--- Last duty vector written by applyReassembly / teleop / cardinal (or {}).
+function drive.getLastDuties()
+    local out = {}
+    for i, d in ipairs(lastDuties) do
+        out[i] = d or 0
+    end
+    return out
+end
+
+--- Snapshot of queued / last-sent motor RPMs (for realtime host tests).
+function drive.getMotorSnapshot()
+    local desired, sent = {}, {}
+    for name, rpm in pairs(motorDesired) do
+        desired[name] = rpm
+    end
+    for name, rpm in pairs(motorSent) do
+        sent[name] = rpm
+    end
+    return { desired = desired, sent = sent }
+end
 
 local function readBackDuties(control, scores, maxAbs, scale)
     local duties = {}
@@ -1221,7 +1253,9 @@ function drive.applyCardinalRoles(control, fx, fy, tz)
     local scale = math.min(1, cmdMag)
     local duties = readBackDuties(control, scores, maxAbs, scale)
     if math.abs(tz) >= 0.5 and math.abs(fx) + math.abs(fy) < 0.25 then
-        duties = drive.ensureYawDifferential(thrusters, duties, tz, {})
+        duties = drive.ensureYawDifferential(thrusters, duties, tz, {
+            yaw_sign = drive.getYawSign(control),
+        })
     end
     if isPureSurge(fx, fy, 0) or isPureStrafe(fx, fy, 0) then
         if control.com_compensate ~= false then
@@ -1545,7 +1579,10 @@ function drive.applyReassembly(control, fx, fy, tz)
     elseif pureStrafe or (strafePriority and absTz < 0.35) then
         duties = ensureStrafeDuties(thrusters, duties, fy, { deadband = dutyDeadband })
     elseif absTz >= 0.5 and absFx + absFy < 0.25 then
-        duties = drive.ensureYawDifferential(thrusters, duties, tz, { deadband = dutyDeadband })
+        duties = drive.ensureYawDifferential(thrusters, duties, tz, {
+            deadband = dutyDeadband,
+            yaw_sign = drive.getYawSign(control),
+        })
     end
 
     -- CoM couple polish on pure surge/strafe (protect primary force)
@@ -1606,35 +1643,51 @@ function drive.flushMotorsAll(maxCalls)
 end
 
 --- Physical side score: +starboard / -port (from facing, calib, not name order).
-function drive.thrusterSide(t)
+-- opts.yaw_sign: when inferring from measured tz, account for raw ω·up (v8 yaw_sign=-1).
+function drive.thrusterSide(t, opts)
     if type(t) ~= "table" then
         return 0
     end
+    opts = opts or {}
     local facing = t.facing or t.role
     if facing == "left" or facing == "port" then
         return -1
     elseif facing == "right" or facing == "starboard" or facing == "stbd" then
         return 1
     end
+    -- side_score=0 means "unknown" (calib used to write 0 on forward) — keep looking.
     if t.side_score ~= nil then
-        return tonumber(t.side_score) or 0
+        local ss = tonumber(t.side_score) or 0
+        if math.abs(ss) >= 0.05 then
+            return ss
+        end
+    end
+    local ly = tonumber(t.ly) or 0
+    if math.abs(ly) >= 0.05 then
+        return (ly >= 0) and 1 or -1
     end
     local fy = tonumber(t.fy) or 0
     if math.abs(fy) >= 0.02 then
         return fy
     end
     local lever = tonumber(t.lever_est)
-    if lever and math.abs(lever) >= 0.05 then
-        return lever
+    local ys = tonumber(opts.yaw_sign)
+    if not ys or ys == 0 then
+        ys = -1 -- v8 raw ω·up default (callers with geometric tables must pass +1)
     end
-    -- Forward force on the port side (negative right) yields +tz ≈ -ry*fx
+    if lever and math.abs(lever) >= 0.05 then
+        -- lever_est = tz/|F|; convert to port(−)/stbd(+) with yaw_sign
+        return lever * ys * -1
+    end
+    -- Geometric left+ : port fwd → +tz → side = −tz/fx.
+    -- Raw ω·up (yaw_sign=-1): measured tz flipped → multiply by yaw_sign.
     local fx = tonumber(t.fx) or 0
     local tz = tonumber(t.tz) or 0
     if math.abs(fx) >= 0.02 and math.abs(tz) >= 0.004 then
-        return -tz / fx
+        return (-tz / fx) * ys
     end
     if math.abs(tz) >= 0.008 then
-        return tz
+        return tz * ys * -1
     end
     return 0
 end
@@ -1655,8 +1708,9 @@ function drive.healYawThrusters(control)
     end
 
     local ranked = {}
+    local sideOpts = { yaw_sign = drive.getYawSign(control) }
     for i, t in ipairs(control.thrusters) do
-        ranked[#ranked + 1] = { i = i, s = drive.thrusterSide(t), t = t }
+        ranked[#ranked + 1] = { i = i, s = drive.thrusterSide(t, sideOpts), t = t }
     end
     table.sort(ranked, function(a, b)
         if a.s == b.s then
@@ -1731,9 +1785,10 @@ function drive.applyTeleop(control, fx, fy, tz)
     end
 
     local sides = {}
+    local sideOpts = { yaw_sign = drive.getYawSign(control) }
     local maxFx, maxFy, maxTz = 0, 0, 0
     for i, t in ipairs(thrusters) do
-        sides[i] = drive.thrusterSide(t)
+        sides[i] = drive.thrusterSide(t, sideOpts)
         maxFx = math.max(maxFx, math.abs(t.fx or 0))
         maxFy = math.max(maxFy, math.abs(t.fy or 0))
         maxTz = math.max(maxTz, math.abs(t.tz or 0))
@@ -1835,7 +1890,9 @@ function drive.applyTeleop(control, fx, fy, tz)
     local scale = math.min(1, cmdMag)
     local duties = readBackDuties(control, scores, maxAbs, scale)
     if pureYaw then
-        duties = drive.ensureYawDifferential(thrusters, duties, tz, {})
+        duties = drive.ensureYawDifferential(thrusters, duties, tz, {
+            yaw_sign = drive.getYawSign(control),
+        })
     end
     if control.com_compensate ~= false and (pureSurge or pureStrafe) then
         duties = drive.nullResidualYaw(thrusters, duties, {
@@ -2070,7 +2127,8 @@ function drive.stepToward(control, target, mode, pidStates, dt)
                 cmd.tz = yawCmd
             end
         end
-        drive.applyWrench(control, cmd.fx, cmd.fy, cmd.tz)
+        drive.applyCommand(control, cmd.fx, cmd.fy, cmd.tz)
+        drive.flushMotors(4)
     else
         drive.applySigned(control, "thrust_forward", "thrust_reverse", fwdCmd)
         drive.applySigned(control, "steer_left", "steer_right", yawCmd)

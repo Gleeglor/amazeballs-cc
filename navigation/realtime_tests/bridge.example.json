@@ -1,0 +1,5 @@
+{
+  "world": "New World (3)",
+  "computer_id": "0",
+  "comment": "Copy to bridge.json. Find ids with: npm run list. Prefer a computer that has boat.lua / boat_control.json / lib/drive.lua."
+}

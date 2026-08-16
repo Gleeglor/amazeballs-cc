@@ -34,6 +34,10 @@
         "label": "stopmotors - force all electric motors to 0",
         "dest": "stopmotors.lua"
       },
+      "test_agent.lua": {
+        "label": "test_agent - host FS bridge for realtime boat tests",
+        "dest": "test_agent.lua"
+      },
       "lib": {
         "util.lua": {
           "label": "lib util",

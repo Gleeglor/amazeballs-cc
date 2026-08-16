@@ -207,7 +207,7 @@ end
 
 local function menu(cfg)
     print("Boat " .. cfg.boat_id)
-    print("Commands: control | calibrate [power N] [rpm N] | record <name> | stop | run | follow <path> | dock <port> | list | pose | quit")
+    print("Commands: control | calibrate [power N] [rpm N] | record <name> | stop | run | follow <path> | dock <port> | list | pose | testagent | quit")
     while true do
         write("> ")
         local line = read()
@@ -250,8 +250,11 @@ local function menu(cfg)
         elseif cmd == "pose" then
             local p = pose.get()
             print(string.format("pos=%.2f,%.2f,%.2f yaw=%.1fdeg", p.position.x, p.position.y, p.position.z, pose.yawDeg(p.yaw)))
+        elseif cmd == "testagent" or cmd == "test_agent" or cmd == "realtime" then
+            print("Starting realtime test agent (host: navigation/realtime_tests)...")
+            shell.run("test_agent")
         else
-            print("Unknown. control | calibrate | record <name> | stop | run | follow <path> | dock <port> | list | pose | quit")
+            print("Unknown. control | calibrate | record <name> | stop | run | follow <path> | dock <port> | list | pose | testagent | quit")
         end
     end
 end
@@ -297,6 +300,8 @@ elseif args[1] == "record" then
     else
         print("Record ended: " .. tostring(reason))
     end
+elseif args[1] == "testagent" or args[1] == "test_agent" or args[1] == "realtime" then
+    shell.run("test_agent")
 else
     menu(cfg)
 end
