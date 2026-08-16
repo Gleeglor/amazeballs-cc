@@ -356,24 +356,24 @@ function M.run(opts)
     )
     waitSettle(names, 2.5)
 
-    -- --- W surge (use signed command from teleop mapping) ---
+    -- --- W surge: user W must increase pose-forward speed (regardless of duty sign) ---
     local baseline = sampleForward(0.3)
     local wCmd = surgeW
     local wRes = applyAxes(thrusters, wCmd, 0, 0, 1.0)
     check(
         "live.W_motors_spin",
         wRes.max_actual >= 4 or wRes.max_sent >= 4,
-        string.format("max_actual=%.1f mode=%s duties=%.2f", wRes.max_actual, tostring(wRes.mode), wRes.max_duty)
+        string.format("max_actual=%.1f mode=%s duties=%.2f cmd=%s", wRes.max_actual, tostring(wRes.mode), wRes.max_duty, tostring(wCmd))
     )
     check(
-        "live.W_forward_increases",
-        sign(wRes.mean_forward - baseline) == sign(wCmd)
-            or (sign(wCmd) ~= 0 and sign(wRes.mean_forward) == sign(wCmd) and math.abs(wRes.mean_forward) > 0.05),
+        "live.W_goes_forward",
+        wRes.mean_forward > baseline + 0.05 or wRes.mean_forward > 0.08,
         string.format(
-            "baseline=%.3f during=%.3f cmd=%s (flip surge_sign if W goes backward)",
+            "baseline=%.3f during=%.3f cmd=%s surge_sign=%s (flip surge_sign if W goes backward)",
             baseline,
             wRes.mean_forward,
-            tostring(wCmd)
+            tostring(wCmd),
+            tostring(surgeSign)
         )
     )
     waitSettle(names, 3.0)
