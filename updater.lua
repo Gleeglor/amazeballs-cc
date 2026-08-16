@@ -136,23 +136,6 @@ local function fetchCatalog()
     end
     table.sort(roots)
     print("Catalog v" .. tostring(catalog.version or "?") .. " roots: " .. table.concat(roots, ", "))
-    local nav = catalog.tree.navigation
-    if type(nav) == "table" then
-        local nk = {}
-        for k in pairs(nav) do
-            if k ~= "dest" and k ~= "label" then
-                nk[#nk + 1] = k
-            end
-        end
-        table.sort(nk)
-        if #nk == 0 then
-            print("navigation/: (empty!)")
-        else
-            print("navigation/: " .. table.concat(nk, ", "))
-        end
-    else
-        print("navigation/: missing")
-    end
     sleep(2)
     return catalog
 end

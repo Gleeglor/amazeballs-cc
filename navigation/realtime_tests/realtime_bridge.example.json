@@ -1,6 +1,0 @@
-{
-  "mode": "http",
-  "base_url": "http://192.168.178.160:8765",
-  "poll": 0.3,
-  "comment": "Copy to boat as /realtime_bridge.json. base_url is reached by the Minecraft SERVER (CC http is server-side). Same LAN → PC LAN IP. Remote VPS → ngrok/cloudflare URL. Never 127.0.0.1. CC allow rule must sit ABOVE $private deny."
-}

@@ -64,62 +64,6 @@ The `cannon/` folder lists **3 scripts** (one per computer role). Pick the scrip
 
 `startup.lua` is owned by the installer (updater chain). Your role program is started via the boot choice in setup (`run` in `/cc_update.json`), not by separate autorun helper files.
 
-## Roles (navigation)
-
-Boat logistics between two docks. Select **all** `navigation/lib/*` files plus the role script for that machine.
-
-| Computer | Select | Boot program |
-|----------|--------|--------------|
-| Boat | `boat.lua` + entire `lib/` (+ `test_agent.lua` for host tests) | `boat` |
-| Port (shore) | `port.lua` + `lib/` (util, protocol, filters, xfer, schedule) | `port` |
-| Calibrate (once) | `calibrate.lua` + lib (util, pose, drive, nav_calibrate, path) | `calibrate` or run manually |
-| Recorder (once) | `recorder.lua` + lib (util, pose, path) | run manually: `recorder to_port_b` |
-| Realtime tests | `test_agent.lua` + lib (drive, pose, util, …) | run `test_agent` (or `boat` → `testagent`) |
-
-Easiest: in setup, open `navigation/`, select every file under it (skip `sim/`), then set boot to `boat` or `port`.
-
-### Realtime control tests (source of truth)
-
-HTML/unit sim under `navigation/sim/` is **deprecated as authority** — green Node tests there do not prove in-game A/D/W.
-
-**Multiplayer:** the boat is not under local Prism `saves/` — use the HTTP poll bridge (`npm run serve` + boat `/realtime_bridge.json`). Local `npm run list` will not find it.
-
-**Singleplayer:** FS inbox/outbox under the world computer folder.
-
-1. Host: `cd navigation/realtime_tests && cp bridge.example.json bridge.json && npm run serve`
-2. Boat: `/realtime_bridge.json` with LAN `base_url`; `updater` → `test_agent`; run `test_agent`
-3. Server admin: allow host IP:8765 in `computercraft-server.toml` `http.rules` (before `$private` deny)
-4. Host: `npm test` (then overnight dock to 340,165)
-
-See `navigation/realtime_tests/README.md` and `navigation/OVERNIGHT.md`.
-
-### Boat setup
-
-1. Computer on the Sable craft with wireless modem + wired modems to `redstone_relay`s on thrusters.
-2. Run `calibrate` in open water (props submerged). Writes `/boat_control.json`.
-3. Pilot routes; run `recorder to_port_a` / `recorder to_port_b` (press **Q** to save). Paths land in `/paths/`.
-4. Edit `/boat_config.json` (`boat_id`, `route` path names, optional `cargo` / `tidy_cargo` peripherals).
-5. Boot `boat`. Useful commands:
-   - `control` — keyboard drive (W/S thrust, A/D steer, Z/C strafe, X stop, Q quit)
-   - `testagent` — host bridge for realtime A/D/W tests (`realtime_tests/`; HTTP on MP)
-   - `record to_port_b` — drive with those keys and save a path (Q finishes)
-   - `run` — autopilot A↔B loop
-
-Dock-assist uses forward/back, yaw, and strafe (if calibrated) near the last waypoint.
-
-### Port setup
-
-1. Shore computer next to dock buffer chest + Sophisticated Storage Input/Output.
-2. Create funnels (outbound buffer→boat, inbound boat→buffer) on redstone relays.
-3. Edit `/port_config.json`: `port_id`, `mode` (`export`/`import`/`both`), `schedule` slots with `filters`, `buffers.*` peripheral names, `funnels.outbound` / `funnels.inbound` (relay name or `side:left`).
-4. Boot `port` — waits for `arrived`, runs schedule, enables funnels, sends `depart`.
-
-Use `port menu` then `list` to print inventory/relay peripheral names.
-
-### Multi-boat
-
-Every message carries `boat_id` / `port_id`. v1 is one boat; more boats later use new ids (and optional berth queue).
-
 ## Keep scripts up to date (author)
 
 Local source of truth (this Cursor workspace):
@@ -142,9 +86,4 @@ The **multiplayer server** must allow ComputerCraft HTTP to `raw.githubuserconte
 catalog.json / catalog.v2.json
 install.lua / updater.lua
 cannon/
-navigation/
-  boat.lua, calibrate.lua, test_agent.lua, …
-  lib/                 # drive, pose, …
-  realtime_tests/      # host Node runner — in-game truth
-  sim/                 # DEPRECATED as authority (local HTML only)
 ```
