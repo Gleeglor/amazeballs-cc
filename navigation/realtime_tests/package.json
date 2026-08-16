@@ -10,7 +10,10 @@
     "deploy": "node deploy_http.mjs",
     "deploy:fs": "node deploy_to_computer.mjs",
     "deploy:http": "node deploy_http.mjs",
+    "dual-dock": "node dual_dock_live.mjs",
     "overnight": "node overnight_loop.mjs",
-    "overnight:once": "node overnight_loop.mjs --once"
+    "overnight:once": "node overnight_loop.mjs --once",
+    "recover": "node recover_overnight.mjs",
+    "deploy:reboot": "node deploy_http.mjs --reboot"
   }
 }

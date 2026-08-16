@@ -23,6 +23,7 @@ const CC_SCRIPTS = path.resolve(NAV, "..");
 export const DEPLOY_FILES = [
   ["test_agent.lua", "test_agent.lua"],
   ["boat.lua", "boat.lua"],
+  ["port.lua", "port.lua"],
   ["calibrate.lua", "calibrate.lua"],
   ["stopmotors.lua", "stopmotors.lua"],
   ["lib/util.lua", "lib/util.lua"],
@@ -34,6 +35,13 @@ export const DEPLOY_FILES = [
   ["lib/filters.lua", "lib/filters.lua"],
   ["lib/xfer.lua", "lib/xfer.lua"],
   ["lib/schedule.lua", "lib/schedule.lua"],
+  ["lib/ports.lua", "lib/ports.lua"],
+  ["lib/dock.lua", "lib/dock.lua"],
+  ["startup", "startup"],
+  ["paths/to_port_a.json", "paths/to_port_a.json"],
+  ["paths/to_port_b.json", "paths/to_port_b.json"],
+  ["paths/a_to_b.json", "paths/a_to_b.json"],
+  ["paths/b_to_a.json", "paths/b_to_a.json"],
 ];
 
 const CHUNK = 48_000;

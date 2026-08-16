@@ -16,7 +16,8 @@ import { openSession, resolveBridgeMode, readStatus } from "./bridge.mjs";
 import { spawn } from "node:child_process";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const DOCK = { x: 340, z: 165 };
+const DOCK = { x: 341, z: 163 }; // Port A berth
+
 const STATUS_PATH = path.join(__dirname, "overnight_status.json");
 const POLL_MS = 15000;
 

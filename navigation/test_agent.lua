@@ -17,13 +17,17 @@ local STATUS = "/realtime_status.json"
 local BRIDGE_CFG = "/realtime_bridge.json"
 local POLL = 0.08
 local WATCHDOG_SEC = 3.0
-local HOLD_MAX_SEC = 6.0
+local HOLD_MAX_SEC = 8.0
 -- Paths the host may overwrite via write_file / sync_tree (HTTP deploy).
 local WRITE_ALLOW = {
     ["test_agent.lua"] = true,
     ["boat.lua"] = true,
     ["calibrate.lua"] = true,
     ["stopmotors.lua"] = true,
+    ["port.lua"] = true,
+    ["startup"] = true,
+    ["startup.lua"] = true,
+    ["boat_config.json"] = true,
     ["lib/util.lua"] = true,
     ["lib/pose.lua"] = true,
     ["lib/drive.lua"] = true,
@@ -33,6 +37,19 @@ local WRITE_ALLOW = {
     ["lib/filters.lua"] = true,
     ["lib/xfer.lua"] = true,
     ["lib/schedule.lua"] = true,
+    ["lib/ports.lua"] = true,
+    ["lib/dock.lua"] = true,
+    ["paths/to_port_a.json"] = true,
+    ["paths/to_port_b.json"] = true,
+    ["paths/a_to_b.json"] = true,
+    ["paths/b_to_a.json"] = true,
+}
+-- Host may read these (config dump / resume).
+local READ_ALLOW = {
+    ["boat_control.json"] = true,
+    ["boat_config.json"] = true,
+    ["realtime_bridge.json"] = true,
+    ["realtime_status.json"] = true,
 }
 
 local lastId = nil
@@ -360,6 +377,56 @@ local function ensureParentDir(path)
     end
 end
 
+local function softReloadLibs()
+    safeStop()
+    package.loaded["util"] = nil
+    package.loaded["pose"] = nil
+    package.loaded["drive"] = nil
+    package.loaded["path"] = nil
+    package.loaded["dock"] = nil
+    package.loaded["ports"] = nil
+    package.loaded["protocol"] = nil
+    local nu = require("util")
+    local np = require("pose")
+    local nd = require("drive")
+    -- ports/dock/path are require()'d per command after package.loaded clear
+    for k in pairs(util) do
+        util[k] = nil
+    end
+    for k, v in pairs(nu) do
+        util[k] = v
+    end
+    for k in pairs(pose) do
+        pose[k] = nil
+    end
+    for k, v in pairs(np) do
+        pose[k] = v
+    end
+    for k in pairs(drive) do
+        drive[k] = nil
+    end
+    for k, v in pairs(nd) do
+        drive[k] = v
+    end
+    pcall(function()
+        drive.stopAllMotors({ drain_timeout = 0.4 })
+    end)
+    return true
+end
+
+local function safeReadPath(raw)
+    local p = tostring(raw or "")
+    p = string.gsub(p, "\\", "/")
+    p = string.gsub(p, "^/+", "")
+    if p == "" or string.find(p, "%.%.") or string.find(p, ":") then
+        return nil, "bad path"
+    end
+    if not READ_ALLOW[p] then
+        return nil, "path not allowed: " .. p
+    end
+    return p
+end
+
 local function writeDeployFile(relPath, content, append)
     ensureParentDir(relPath)
     local mode = append and "a" or "w"
@@ -612,13 +679,52 @@ local function handle(req)
     end
 
     if cmd == "reboot" or cmd == "restart_agent" then
-        reply(req, true, { rebooting = true, note = "os.reboot — ensure startup runs test_agent" })
+        -- Ensure next boot re-enters the agent (host may also write startup).
+        if not fs.exists("startup") and not fs.exists("startup.lua") then
+            local f = fs.open("startup", "w")
+            if f then
+                f.write('shell.run("test_agent")\n')
+                f.close()
+            end
+        end
+        reply(req, true, { rebooting = true, note = "os.reboot — startup runs test_agent" })
         sleep(0.4)
         os.reboot()
         return
     end
 
-    -- Navigate toward world XZ (base dock default 340,165). Uses drive.stepToward.
+    if cmd == "reload_libs" or cmd == "soft_reload" then
+        local okR, errR = pcall(softReloadLibs)
+        if not okR then
+            reply(req, false, nil, tostring(errR))
+            return
+        end
+        reply(req, true, { reloaded = true })
+        return
+    end
+
+    if cmd == "read_file" then
+        local rel, perr = safeReadPath(req.path)
+        if not rel then
+            reply(req, false, nil, perr)
+            return
+        end
+        if not fs.exists(rel) then
+            reply(req, false, nil, "missing: " .. rel)
+            return
+        end
+        local f = fs.open(rel, "r")
+        if not f then
+            reply(req, false, nil, "open failed")
+            return
+        end
+        local content = f.readAll()
+        f.close()
+        reply(req, true, { path = rel, content = content, size = #tostring(content or "") })
+        return
+    end
+
+    -- Navigate toward world XZ (default Port A 341,163). Uses drive.stepToward.
     if cmd == "navigate_to" or cmd == "go_dock" then
         local control = drive.loadControl()
         if not control then
@@ -630,12 +736,12 @@ local function handle(req)
             reply(req, false, nil, berr or "pose failed")
             return
         end
-        local tx = tonumber(req.x) or 340
-        local tz = tonumber(req.z) or 165
+        local tx = tonumber(req.x) or 341
+        local tz = tonumber(req.z) or 163
         local ty = tonumber(req.y) or before.y
-        local timeout = tonumber(req.timeout) or 90
-        if timeout > 180 then
-            timeout = 180
+        local timeout = tonumber(req.timeout) or 180
+        if timeout > 420 then
+            timeout = 420
         end
         if timeout < 5 then
             timeout = 5
@@ -643,6 +749,11 @@ local function handle(req)
         local arriveDist = tonumber(req.arrive_dist) or 3.5
         local mode = req.mode or "cruise"
         local target = { x = tx, y = ty, z = tz }
+        if req.yaw ~= nil then
+            target.yaw = tonumber(req.yaw)
+        elseif req.yaw_deg ~= nil then
+            target.yaw = math.rad(tonumber(req.yaw_deg) or 0)
+        end
         local pid = drive.newPidStates()
         thrusting = true
         local t0 = os.clock()
@@ -679,6 +790,247 @@ local function handle(req)
             pose_before = before,
             pose_after = after,
         })
+        return
+    end
+
+    if cmd == "list_ports" then
+        package.loaded["ports"] = nil
+        local portsMod = require("ports")
+        reply(req, true, {
+            boat_dock = portsMod.BOAT_DOCK,
+            ports = portsMod.list(),
+        })
+        return
+    end
+
+    if cmd == "handshake_stub" or cmd == "dock_handshake" then
+        package.loaded["dock"] = nil
+        package.loaded["ports"] = nil
+        package.loaded["protocol"] = nil
+        local dockMod = require("dock")
+        local portId = tostring(req.port or req.port_id or "port_a")
+        local boatId = tostring(req.boat_id or "boat1")
+        local okH, result = dockMod.handshakeStub(boatId, portId, {
+            timeout = tonumber(req.timeout) or 12,
+            stub_sleep = tonumber(req.stub_sleep) or 0.4,
+        })
+        reply(req, okH and true or false, result, okH and nil or (result and result.error))
+        return
+    end
+
+    -- Full port call: cruise → berth_align → docking_port handshake stub.
+    if cmd == "go_port" or cmd == "dual_dock_leg" then
+        local control = drive.loadControl()
+        if not control then
+            reply(req, false, nil, "no boat_control.json")
+            return
+        end
+        package.loaded["ports"] = nil
+        package.loaded["dock"] = nil
+        package.loaded["protocol"] = nil
+        local portsMod = require("ports")
+        local dockMod = require("dock")
+        local port = portsMod.get(req.port or req.port_id or req.id)
+        if not port then
+            reply(req, false, nil, "unknown port (use port_a / port_b)")
+            return
+        end
+        local before, berr = samplePose()
+        if not before then
+            reply(req, false, nil, berr or "pose failed")
+            return
+        end
+        local cruiseTimeout = tonumber(req.timeout) or 300
+        if cruiseTimeout > 420 then
+            cruiseTimeout = 420
+        end
+        local berthTimeout = tonumber(req.berth_timeout) or 60
+        local arriveDist = tonumber(req.arrive_dist) or port.arrive_dist or 4.5
+        local skipHandshake = req.handshake == false or req.skip_handshake == true
+        local doApproach = req.approach ~= false
+
+        local function runNav(target, mode, timeout, distLim)
+            local pid = drive.newPidStates()
+            thrusting = true
+            local t0 = os.clock()
+            local lastErr, arrived = nil, false
+            while os.clock() - t0 < timeout do
+                lastAlive = os.clock()
+                local okStep, errOrMsg, arr = pcall(function()
+                    return drive.stepToward(control, target, mode, pid, 0.15)
+                end)
+                if not okStep then
+                    safeStop()
+                    return false, tostring(errOrMsg), nil
+                end
+                lastErr, arrived = errOrMsg, arr
+                drive.flushMotors(4)
+                if arrived or (lastErr and (lastErr.distance or 99) <= distLim) then
+                    return true, lastErr, os.clock() - t0
+                end
+                sleep(0.15)
+            end
+            safeStop()
+            return (lastErr and (lastErr.distance or 99) <= distLim * 1.4), lastErr, os.clock() - t0
+        end
+
+        local phases = {}
+        if doApproach then
+            local ap = portsMod.approachOf(port)
+            ap.y = before.y
+            local okA, errA, elA = runNav(ap, "cruise", math.min(cruiseTimeout, 240), arriveDist + 2)
+            phases[#phases + 1] = {
+                phase = "approach",
+                ok = okA,
+                elapsed = elA,
+                distance = errA and errA.distance,
+                target = ap,
+            }
+        end
+
+        local berth = {
+            x = port.x,
+            y = before.y,
+            z = port.z,
+            yaw = port.yaw,
+        }
+        local okB, errB, elB = runNav(berth, "dock", berthTimeout, port.dock_tol or 2.5)
+        phases[#phases + 1] = {
+            phase = "berth_align",
+            ok = okB,
+            elapsed = elB,
+            distance = errB and errB.distance,
+            yaw_err = errB and errB.yaw,
+            target = berth,
+        }
+        safeStop()
+
+        local handshake = nil
+        if not skipHandshake then
+            local okH, hs = dockMod.handshakeStub(tostring(req.boat_id or "boat1"), port.id, {
+                timeout = tonumber(req.handshake_timeout) or 10,
+            })
+            handshake = hs
+            handshake.ok = okH and hs.ok
+            phases[#phases + 1] = { phase = "handshake", ok = handshake.ok, mode = hs.mode }
+        end
+
+        local after = samplePose()
+        local distFinal = nil
+        if after then
+            local dx = (after.x or 0) - port.x
+            local dz = (after.z or 0) - port.z
+            distFinal = math.sqrt(dx * dx + dz * dz)
+        end
+        local arrived = okB or (distFinal ~= nil and distFinal <= (port.dock_tol or 2.5) * 1.6)
+        reply(req, true, {
+            port = port,
+            boat_dock = portsMod.BOAT_DOCK,
+            shore_dock = port.dock_block,
+            arrived = arrived and true or false,
+            distance = distFinal,
+            phases = phases,
+            handshake = handshake,
+            pose_before = before,
+            pose_after = after,
+        })
+        return
+    end
+
+    -- Hold berth pose (position + yaw) in dock mode until aligned or timeout.
+    if cmd == "berth_align" or cmd == "hold_pose" then
+        local control = drive.loadControl()
+        if not control then
+            reply(req, false, nil, "no boat_control.json")
+            return
+        end
+        local before, berr = samplePose()
+        if not before then
+            reply(req, false, nil, berr or "pose failed")
+            return
+        end
+        local tx = tonumber(req.x) or before.x
+        local tz = tonumber(req.z) or before.z
+        local ty = tonumber(req.y) or before.y
+        local tyaw = tonumber(req.yaw)
+        if tyaw == nil and req.yaw_deg ~= nil then
+            tyaw = math.rad(tonumber(req.yaw_deg) or 0)
+        end
+        local timeout = tonumber(req.timeout) or 45
+        if timeout > 120 then
+            timeout = 120
+        end
+        local target = { x = tx, y = ty, z = tz, yaw = tyaw }
+        local pid = drive.newPidStates()
+        thrusting = true
+        local t0 = os.clock()
+        local lastErr, arrived = nil, false
+        while os.clock() - t0 < timeout do
+            lastAlive = os.clock()
+            local okStep, errOrMsg, arr = pcall(function()
+                return drive.stepToward(control, target, "dock", pid, 0.12)
+            end)
+            if not okStep then
+                safeStop()
+                reply(req, false, { pose = samplePose() }, tostring(errOrMsg))
+                return
+            end
+            lastErr, arrived = errOrMsg, arr
+            drive.flushMotors(4)
+            if arrived then
+                break
+            end
+            sleep(0.12)
+        end
+        safeStop()
+        reply(req, true, {
+            arrived = arrived and true or false,
+            target = target,
+            elapsed = os.clock() - t0,
+            err = lastErr,
+            pose_before = before,
+            pose_after = samplePose(),
+            handshake = {
+                kind = "psi_stub",
+                note = "Create portable_storage_interface align — redstone/funnel handshake is software stub",
+            },
+        })
+        return
+    end
+
+    if cmd == "follow_path" then
+        local control = drive.loadControl()
+        if not control then
+            reply(req, false, nil, "no boat_control.json")
+            return
+        end
+        local name = tostring(req.name or req.path or "")
+        name = string.gsub(name, "%.json$", "")
+        if name == "" then
+            reply(req, false, nil, "need name=")
+            return
+        end
+        package.loaded["path"] = nil
+        local pathMod = require("path")
+        local data = pathMod.load(name)
+        if not data then
+            reply(req, false, nil, "missing path: " .. name)
+            return
+        end
+        thrusting = true
+        local before = samplePose()
+        local okF, reason = drive.followPath(control, data.waypoints, {
+            engage_distance = tonumber(req.engage_distance) or 12,
+            timeout = tonumber(req.timeout) or 240,
+        })
+        safeStop()
+        reply(req, okF and true or false, {
+            name = name,
+            reason = reason,
+            pose_before = before,
+            pose_after = samplePose(),
+            n_waypoints = #(data.waypoints or {}),
+        }, okF and nil or tostring(reason))
         return
     end
 

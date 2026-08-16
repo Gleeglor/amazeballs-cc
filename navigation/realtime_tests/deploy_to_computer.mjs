@@ -24,6 +24,9 @@ const FILES = [
   ["lib/filters.lua", "lib/filters.lua"],
   ["lib/xfer.lua", "lib/xfer.lua"],
   ["lib/schedule.lua", "lib/schedule.lua"],
+  ["lib/ports.lua", "lib/ports.lua"],
+  ["lib/dock.lua", "lib/dock.lua"],
+  ["port.lua", "port.lua"],
 ];
 
 function copyTree(targetDir) {

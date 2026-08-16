@@ -14,10 +14,10 @@ local function defaultConfig()
     return {
         boat_id = "boat1",
         ports = {
-            { id = "port_a", arrival = "a_to_a_park", depart = "a_to_b" },
-            { id = "port_b", arrival = "b_to_b_park", depart = "b_to_a" },
+            { id = "port_a", x = 341, z = 163, yaw_deg = 0, arrival = "to_port_a", depart = "a_to_b" },
+            { id = "port_b", x = 383, z = 285, yaw_deg = 180, arrival = "to_port_b", depart = "b_to_a" },
         },
-        -- Simpler A↔B: alternate these two path names
+        -- Alternating A↔B logistics route
         route = {
             { port_id = "port_a", path = "to_port_a" },
             { port_id = "port_b", path = "to_port_b" },
@@ -25,6 +25,13 @@ local function defaultConfig()
         cargo = "left", -- peripheral name or side-named inventory for gangway
         tidy_cargo = nil, -- optional deeper cargo inventory
         funnel_wait = 8,
+        dock_timeout = 180,
+        -- Create PSI berth handshake (software stub if no rednet port host)
+        docking = {
+            shore_block = "create:portable_storage_interface",
+            boat_block = "create:portable_storage_interface",
+            use_stub_handshake = true,
+        },
     }
 end
 
@@ -94,7 +101,51 @@ local function handleJob(cfg, job)
 end
 
 local function dockSession(cfg, portId)
+    local dockLib = require("dock")
+    local portsLib = require("ports")
+    local berth = portsLib.get(portId)
+    local control = drive.loadControl()
+    if berth and control then
+        print("Aligning to berth " .. portId)
+        local craft = pose.get()
+        local y = craft.position.y
+        local approach = portsLib.approachOf(berth)
+        approach.y = y
+        local pid = drive.newPidStates()
+        local t0 = os.clock()
+        local timeout = (cfg.dock_timeout) or 120
+        while os.clock() - t0 < timeout * 0.55 do
+            local err, arrived = drive.stepToward(control, approach, "cruise", pid, 0.15)
+            drive.flushMotors(4)
+            if arrived or (err and err.distance and err.distance < 5) then
+                break
+            end
+            sleep(0.15)
+        end
+        local berthTarget = { x = berth.x, y = y, z = berth.z, yaw = berth.yaw }
+        pid = drive.newPidStates()
+        local t1 = os.clock()
+        while os.clock() - t1 < timeout * 0.45 do
+            local err, arrived = drive.stepToward(control, berthTarget, "dock", pid, 0.12)
+            drive.flushMotors(4)
+            if arrived then
+                break
+            end
+            sleep(0.12)
+        end
+        drive.allOff(control)
+        print("Berth align done")
+    end
     announceArrived(cfg, portId)
+    if cfg.docking and cfg.docking.use_stub_handshake ~= false then
+        local okH, hs = dockLib.handshakeStub(cfg.boat_id or "boat1", portId, {
+            timeout = math.min(cfg.funnel_wait or 8, 12),
+        })
+        print("Handshake: " .. tostring(okH) .. " mode=" .. tostring(hs and hs.mode))
+        if okH then
+            return true
+        end
+    end
     local deadline = os.clock() + ((cfg.dock_timeout) or 180)
     while os.clock() < deadline do
         local sender, msg = protocol.receive(2, function(m)

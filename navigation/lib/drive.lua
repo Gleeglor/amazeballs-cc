@@ -87,7 +87,8 @@ end
 --
 -- IMPORTANT: Create Addition motors KEEP their last RPM if the computer
 -- reboots/shuts off mid-command. Always stop() before exit; boot must zero them.
-local DEFAULT_MAX_RPM = 24 -- per motor (NOT a shared total across thrusters)
+-- 24 was too weak for measurable live Δyaw/Δfwd on Aero props; 96 still CCA-safe.
+local DEFAULT_MAX_RPM = 96 -- per motor (NOT a shared total across thrusters)
 local DEFAULT_POWER_BUDGET_RF = 0 -- 0 = off; shared RF cap is opt-in only
 local DEFAULT_FE_PER_RPM = 1 -- CCA-ish: ~1 FE/t per RPM (pack-dependent)
 local motorDesired = {}
@@ -1138,6 +1139,28 @@ function drive.enrichControl(control)
             local ys = drive.getYawSign(control)
             t.side_score = -((tz >= 0) and 1 or -1) * ys
         end
+        -- Weak calib tz (common when pulse is short): synthesize geometric yaw from
+        -- side × lateral force so Reassembly/LS can actually allocate A/D.
+        local tzAbs = math.abs(tonumber(t.tz) or 0)
+        if tzAbs < 0.02 then
+            local side = drive.thrusterSide(t, { yaw_sign = drive.getYawSign(control) })
+            local fy = tonumber(t.fy) or 0
+            local fx = tonumber(t.fx) or 0
+            local f = t.facing or t.role or ""
+            local synth = 0
+            if math.abs(side) >= 0.05 and (f == "left" or f == "right" or f == "port"
+                or f == "starboard" or f == "stbd" or math.abs(fy) >= 0.02)
+            then
+                -- Port (side<0) thrusting +fy (craft-right) → negative pilot tz before yaw_sign
+                synth = -side * math.max(math.abs(fy), 0.08)
+            elseif math.abs(side) >= 0.05 and math.abs(fx) >= 0.05 then
+                synth = -side * math.max(math.abs(fx) * 0.35, 0.05)
+            end
+            if math.abs(synth) > tzAbs then
+                t.tz = synth
+                t._tz_synthesized = true
+            end
+        end
     end
     return control
 end
@@ -1326,11 +1349,30 @@ function drive.applyCardinalRoles(control, fx, fy, tz)
     return true
 end
 
+local function maxThrusterTzAbs(control)
+    local m = 0
+    if not control or type(control.thrusters) ~= "table" then
+        return 0
+    end
+    for _, t in ipairs(control.thrusters) do
+        m = math.max(m, math.abs(tonumber(t.tz) or 0))
+    end
+    return m
+end
+
 --- Allocate command; yaw_sign + CoM cancel; Reassembly → teleop → cardinal roles.
 function drive.applyCommand(control, fx, fy, tz)
     control = control or drive.loadControl()
     drive.enrichControl(control)
     fx, fy, tz = fx or 0, fy or 0, tz or 0
+
+    -- Pure A/D with weak calib tz → cardinal differential (Reassembly LS under-yaws).
+    local pureYaw = isPureYaw(fx, fy, tz)
+    if pureYaw and maxThrusterTzAbs(control) < 0.08 then
+        if drive.applyCardinalRoles(control, fx, fy, tz) then
+            return true, "cardinal_yaw"
+        end
+    end
 
     if drive.preferCardinal(control) then
         if drive.applyCardinalRoles(control, fx, fy, tz) then
@@ -1341,6 +1383,16 @@ function drive.applyCommand(control, fx, fy, tz)
     if drive.preferReassembly(control) then
         local ok = drive.applyReassembly(control, fx, fy, tz)
         if ok then
+            -- If pure yaw but net tz still tiny, override with cardinal differential.
+            if pureYaw then
+                local duties = drive.getLastDuties()
+                local net = drive.netWrench(control.thrusters, duties)
+                if math.abs(net.tz or 0) < 0.08 then
+                    if drive.applyCardinalRoles(control, fx, fy, tz) then
+                        return true, "cardinal_yaw_override"
+                    end
+                end
+            end
             return true, "reassembly"
         end
         if drive.applyTeleop(control, fx, fy, tz) then
@@ -2204,11 +2256,23 @@ function drive.followPath(control, waypoints, opts)
     local engage = opts.engage_distance or dock.engage_distance or 12
     local holdTicks = opts.hold_ticks or 8
     local dt = opts.dt or 0.1
+    local timeout = tonumber(opts.timeout) or 300
+    if timeout < 10 then
+        timeout = 10
+    end
+    if timeout > 600 then
+        timeout = 600
+    end
     local pidStates = drive.newPidStates()
     local i = path.nearestIndex(waypoints)
     local hold = 0
+    local t0 = os.clock()
 
     while true do
+        if os.clock() - t0 >= timeout then
+            drive.allOff(control)
+            return false, "timeout"
+        end
         local craft = pose.get()
         local last = waypoints[#waypoints]
         local distLast = math.sqrt((last.x - craft.position.x) ^ 2 + (last.z - craft.position.z) ^ 2)
