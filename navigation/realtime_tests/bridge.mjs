@@ -116,6 +116,50 @@ async function httpJson(method, url, body, opts = {}) {
   }
 }
 
+const TIMEOUT_HINTS = [
+  "Boat must use LAN IP or tunnel in /realtime_bridge.json — never 127.0.0.1 (CC http runs on the MC server).",
+  "If MC server is a remote VPS (not on your LAN), LAN IPs like 192.168.x.x are unreachable — use ngrok/cloudflare tunnel.",
+  "CC http.rules: allow host:port ABOVE host=$private deny; restart/reload after edit.",
+  "Host firewall if needed: sudo ufw allow 8765/tcp",
+  "Confirm npm run serve is listening (ss -tlnp | grep 8765) and boat prints HTTP errors each poll.",
+];
+
+async function printHttpTimeoutDiagnostics(base) {
+  console.error("\n--- HTTP bridge timeout diagnostics ---");
+  for (const h of TIMEOUT_HINTS) {
+    console.error(`  • ${h}`);
+  }
+  try {
+    const health = await httpJson("GET", `${base}/v1/health`, null, { timeoutMs: 2000 });
+    if (health.ok && health.data) {
+      console.error(
+        `  health: agent_alive=${health.data.agent_alive} age_ms=${health.data.agent_age_ms} pending=${JSON.stringify(health.data.pending)}`,
+      );
+    }
+  } catch (e) {
+    console.error(`  health fetch failed: ${e.message || e}`);
+  }
+  try {
+    const log = await httpJson("GET", `${base}/v1/accesslog?n=15`, null, { timeoutMs: 2000 });
+    const lines = log.data?.lines || [];
+    if (lines.length) {
+      console.error("  last server access log:");
+      for (const line of lines) console.error(`    ${line}`);
+      const boatish = lines.some((l) => /\/v1\/(cmd|status|result)/.test(l) && !/127\.0\.0\.1|::1/.test(l));
+      if (!boatish) {
+        console.error(
+          "  → No non-loopback agent hits in access log. Boat is not reaching this host (wrong base_url, $private deny, firewall, or need tunnel).",
+        );
+      }
+    } else {
+      console.error("  access log empty (restart serve to enable request logging, or no requests yet).");
+    }
+  } catch (e) {
+    console.error(`  accesslog fetch failed: ${e.message || e}`);
+  }
+  console.error("---\n");
+}
+
 /**
  * HTTP session: talks to local http_server (loopback). Boat polls the same server.
  */
@@ -148,8 +192,9 @@ export function createHttpSession(opts = {}) {
       }
       await sleep(pollMs);
     }
+    await printHttpTimeoutDiagnostics(base);
     throw new Error(
-      `Timeout waiting for HTTP result id=${id} cmd=${payload.cmd} (${timeoutMs}ms). Is test_agent (HTTP mode) running on the boat?`,
+      `Timeout waiting for HTTP result id=${id} cmd=${payload.cmd} (${timeoutMs}ms). Is test_agent (HTTP mode) reaching this host?`,
     );
   }
 

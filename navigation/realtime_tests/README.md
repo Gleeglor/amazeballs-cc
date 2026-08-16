@@ -32,15 +32,30 @@ cp bridge.example.json bridge.json
 npm run serve
 ```
 
-Leave `serve` running. Note your LAN IP (e.g. `192.168.1.50`) — the **Minecraft server** must reach it (CC `http` is server-side).
+Leave `serve` running. Note your LAN IP (e.g. `192.168.178.160`) — the **Minecraft server** must reach it (CC `http` is server-side).
+
+### Topology check (LAN vs remote)
+
+CC `http.get` runs on the **Minecraft server process**, not your game client.
+
+| MC server location | Boat `base_url` must be |
+|--------------------|-------------------------|
+| Same LAN as your PC | `http://YOUR_LAN_IP:8765` (e.g. `192.168.178.160`) |
+| Remote VPS / hosted (public IP in multiplayer list) | **Public tunnel** (ngrok / Cloudflare) pointing at host `:8765` — LAN IPs are unreachable |
+
+**Detection:** if your multiplayer server address is a public IP (not `192.168.*` / `10.*`), you need a tunnel. Example: server `62.x.x.x:25565` cannot dial `192.168.178.160`.
+
+Host firewall tip (if UFW is on): `sudo ufw allow 8765/tcp`
 
 ### 2. Ask the server admin (HTTP whitelist)
 
-Default CC denies `$private` (LAN/localhost). Admin must allow your host **before** the `$private` deny in `computercraft-server.toml`:
+Default CC denies `$private` (LAN/localhost). That **blocks** host LAN IPs like `192.168.178.160` unless an **allow** rule is listed **above** the `$private` deny. **Rule order matters** — first match wins.
+
+Admin snippet for `computercraft-server.toml` (allow MUST come before `$private`):
 
 ```toml
 [[http.rules]]
-	host = "192.168.1.50"
+	host = "192.168.178.160"
 	port = 8765
 	action = "allow"
 
@@ -49,14 +64,39 @@ Default CC denies `$private` (LAN/localhost). Admin must allow your host **befor
 	action = "deny"
 ```
 
-Or allow a tunnel hostname (`*.ngrok-free.app`, etc.) if you expose the bridge that way. Also ensure `[http] enabled = true`.
+Also ensure `[http] enabled = true`.
+
+**Prefer not to open LAN?** Run a Cloudflare tunnel or ngrok to the bridge, then allow that **public** hostname (and put it in the boat `base_url`) instead of the LAN IP — still place the allow rule **above** `$private`.
+
+### Port already in use (`EADDRINUSE …:8765`)
+
+```bash
+ss -tlnp | grep 8765
+# Confirm cmdline is node http_server.mjs (ours), then:
+kill <PID>
+# Or keep the old process and use another port everywhere:
+PORT=8766 npm run serve
+```
+
+If you switch ports, boat `/realtime_bridge.json` and the admin allow rule must match:
+
+```json
+{ "mode": "http", "base_url": "http://192.168.178.160:8766", "poll": 0.3 }
+```
+
+```toml
+[[http.rules]]
+	host = "192.168.178.160"
+	port = 8766
+	action = "allow"
+```
 
 ### 3. Boat agent config + deploy
 
 On the boat computer create `/realtime_bridge.json` (see `realtime_bridge.example.json`):
 
 ```json
-{ "mode": "http", "base_url": "http://192.168.1.50:8765", "poll": 0.3 }
+{ "mode": "http", "base_url": "http://192.168.178.160:8765", "poll": 0.3 }
 ```
 
 Then `updater` → select `test_agent.lua` + navigation `lib/*`, calibrate if needed, run:
@@ -65,17 +105,21 @@ Then `updater` → select `test_agent.lua` + navigation `lib/*`, calibrate if ne
 test_agent
 ```
 
-You should see `mode http` and `base …`. If HTTP is blocked, posts/gets fail — fix whitelist first.
+You should see `mode http` and `base …`. HTTP failures now print every poll with status + URL — if you see Domain not permitted / Connection refused, fix whitelist or topology first.
 
 ### 4. Run tests / dock
 
 ```bash
 cd cc-scripts/navigation/realtime_tests
+# Expect curl health agent_alive=true once boat heartbeats:
+curl -s http://127.0.0.1:8765/v1/health
 npm test
 # after green:
 node overnight_loop.mjs --once
 # dock target is navigate_to x=340 z=165
 ```
+
+On ping timeout, `npm test` prints last access-log lines. If you only see loopback host traffic and no boat `/v1/cmd` or `/v1/status`, the MC server never reached your PC.
 
 ## Singleplayer — filesystem
 

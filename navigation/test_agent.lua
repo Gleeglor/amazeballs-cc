@@ -55,42 +55,60 @@ local function loadBridgeConfig()
     end
 end
 
+local function httpFailMsg(kind, url, err, status)
+    local bits = { kind, "failed" }
+    if status then
+        bits[#bits + 1] = "status=" .. tostring(status)
+    end
+    bits[#bits + 1] = "url=" .. tostring(url)
+    bits[#bits + 1] = "err=" .. tostring(err or "?")
+    return table.concat(bits, " ")
+end
+
 local function httpGetJson(url)
     if not http or not http.get then
-        return nil, "http API unavailable"
+        return nil, httpFailMsg("http.get", url, "http API unavailable")
     end
     local res, err = http.get(url, { ["Accept"] = "application/json" })
     if not res then
-        return nil, err or "http.get failed"
+        return nil, httpFailMsg("http.get", url, err or "request failed")
     end
+    local code = res.getResponseCode and res.getResponseCode() or nil
     local body = res.readAll()
     res.close()
+    if code and (code < 200 or code >= 300) then
+        return nil, httpFailMsg("http.get", url, "bad HTTP status", code)
+    end
     if not body or body == "" then
-        return nil, "empty body"
+        return nil, httpFailMsg("http.get", url, "empty body", code)
     end
     local ok, data = pcall(textutils.unserialiseJSON, body)
     if not ok or type(data) ~= "table" then
-        return nil, "bad JSON"
+        return nil, httpFailMsg("http.get", url, "bad JSON", code)
     end
     return data
 end
 
 local function httpPostJson(url, payload)
     if not http or not http.post then
-        return false, "http API unavailable"
+        return false, httpFailMsg("http.post", url, "http API unavailable")
     end
     local okEnc, encoded = pcall(textutils.serialiseJSON, payload)
     if not okEnc then
-        return false, "encode failed"
+        return false, httpFailMsg("http.post", url, "encode failed")
     end
     local res, err = http.post(url, encoded, {
         ["Content-Type"] = "application/json",
         ["Accept"] = "application/json",
     })
     if not res then
-        return false, err or "http.post failed"
+        return false, httpFailMsg("http.post", url, err or "request failed")
     end
+    local code = res.getResponseCode and res.getResponseCode() or nil
     res.close()
+    if code and (code < 200 or code >= 300) then
+        return false, httpFailMsg("http.post", url, "bad HTTP status", code)
+    end
     return true
 end
 
@@ -164,7 +182,7 @@ local function writeOut(payload)
     if transport.mode == "http" then
         local ok, err = httpPostJson(transport.base_url .. "/v1/result", payload)
         if not ok then
-            print("result POST failed: " .. tostring(err))
+            print(tostring(err))
         end
         return
     end
@@ -189,10 +207,7 @@ local function writeStatus(extra)
     if transport.mode == "http" then
         local ok, err = httpPostJson(transport.base_url .. "/v1/status", st)
         if not ok then
-            -- Keep trying; don't spam every poll failure hard.
-            if extra and extra.boot then
-                print("status POST failed: " .. tostring(err))
-            end
+            print(tostring(err))
         end
         return
     end
@@ -201,8 +216,10 @@ end
 
 local function pollNextCommand()
     if transport.mode == "http" then
-        local data, err = httpGetJson(transport.base_url .. "/v1/cmd")
+        local url = transport.base_url .. "/v1/cmd"
+        local data, err = httpGetJson(url)
         if not data then
+            print(tostring(err))
             return nil, err
         end
         if data.cmd == nil or data.cmd == false then
@@ -473,8 +490,16 @@ if transport.mode == "http" then
     print("  mode    http")
     print("  base    " .. tostring(transport.base_url))
     print("  poll    " .. tostring(transport.poll) .. "s")
+    if string.find(tostring(transport.base_url or ""), "127%.0%.0%.1", 1, false)
+        or string.find(tostring(transport.base_url or ""), "localhost", 1, true)
+    then
+        print("ERROR: base_url is loopback — MC server will never reach your PC.")
+        print("  Use player PC LAN IP (same LAN) or a public tunnel URL (remote VPS).")
+    end
     if not http then
         print("ERROR: http API disabled — ask server admin to enable CC http + whitelist host")
+    else
+        print("  HTTP errors print every poll (status + URL) — watch this screen.")
     end
 else
     print("  mode    fs")

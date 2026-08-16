@@ -29,6 +29,7 @@ In `computercraft-server.toml`, allow the host PC **before** `$private` deny, e.
 
 (`[http] enabled = true` must stay on.)
 
+**Remote hosted server?** If the multiplayer address is a public IP (not on your home LAN), the boat cannot reach `192.168.x.x` — run ngrok/cloudflare to `:8765` and allow that public hostname instead.
 ### Host (your PC)
 ```bash
 cd cc-scripts/navigation/realtime_tests

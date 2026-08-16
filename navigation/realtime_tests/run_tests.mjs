@@ -86,7 +86,13 @@ async function main() {
   }
   if (!status?.alive) {
     console.warn(
-      "\nWARNING: agent status not alive. Start test_agent on the boat (HTTP: with /realtime_bridge.json + npm run serve on host).\n",
+      "\nWARNING: agent status not alive (no recent POST /v1/status from boat).",
+    );
+    console.warn(
+      "  Boat must poll YOUR reachable URL — never 127.0.0.1. Remote MC server → need tunnel.",
+    );
+    console.warn(
+      "  Check http.rules allow ABOVE $private; curl /v1/health; boat should print http.get failures.\n",
     );
   } else {
     console.log(`  agent alive (last_cmd=${status.last_cmd || "?"})`);

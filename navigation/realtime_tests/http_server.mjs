@@ -22,6 +22,22 @@ const state = {
 };
 
 const MAX_RESULTS = 64;
+const MAX_ACCESS_LOG = 80;
+/** @type {string[]} */
+const accessLog = [];
+
+function remoteAddr(req) {
+  const xf = req.headers["x-forwarded-for"];
+  if (typeof xf === "string" && xf.trim()) return xf.split(",")[0].trim();
+  return req.socket?.remoteAddress || "?";
+}
+
+function logAccess(req, pathname, code) {
+  const line = `${new Date().toISOString()} ${req.method} ${pathname} from ${remoteAddr(req)} → ${code}`;
+  accessLog.push(line);
+  while (accessLog.length > MAX_ACCESS_LOG) accessLog.shift();
+  console.log(line);
+}
 
 function json(res, code, body) {
   const raw = JSON.stringify(body);
@@ -114,29 +130,34 @@ export function hostClearPending() {
 async function handle(req, res) {
   const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
   const p = url.pathname.replace(/\/+$/, "") || "/";
+  let code = 500;
 
   try {
     // --- Agent endpoints ---
     if (req.method === "GET" && (p === "/v1/cmd" || p === "/cmd")) {
       const pending = state.pending;
       if (!pending) {
-        json(res, 200, { cmd: null });
+        code = 200;
+        json(res, code, { cmd: null });
         return;
       }
       // Hand out once per id (agent may poll while executing).
       if (state.claimedId === pending.id) {
-        json(res, 200, { cmd: null, in_flight: pending.id });
+        code = 200;
+        json(res, code, { cmd: null, in_flight: pending.id });
         return;
       }
       state.claimedId = pending.id;
-      json(res, 200, pending);
+      code = 200;
+      json(res, code, pending);
       return;
     }
 
     if (req.method === "POST" && (p === "/v1/result" || p === "/result" || p === "/outbox")) {
       const body = await readBody(req);
       if (!body || !body.id) {
-        json(res, 400, { ok: false, error: "need { id, ... }" });
+        code = 400;
+        json(res, code, { ok: false, error: "need { id, ... }" });
         return;
       }
       rememberResult(body);
@@ -144,19 +165,22 @@ async function handle(req, res) {
         state.pending = null;
         state.claimedId = null;
       }
-      json(res, 200, { ok: true });
+      code = 200;
+      json(res, code, { ok: true });
       return;
     }
 
     if (req.method === "POST" && (p === "/v1/status" || p === "/status")) {
       const body = (await readBody(req)) || {};
       state.status = { ...body, alive: body.alive !== false, recv_ts: Date.now() };
-      json(res, 200, { ok: true });
+      code = 200;
+      json(res, code, { ok: true });
       return;
     }
 
     if (req.method === "GET" && (p === "/v1/status" || p === "/status")) {
-      json(res, 200, state.status || { alive: false });
+      code = 200;
+      json(res, code, state.status || { alive: false });
       return;
     }
 
@@ -165,9 +189,11 @@ async function handle(req, res) {
       const body = await readBody(req);
       try {
         const enq = hostEnqueue(body);
-        json(res, 200, { ok: true, id: enq.id });
+        code = 200;
+        json(res, code, { ok: true, id: enq.id });
       } catch (e) {
-        json(res, 400, { ok: false, error: String(e.message || e) });
+        code = 400;
+        json(res, code, { ok: false, error: String(e.message || e) });
       }
       return;
     }
@@ -175,33 +201,49 @@ async function handle(req, res) {
     if (req.method === "GET" && (p === "/v1/result" || p === "/outbox")) {
       const id = url.searchParams.get("id");
       if (!id) {
-        json(res, 400, { ok: false, error: "need ?id=" });
+        code = 400;
+        json(res, code, { ok: false, error: "need ?id=" });
         return;
       }
       const got = hostGetResult(id);
       if (!got) {
-        json(res, 404, { ok: false, error: "not ready" });
+        code = 404;
+        json(res, code, { ok: false, error: "not ready" });
         return;
       }
-      json(res, 200, got);
+      code = 200;
+      json(res, code, got);
+      return;
+    }
+
+    if (req.method === "GET" && (p === "/v1/accesslog" || p === "/accesslog")) {
+      const n = Math.min(50, Math.max(1, Number(url.searchParams.get("n")) || 20));
+      code = 200;
+      json(res, code, { ok: true, lines: accessLog.slice(-n) });
       return;
     }
 
     if (req.method === "GET" && (p === "/v1/health" || p === "/health" || p === "/")) {
-      json(res, 200, {
+      code = 200;
+      json(res, code, {
         ok: true,
         service: "amazeballs-realtime-http-bridge",
         pending: state.pending ? { id: state.pending.id, cmd: state.pending.cmd } : null,
         agent_alive: !!(state.status?.alive),
         agent_age_ms:
           state.status?.recv_ts != null ? Date.now() - state.status.recv_ts : null,
+        access_log_len: accessLog.length,
       });
       return;
     }
 
-    json(res, 404, { ok: false, error: "not found", path: p });
+    code = 404;
+    json(res, code, { ok: false, error: "not found", path: p });
   } catch (e) {
-    json(res, 500, { ok: false, error: String(e.message || e) });
+    code = 500;
+    json(res, code, { ok: false, error: String(e.message || e) });
+  } finally {
+    logAccess(req, p, code);
   }
 }
 
@@ -244,6 +286,10 @@ function resolveListenFromConfigOrArgs(argv) {
     if (argv[i] === "--listen") listen = argv[++i];
   }
   if (listen) return listen;
+  if (process.env.PORT) {
+    const port = String(process.env.PORT).trim();
+    if (port) return `0.0.0.0:${port}`;
+  }
   const { config } = loadBridgeConfig();
   return config?.listen || "0.0.0.0:8765";
 }
@@ -257,12 +303,15 @@ if (isMain) {
   startHttpBridgeServer(listen)
     .then((s) => {
       console.log(`Realtime HTTP bridge listening on http://${s.listen}`);
+      console.log("Logging every request (method path remote → status).");
       console.log("Agent endpoints: GET /v1/cmd  POST /v1/result  POST /v1/status");
-      console.log("Host endpoints:  POST /v1/inbox  GET /v1/result?id=  GET /v1/status");
-      console.log("Boat /realtime_bridge.json example:");
+      console.log("Host endpoints:  POST /v1/inbox  GET /v1/result?id=  GET /v1/status  GET /v1/accesslog");
+      console.log("Boat /realtime_bridge.json: base_url must be reachable FROM the Minecraft SERVER.");
+      console.log("  Same LAN → http://YOUR_LAN_IP:8765   Remote VPS → ngrok/cloudflare tunnel URL");
+      console.log("  Never 127.0.0.1 (server loops to itself). Firewall: sudo ufw allow 8765/tcp");
       console.log(
         JSON.stringify(
-          { mode: "http", base_url: "http://YOUR_LAN_IP:8765", poll: 0.3 },
+          { mode: "http", base_url: "http://YOUR_LAN_IP_OR_TUNNEL:8765", poll: 0.3 },
           null,
           2,
         ),
