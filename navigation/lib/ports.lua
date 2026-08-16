@@ -24,7 +24,8 @@ ports.SAFETY = {
     max_approach_speed = 0.2,
     cruise_rpm_cap = 36,
     creep_rpm_cap = 18,
-    note = "Reached if horiz ≤20 of water hold; surge-biased gentle cruise; never seek shore coords",
+    auth_ceil = 0.78,
+    note = "Reached if horiz ≤20 of water hold; surge-biased gentle cruise (auth≤0.78); never seek shore coords",
 }
 
 ports.BOAT_DOCK = {

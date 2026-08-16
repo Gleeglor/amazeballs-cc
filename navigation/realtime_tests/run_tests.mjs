@@ -187,6 +187,22 @@ async function main() {
     `Δfwd=${Number(wFwd).toFixed(3)} maxSentRpm=${wSent} net.fx=${w.result?.net?.fx}`,
   );
 
+  console.log("\n=== S reverse (hold 2.5s) ===");
+  await between(session);
+  const s = await session.sendCommand(
+    { cmd: "hold_apply", fx: -1, fy: 0, tz: 0, seconds: 2.5 },
+    { timeoutMs: 25000 },
+  );
+  ok("S_apply_ok", s.ok === true, s.error || `path=${s.result?.path}`);
+  const sFwd = s.result?.delta_forward ?? 0;
+  const sSent = maxAbsMotorSent(s.result?.motors);
+  const sNetFx = Number(s.result?.net?.fx);
+  ok(
+    "S_reverse_motion_or_RPM",
+    sFwd < -FWD_MIN || sSent >= 8 || (Number.isFinite(sNetFx) && sNetFx < -0.25),
+    `Δfwd=${Number(sFwd).toFixed(3)} maxSentRpm=${sSent} net.fx=${s.result?.net?.fx}`,
+  );
+
   console.log("\n=== A yaw left (hold 4.0s) ===");
   await between(session);
   await new Promise((r) => setTimeout(r, 2000));

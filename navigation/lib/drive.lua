@@ -2238,8 +2238,8 @@ function drive.stepToward(control, target, mode, pidStates, dt)
         return err, true
     end
 
-    -- Gentle but usable authority: ~36 RPM cruise beats water drag; old ~14
-    -- left yaw PID spinning while surge lost to Create boat drag.
+    -- Gentle but usable authority: target ~20–36 soft RPM (not full ±1).
+    -- Old authCeil 0.55 on 24-RPM boats → ~13 RPM and yaw-only spin in drag.
     local maxRpm = tonumber(control and control.default_motor_rpm) or DEFAULT_MAX_RPM
     if maxRpm < 1 then
         maxRpm = DEFAULT_MAX_RPM
@@ -2248,12 +2248,14 @@ function drive.stepToward(control, target, mode, pidStates, dt)
     local midRpmCap = 28
     local creepRpmCap = 18
     local pulseRpmCap = 10
+    -- Absolute soft RPM / motor max; allow up to ~78% duty on low-max boats.
+    local authCeil = 0.78
     local rpmAuth = function(rpmCap)
-        return rpmCap / math.max(24, maxRpm)
+        return rpmCap / math.max(1, maxRpm)
     end
 
     -- Fraction of wrench from soft RPM caps (still far below full ±1 / 96 RPM).
-    local auth = math.min(0.55, rpmAuth(cruiseRpmCap))
+    local auth = math.min(authCeil, rpmAuth(cruiseRpmCap))
     if mode == "creep" or mode == "dock" then
         auth = math.min(auth, rpmAuth(creepRpmCap))
     end

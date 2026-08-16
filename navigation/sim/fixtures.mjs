@@ -393,6 +393,8 @@ export function fixtureSymmetricSurge() {
     version: 2,
     mode: "wrench",
     default_motor_rpm: 24,
+    // Geometric left+ tz in this fixture — must not use v8 default yaw_sign=-1.
+    yaw_sign: 1,
     gains: { norm: 1 },
     thrusters,
     description:

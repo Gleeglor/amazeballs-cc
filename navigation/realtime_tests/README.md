@@ -156,11 +156,23 @@ Not required when HTTP works. Do not pretend local Prism discover finds an MP bo
 | `load_control` | `/boat_control.json` loads |
 | idle `apply 0,0,0` | Duties near zero |
 | hold **W** | Real Δfwd and/or motor RPM actually sent |
+| hold **S** (`fx=-1`) | Reverse Δfwd and/or motor RPM / strong negative net Fx |
 | hold **A** (`tz=+1`) | Both sides lit; **Δyaw° < −4** (pilot left → negative pose yaw) |
 | hold **D** (`tz=-1`) | **\|Δyaw\| ≥ 4** and opposite sign to A |
 | stop between cases | Motors zeroed |
 
-Commands: `ping`, `stop`, `load_control`, `sample_pose`, `apply`, `hold_apply`, `write_file`, `sync_tree`, `reboot` / `restart_agent`, `navigate_to` / `go_dock`, `shutdown`.
+Commands: `ping`, `stop`, `load_control`, `sample_pose`, `apply`, `hold_apply`, `write_file`, `sync_tree`, `reboot` / `restart_agent`, `navigate_to` / `go_dock`, `go_port`, `follow_path`, `shutdown`.
+
+## Offline soft-nav tests (no boat)
+
+When you are not running `test_agent`, still verify soft arrive / gentle thrust / water-hold paths:
+
+```bash
+cd ../sim
+npm test
+```
+
+See also `../OVERNIGHT.md` for pull + offline/live checklist.
 
 ## Host-owned Lua updates (no updater)
 

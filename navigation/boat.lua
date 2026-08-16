@@ -191,7 +191,13 @@ local function followNamed(name)
         return false
     end
     print("Following /paths/" .. name .. ".json (" .. #data.waypoints .. " wps)")
-    local ok, reason = drive.followPath(drive.loadControl(), data.waypoints, {})
+    -- Soft water corridor: arrive ≤20 of holds, never slam shore landmarks.
+    local ok, reason = drive.followPath(drive.loadControl(), data.waypoints, {
+        arrive_dist = 20,
+        engage_distance = 22,
+        timeout = 360,
+        hold_ticks = 2,
+    })
     print("Follow result: " .. tostring(reason))
     return ok
 end

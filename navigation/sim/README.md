@@ -66,7 +66,9 @@ cd navigation/sim
 npm test
 ```
 
-Covers allocation, physics, **user CoM bugs** (`com_bugs.test.mjs`), and **in-game-equivalent** `boat_control.json` v6 cases (`lua_like_cardinal5`).
+Covers allocation, physics, **user CoM bugs** (`com_bugs.test.mjs`), **in-game-equivalent** `boat_control.json` v6 cases (`lua_like_cardinal5`), and **soft-nav** (`soft_nav.test.mjs`: soft arrive ≤20, pulse band, surge bias, water-hold paths).
+
+> Live A/D/W still needs `navigation/realtime_tests/` + boat `test_agent` when you are ready.
 
 ## In-game (one updater pass)
 
