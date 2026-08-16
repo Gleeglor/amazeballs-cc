@@ -179,7 +179,8 @@ function calibrate.run(opts)
     local control = {
         version = 2,
         max_rpm = motors.MAX_RPM,
-        yaw_sign = 1, -- A = yaw-; set to -1 in /boat_control.json if A/D feel mirrored
+        yaw_sign = 1, -- A = yaw-; set to -1 if A/D feel mirrored
+        surge_sign = -1, -- W = +surge after sign; flip to 1 if W goes backward
         thrusters = thrusters,
         unused = unused,
         calibrated_at = tostring(os.epoch and os.epoch("utc") or os.clock()),

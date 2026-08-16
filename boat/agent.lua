@@ -108,7 +108,8 @@ local function handleRpc(ws, msg)
         if type(code) ~= "string" then
             reply(ws, id, false, nil, "code required")
         else
-            local fn, err = load(code, "exec", "t", _ENV)
+            -- Use _G so require/package/peripheral work (not a bare _ENV sandbox).
+            local fn, err = load(code, "exec", "t", _G)
             if not fn then
                 reply(ws, id, false, nil, err)
             else
@@ -157,11 +158,76 @@ local function handleRpc(ws, msg)
             end)
             return { ok = ok, error = ok and nil or tostring(err) }
         end
+        local function runExhaustive()
+            local h = fs.open("/tests/exhaustive.lua", "r")
+            if not h then
+                return { ok = false, error = "missing /tests/exhaustive.lua" }
+            end
+            local src = h.readAll()
+            h.close()
+            local env = {
+                require = require,
+                keys = keys,
+                peripheral = peripheral,
+                sleep = sleep,
+                os = os,
+                fs = fs,
+                textutils = textutils,
+                shell = shell,
+                package = package,
+                math = math,
+                table = table,
+                string = string,
+                pairs = pairs,
+                ipairs = ipairs,
+                tonumber = tonumber,
+                tostring = tostring,
+                type = type,
+                select = select,
+                pcall = pcall,
+                error = error,
+                assert = assert,
+                print = print,
+                getfenv = getfenv,
+                setfenv = setfenv,
+                load = load,
+                loadfile = loadfile,
+                _G = _G,
+            }
+            setmetatable(env, { __index = _G })
+            local chunk, err = load(src, "@/tests/exhaustive.lua", "t", env)
+            if not chunk then
+                return { ok = false, error = tostring(err) }
+            end
+            local ok, mod = pcall(chunk)
+            if not ok then
+                return { ok = false, error = tostring(mod) }
+            end
+            if type(mod) ~= "table" or type(mod.run) ~= "function" then
+                return { ok = false, error = "exhaustive did not return module" }
+            end
+            local ok2, summary = pcall(mod.run, params)
+            if not ok2 then
+                return { ok = false, error = tostring(summary) }
+            end
+            return summary
+        end
         if suite == "all" or suite == "live" then
             results.live = runFile("/tests/live_smoke.lua")
         end
+        if suite == "all" or suite == "exhaustive" then
+            results.exhaustive = runExhaustive()
+        end
         ui.setLastTest(textutils.serialiseJSON(results))
-        reply(ws, id, true, results)
+        local okAll = true
+        if results.live and results.live.ok == false then
+            okAll = false
+        end
+        if results.exhaustive and results.exhaustive.ok == false then
+            okAll = false
+        end
+        reply(ws, id, okAll, results, okAll and nil or "tests failed")
+        return
     elseif method == "set_duties" then
         local control = calibrate.load()
         if not control or not control.thrusters then

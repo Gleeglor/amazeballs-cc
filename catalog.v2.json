@@ -46,6 +46,10 @@
         "live_smoke.lua": {
           "label": "live smoke tests",
           "dest": "tests/live_smoke.lua"
+        },
+        "exhaustive.lua": {
+          "label": "exhaustive live regression",
+          "dest": "tests/exhaustive.lua"
         }
       }
     }

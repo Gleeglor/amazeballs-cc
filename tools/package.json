@@ -4,6 +4,8 @@
   "type": "module",
   "scripts": {
     "test": "node test_host.mjs",
+    "test:live": "node test_live.mjs",
+    "test:all": "node test_host.mjs && node test_live.mjs",
     "agent": "node agent_host.mjs"
   },
   "dependencies": {

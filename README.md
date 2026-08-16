@@ -109,5 +109,16 @@ catalog.json / catalog.v2.json
 install.lua / updater.lua
 cannon/
 boat/          agent, menu, lib, tests, rendezvous
-tools/         agent_host.mjs, test_host.mjs
+tools/         agent_host.mjs, test_host.mjs, test_live.mjs
 ```
+
+## Tests
+
+```bash
+cd tools
+npm test          # host unit tests (no boat required)
+npm run test:live # exhaustive live suite via agent RPC (boat must be connected)
+npm run test:all  # both
+```
+
+Live suite spins motors briefly and asserts A/D yaw_rate signs match `yaw_sign`, W increases forward speed, release zeros RPM, hold timeout ≥1s, pose quaternion not stuck at yaw=0, etc.

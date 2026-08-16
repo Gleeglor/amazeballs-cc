@@ -46,8 +46,9 @@ local function loadThrusters()
     return control.thrusters, control, nil
 end
 
-function teleop.commandFromHeld(held, yawSign)
+function teleop.commandFromHeld(held, yawSign, surgeSign)
     yawSign = tonumber(yawSign) or 1
+    surgeSign = tonumber(surgeSign) or -1 -- live: +duty was reverse of pose.forward
     local surge, strafe, yaw = 0, 0, 0
     if held[keys.w] then
         surge = surge + 1
@@ -68,6 +69,7 @@ function teleop.commandFromHeld(held, yawSign)
         yaw = yaw + 1
     end
     yaw = yaw * yawSign
+    surge = surge * surgeSign
     return util.clamp(surge, -1, 1), util.clamp(strafe, -1, 1), util.clamp(yaw, -1, 1)
 end
 
@@ -185,6 +187,7 @@ function teleop.begin()
     local session = {
         thrusters = thrusters,
         yawSign = (control and control.yaw_sign) or 1,
+        surgeSign = (control and control.surge_sign) or -1,
         held = {},
         seen = {},
         duties = {},
@@ -207,7 +210,7 @@ function teleop.sync(session, forceFlush)
     if not session then
         return false
     end
-    local surge, strafe, yaw = teleop.commandFromHeld(session.held, session.yawSign)
+    local surge, strafe, yaw = teleop.commandFromHeld(session.held, session.yawSign, session.surgeSign)
     local axes = { surge, strafe, yaw }
     if sameAxes(axes, session.lastAxes) then
         return false
@@ -227,7 +230,7 @@ function teleop.redraw(session)
         return
     end
     local craft = pose.get()
-    local surge = select(1, teleop.commandFromHeld(session.held, session.yawSign))
+    local surge = select(1, teleop.commandFromHeld(session.held, session.yawSign, session.surgeSign))
     local actual = {}
     for _, t in ipairs(session.thrusters) do
         actual[t.name] = motors.readActualSpeed(t.name)
@@ -285,7 +288,7 @@ function teleop.onEvent(session, e, a, b)
             session.held[key] = true
             session.seen[key] = t
             if isRepeat then
-                local surge, strafe, yaw = teleop.commandFromHeld(session.held, session.yawSign)
+                local surge, strafe, yaw = teleop.commandFromHeld(session.held, session.yawSign, session.surgeSign)
                 if not sameAxes({ surge, strafe, yaw }, session.lastAxes) then
                     teleop.sync(session, true)
                 end
