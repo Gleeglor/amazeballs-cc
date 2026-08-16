@@ -12,6 +12,7 @@ import { fileURLToPath } from "node:url";
 import { loadBridgeConfig } from "./discover.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const CC_SCRIPTS_ROOT = path.resolve(__dirname, "../..");
 
 /** @type {{ pending: object|null, results: Map<string, object>, status: object|null, claimedId: string|null }} */
 const state = {
@@ -234,6 +235,32 @@ async function handle(req, res) {
           state.status?.recv_ts != null ? Date.now() - state.status.recv_ts : null,
         access_log_len: accessLog.length,
       });
+      return;
+    }
+
+    // Raw Lua tree for one-time boat bootstrap: wget <base>/v1/repo/navigation/test_agent.lua
+    if (req.method === "GET" && (p === "/v1/repo" || p.startsWith("/v1/repo/"))) {
+      const rel = p === "/v1/repo" ? "" : p.slice("/v1/repo/".length);
+      const decoded = decodeURIComponent(rel).replace(/\\/g, "/");
+      if (!decoded || decoded.includes("..") || path.isAbsolute(decoded)) {
+        code = 400;
+        json(res, code, { ok: false, error: "bad repo path" });
+        return;
+      }
+      const abs = path.resolve(CC_SCRIPTS_ROOT, decoded);
+      if (!abs.startsWith(CC_SCRIPTS_ROOT) || !fs.existsSync(abs) || !fs.statSync(abs).isFile()) {
+        code = 404;
+        json(res, code, { ok: false, error: "file not found", path: decoded });
+        return;
+      }
+      const body = fs.readFileSync(abs);
+      code = 200;
+      res.writeHead(code, {
+        "Content-Type": "text/plain; charset=utf-8",
+        "Content-Length": body.length,
+        "Cache-Control": "no-store",
+      });
+      res.end(body);
       return;
     }
 

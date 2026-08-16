@@ -7,7 +7,9 @@
     "test": "node run_tests.mjs",
     "list": "node run_tests.mjs --list",
     "discover": "node run_tests.mjs --list",
-    "deploy": "node deploy_to_computer.mjs",
+    "deploy": "node deploy_http.mjs",
+    "deploy:fs": "node deploy_to_computer.mjs",
+    "deploy:http": "node deploy_http.mjs",
     "overnight": "node overnight_loop.mjs",
     "overnight:once": "node overnight_loop.mjs --once"
   }

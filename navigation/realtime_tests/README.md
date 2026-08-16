@@ -155,14 +155,35 @@ Not required when HTTP works. Do not pretend local Prism discover finds an MP bo
 | `ping` | Agent replies |
 | `load_control` | `/boat_control.json` loads |
 | idle `apply 0,0,0` | Duties near zero |
-| hold **W** | Forward motion and/or net Fx |
-| hold **A** (`tz=+1`) | Yaw activity; preferably both sides |
-| hold **D** (`tz=-1`) | Δyaw opposite sign to A |
+| hold **W** | Real Δfwd and/or motor RPM actually sent |
+| hold **A** (`tz=+1`) | Both sides lit; **Δyaw° < −4** (pilot left → negative pose yaw) |
+| hold **D** (`tz=-1`) | **\|Δyaw\| ≥ 4** and opposite sign to A |
 | stop between cases | Motors zeroed |
 
-Commands: `ping`, `stop`, `load_control`, `sample_pose`, `apply`, `hold_apply`, `navigate_to` / `go_dock`, `shutdown`.
+Commands: `ping`, `stop`, `load_control`, `sample_pose`, `apply`, `hold_apply`, `write_file`, `sync_tree`, `reboot` / `restart_agent`, `navigate_to` / `go_dock`, `shutdown`.
+
+## Host-owned Lua updates (no updater)
+
+After **one** bootstrap of a `test_agent` that supports `write_file` / `sync_tree`:
+
+```bash
+# host
+npm run serve          # already running
+npm run deploy         # pushes navigation/*.lua + lib/*.lua over the bridge
+# optional: npm run deploy -- --reboot   # os.reboot so new test_agent loads
+npm test               # auto-deploys before the suite (SKIP_DEPLOY=1 to skip)
+```
+
+**One-time bootstrap** (boat computer — only if deploy says NEED_BOOTSTRAP):
+
+```
+wget https://raw.githubusercontent.com/Gleeglor/amazeballs-cc/main/navigation/test_agent.lua test_agent
+test_agent
+```
+
+Or wget from the bridge: `<boat base_url>/v1/repo/navigation/test_agent.lua` (same host the boat already polls — never `127.0.0.1`).
 
 ## Safety
 
 - Agent stops all motors on boot, between host `stop`s, after each hold, on quit, and if no host progress for ~3s while thrusting.
-- Hold duration capped at 4s on the agent.
+- Hold duration capped at 6s on the agent; holds drain motor RPM queues (CCA anti-spam) before measuring pose deltas.

@@ -17,7 +17,23 @@ local STATUS = "/realtime_status.json"
 local BRIDGE_CFG = "/realtime_bridge.json"
 local POLL = 0.08
 local WATCHDOG_SEC = 3.0
-local HOLD_MAX_SEC = 4.0
+local HOLD_MAX_SEC = 6.0
+-- Paths the host may overwrite via write_file / sync_tree (HTTP deploy).
+local WRITE_ALLOW = {
+    ["test_agent.lua"] = true,
+    ["boat.lua"] = true,
+    ["calibrate.lua"] = true,
+    ["stopmotors.lua"] = true,
+    ["lib/util.lua"] = true,
+    ["lib/pose.lua"] = true,
+    ["lib/drive.lua"] = true,
+    ["lib/nav_calibrate.lua"] = true,
+    ["lib/path.lua"] = true,
+    ["lib/protocol.lua"] = true,
+    ["lib/filters.lua"] = true,
+    ["lib/xfer.lua"] = true,
+    ["lib/schedule.lua"] = true,
+}
 
 local lastId = nil
 local lastAlive = os.clock()
@@ -289,6 +305,73 @@ local function doApply(control, fx, fy, tz)
     }
 end
 
+--- Push pending motor RPMs with CCA anti-spam gaps (flushMotors alone only lands ~1/call).
+local function drainMotors(budgetSec)
+    if drive.drainMotorsBlocking then
+        return drive.drainMotorsBlocking(budgetSec)
+    end
+    budgetSec = tonumber(budgetSec) or 1.0
+    if budgetSec < 0.05 then
+        budgetSec = 0.05
+    end
+    local t0 = os.clock()
+    local writes = 0
+    while os.clock() - t0 < budgetSec do
+        if not drive.motorsPending() then
+            break
+        end
+        local n = drive.flushMotors(1)
+        writes = writes + (n or 0)
+        sleep(0.03)
+        lastAlive = os.clock()
+    end
+    return writes
+end
+
+local function wrapYawDelta(afterYaw, beforeYaw)
+    local dyaw = (afterYaw or 0) - (beforeYaw or 0)
+    while dyaw > math.pi do
+        dyaw = dyaw - 2 * math.pi
+    end
+    while dyaw < -math.pi do
+        dyaw = dyaw + 2 * math.pi
+    end
+    return dyaw
+end
+
+--- Normalize host path → relative under computer root; reject escapes.
+local function safeDeployPath(raw)
+    local p = tostring(raw or "")
+    p = string.gsub(p, "\\", "/")
+    p = string.gsub(p, "^/+", "")
+    if p == "" or string.find(p, "%.%.") or string.find(p, ":") then
+        return nil, "bad path"
+    end
+    if not WRITE_ALLOW[p] then
+        return nil, "path not allowed: " .. p
+    end
+    return p
+end
+
+local function ensureParentDir(path)
+    local dir = string.match(path, "^(.*)/[^/]+$")
+    if dir and dir ~= "" and not fs.exists(dir) then
+        fs.makeDir(dir)
+    end
+end
+
+local function writeDeployFile(relPath, content, append)
+    ensureParentDir(relPath)
+    local mode = append and "a" or "w"
+    local f, err = fs.open(relPath, mode)
+    if not f then
+        return false, tostring(err or "open failed")
+    end
+    f.write(tostring(content or ""))
+    f.close()
+    return true, fs.getSize(relPath)
+end
+
 local function handle(req)
     local cmd = string.lower(tostring(req.cmd or ""))
     if cmd == "ping" then
@@ -393,27 +476,37 @@ local function handle(req)
             return
         end
 
+        -- Spin-up: CCA anti-spam only lands ~1 setRPM per flush; drain before timing the hold.
+        local drainSec = math.min(1.25, math.max(0.35, seconds * 0.35))
+        local drainWrites = drainMotors(drainSec)
+
         local t0 = os.clock()
+        local peakAbsYawRate = 0
+        local midSamples = 0
         while os.clock() - t0 < seconds do
-            -- Keep duties alive (CCA can drop); re-apply lightly each tick.
             drive.applyCommand(control, fx, fy, tz)
-            drive.flushMotors(4)
-            sleep(0.1)
+            drainMotors(0.12)
+            sleep(0.05)
             lastAlive = os.clock()
+            local mid = samplePose()
+            if mid then
+                midSamples = midSamples + 1
+                local wr = math.abs(tonumber(mid.yaw_rate) or 0)
+                if wr > peakAbsYawRate then
+                    peakAbsYawRate = wr
+                end
+            end
         end
 
         local after = samplePose()
+        -- Snapshot motors while still commanded (safeStop clears sent/desired).
+        local motorsEnd = drive.getMotorSnapshot()
+        local pendingEnd = drive.motorsPending()
         safeStop()
 
         local dyaw = 0
         if after and before then
-            dyaw = (after.yaw or 0) - (before.yaw or 0)
-            while dyaw > math.pi do
-                dyaw = dyaw - 2 * math.pi
-            end
-            while dyaw < -math.pi do
-                dyaw = dyaw + 2 * math.pi
-            end
+            dyaw = wrapYawDelta(after.yaw, before.yaw)
         end
         local dx, dy, dz = 0, 0, 0
         if after and before then
@@ -428,6 +521,9 @@ local function handle(req)
         end
 
         result.hold_seconds = seconds
+        result.drain_seconds = drainSec
+        result.drain_writes = drainWrites
+        result.mid_samples = midSamples
         result.pose_before = before
         result.pose_after = after
         result.delta_yaw = dyaw
@@ -438,10 +534,87 @@ local function handle(req)
         result.delta_horiz = math.sqrt(dx * dx + dz * dz)
         result.delta_forward = localDelta.forward
         result.delta_right = localDelta.right
+        result.motors = motorsEnd
+        result.motors_pending = pendingEnd and true or false
         if after then
             result.yaw_rate_end = after.yaw_rate
         end
+        result.yaw_rate_peak_abs = peakAbsYawRate
         reply(req, true, result)
+        return
+    end
+
+    if cmd == "write_file" then
+        local rel, perr = safeDeployPath(req.path)
+        if not rel then
+            reply(req, false, nil, perr)
+            return
+        end
+        local content = req.content
+        if content == nil then
+            reply(req, false, nil, "need content")
+            return
+        end
+        local okW, sizeOrErr = writeDeployFile(rel, content, req.append and true or false)
+        if not okW then
+            reply(req, false, nil, tostring(sizeOrErr))
+            return
+        end
+        reply(req, true, { path = rel, size = sizeOrErr, append = req.append and true or false })
+        return
+    end
+
+    if cmd == "sync_tree" then
+        local files = req.files
+        if type(files) ~= "table" then
+            reply(req, false, nil, "need files=[{path,content},...]")
+            return
+        end
+        local written = {}
+        local n = 0
+        for _, entry in ipairs(files) do
+            if type(entry) == "table" then
+                local rel, perr = safeDeployPath(entry.path)
+                if not rel then
+                    reply(req, false, { written = written }, perr)
+                    return
+                end
+                local okW, sizeOrErr = writeDeployFile(rel, entry.content, false)
+                if not okW then
+                    reply(req, false, { written = written, failed = rel }, tostring(sizeOrErr))
+                    return
+                end
+                n = n + 1
+                written[n] = { path = rel, size = sizeOrErr }
+            end
+        end
+        -- Also accept object-map { "lib/drive.lua": "..." } from JSON hosts
+        if n == 0 then
+            for pathKey, content in pairs(files) do
+                if type(pathKey) == "string" and type(content) == "string" then
+                    local rel, perr = safeDeployPath(pathKey)
+                    if not rel then
+                        reply(req, false, { written = written }, perr)
+                        return
+                    end
+                    local okW, sizeOrErr = writeDeployFile(rel, content, false)
+                    if not okW then
+                        reply(req, false, { written = written, failed = rel }, tostring(sizeOrErr))
+                        return
+                    end
+                    n = n + 1
+                    written[n] = { path = rel, size = sizeOrErr }
+                end
+            end
+        end
+        reply(req, true, { n = n, written = written })
+        return
+    end
+
+    if cmd == "reboot" or cmd == "restart_agent" then
+        reply(req, true, { rebooting = true, note = "os.reboot — ensure startup runs test_agent" })
+        sleep(0.4)
+        os.reboot()
         return
     end
 

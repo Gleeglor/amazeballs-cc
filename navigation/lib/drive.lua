@@ -354,8 +354,11 @@ end
 
 --- Push pending motor targets. budget = max peripheral calls this invoke.
 -- Stops first (bypass anti-spam gap), then largest |RPM| so main surge/yaw leaders fire ASAP.
-function drive.flushMotors(budget)
+-- opts.yield_gap: if true, sleep MOTOR_FLUSH_GAP between thrust writes (hold/calibrate drains).
+function drive.flushMotors(budget, opts)
     budget = budget or 2
+    opts = opts or {}
+    local yieldGap = opts.yield_gap and true or false
     local now = os.clock()
     local sent = 0
 
@@ -379,10 +382,20 @@ function drive.flushMotors(budget)
         -- Stops bypass anti-spam gap so release/X feel immediate
         if not isStop then
             if (now - lastMotorFlushAt) < MOTOR_FLUSH_GAP and sent == 0 then
-                return false
+                if yieldGap then
+                    sleep(MOTOR_FLUSH_GAP)
+                    now = os.clock()
+                else
+                    return false
+                end
             end
             if sent > 0 and (os.clock() - lastMotorFlushAt) < MOTOR_FLUSH_GAP then
-                return false
+                if yieldGap then
+                    sleep(MOTOR_FLUSH_GAP)
+                    now = os.clock()
+                else
+                    return false
+                end
             end
         end
         if writeMotorRpm(name, want) then
@@ -421,6 +434,24 @@ function drive.flushMotors(budget)
         end
     end
     return sent
+end
+
+--- Blocking drain until queue empty or timeout (for hold_apply / calibrate).
+function drive.drainMotorsBlocking(timeoutSec)
+    timeoutSec = tonumber(timeoutSec) or 1.0
+    local t0 = os.clock()
+    local writes = 0
+    while os.clock() - t0 < timeoutSec do
+        if not drive.motorsPending() then
+            break
+        end
+        local n = drive.flushMotors(8, { yield_gap = true })
+        writes = writes + (n or 0)
+        if (n or 0) < 1 then
+            sleep(MOTOR_FLUSH_GAP)
+        end
+    end
+    return writes
 end
 
 function drive.motorsPending()

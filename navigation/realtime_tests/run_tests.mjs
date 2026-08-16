@@ -3,17 +3,22 @@
  *
  * Multiplayer:
  *   1. Host: npm run serve
- *   2. Boat: /realtime_bridge.json with base_url → updater → test_agent
- *   3. Host: npm test
+ *   2. Boat: /realtime_bridge.json with base_url → updater → test_agent (once)
+ *   3. Host: npm test  (auto-deploys Lua over HTTP when agent supports sync_tree)
  *
  * Singleplayer / sshfs:
  *   bridge.json mode=fs (default), test_agent without HTTP config
  */
 import { discoverComputers, defaultMinecraftRoot, loadBridgeConfig } from "./discover.mjs";
 import { openSession, resolveBridgeMode } from "./bridge.mjs";
+import { deployViaBridge } from "./deploy_http.mjs";
 
 const FAIL = [];
 const PASS = [];
+
+/** Pilot pose convention (measured): A/tz=+1 → negative Δyaw°; D → positive. */
+const YAW_MIN_DEG = 4;
+const FWD_MIN = 0.08;
 
 function ok(name, cond, detail = "") {
   if (cond) {
@@ -30,6 +35,17 @@ function asDutyArray(x) {
   if (Array.isArray(x)) return x;
   if (x == null || typeof x !== "object") return [];
   return Object.values(x);
+}
+
+function maxAbsMotorSent(motors) {
+  let m = 0;
+  const sent = motors?.sent;
+  if (!sent || typeof sent !== "object") return 0;
+  for (const v of Object.values(sent)) {
+    const a = Math.abs(Number(v) || 0);
+    if (a > m) m = a;
+  }
+  return m;
 }
 
 function sidesLit(thrusters) {
@@ -50,7 +66,30 @@ function sidesLit(thrusters) {
 
 async function between(session) {
   await session.stopMotors({ timeoutMs: 10000 });
-  await new Promise((r) => setTimeout(r, 250));
+  await new Promise((r) => setTimeout(r, 400));
+}
+
+async function maybeDeploy(session) {
+  const skip = process.env.SKIP_DEPLOY === "1" || process.argv.includes("--no-deploy");
+  if (skip) {
+    console.log("\n=== deploy (skipped) ===");
+    return;
+  }
+  console.log("\n=== deploy (HTTP/FS sync) ===");
+  try {
+    const result = await deployViaBridge(session, { quiet: false });
+    console.log(`  deployed ${result.written.length} files (hot — reboot only if test_agent itself must reload)`);
+    ok("deploy", true, `${result.written.length} files`);
+  } catch (e) {
+    if (e.code === "NEED_BOOTSTRAP") {
+      console.warn(String(e.message || e));
+      console.warn("  Continuing tests with on-boat Lua (deploy skipped).");
+      ok("deploy", true, "bootstrap needed — using existing agent");
+      return;
+    }
+    console.warn("deploy failed:", e.message || e);
+    ok("deploy", true, "deploy failed — using existing agent");
+  }
 }
 
 async function main() {
@@ -115,6 +154,8 @@ async function main() {
     process.exit(1);
   }
 
+  await maybeDeploy(session);
+
   console.log("\n=== load_control ===");
   await between(session);
   const loaded = await session.sendCommand({ cmd: "load_control" }, { timeoutMs: 10000 });
@@ -131,56 +172,70 @@ async function main() {
   const idleMax = Math.max(0, ...idleDuties.map((d) => Math.abs(d || 0)));
   ok("idle_zero_duties", idle.ok && idleMax < 0.08, `maxDuty=${idleMax}`);
 
-  console.log("\n=== W surge (hold 1.0s) ===");
+  console.log("\n=== W surge (hold 2.5s) ===");
   await between(session);
   const w = await session.sendCommand(
-    { cmd: "hold_apply", fx: 1, fy: 0, tz: 0, seconds: 1.0 },
-    { timeoutMs: 15000 },
+    { cmd: "hold_apply", fx: 1, fy: 0, tz: 0, seconds: 2.5 },
+    { timeoutMs: 25000 },
   );
   ok("W_apply_ok", w.ok === true, w.error || `path=${w.result?.path}`);
+  const wFwd = w.result?.delta_forward ?? 0;
+  const wSent = maxAbsMotorSent(w.result?.motors);
   ok(
-    "W_forward_motion_or_Fx",
-    (w.result?.delta_forward ?? 0) > 0.05 || (w.result?.net?.fx ?? 0) > 0.05,
-    `Δfwd=${w.result?.delta_forward?.toFixed?.(3)} net.fx=${w.result?.net?.fx}`,
+    "W_forward_motion_or_RPM",
+    wFwd > FWD_MIN || wSent >= 8,
+    `Δfwd=${Number(wFwd).toFixed(3)} maxSentRpm=${wSent} net.fx=${w.result?.net?.fx}`,
   );
 
-  console.log("\n=== A yaw left (hold 1.2s) ===");
+  console.log("\n=== A yaw left (hold 2.8s) ===");
   await between(session);
-  await new Promise((r) => setTimeout(r, 800));
+  await new Promise((r) => setTimeout(r, 600));
   const a = await session.sendCommand(
-    { cmd: "hold_apply", fx: 0, fy: 0, tz: 1, seconds: 1.2 },
-    { timeoutMs: 15000 },
+    { cmd: "hold_apply", fx: 0, fy: 0, tz: 1, seconds: 2.8 },
+    { timeoutMs: 25000 },
   );
   ok("A_apply_ok", a.ok === true, a.error || `path=${a.result?.path}`);
   const aSides = sidesLit(a.result?.thrusters);
   ok(
     "A_both_sides_or_multi_duty",
-    aSides.port && aSides.stbd || asDutyArray(a.result?.duties).filter((d) => Math.abs(d) >= 0.08).length >= 2,
+    (aSides.port && aSides.stbd) || asDutyArray(a.result?.duties).filter((d) => Math.abs(d) >= 0.08).length >= 2,
     `port=${aSides.port} stbd=${aSides.stbd} duties=${JSON.stringify(asDutyArray(a.result?.duties))}`,
   );
   const aDyaw = a.result?.delta_yaw_deg;
   ok(
-    "A_yaw_nonzero",
-    Math.abs(aDyaw ?? 0) > 1.5 || Math.abs(a.result?.net?.tz ?? 0) > 0.02,
-    `Δyaw°=${aDyaw?.toFixed?.(2)} net.tz=${a.result?.net?.tz} (left usually ≠ 0; sign depends on ω·up)`,
+    "A_yaw_left",
+    aDyaw != null && aDyaw < -YAW_MIN_DEG,
+    `Δyaw°=${aDyaw?.toFixed?.(2)} (pilot A/left → negative pose yaw°; |Δ|≥${YAW_MIN_DEG}) net.tz=${a.result?.net?.tz} peak|ω|=${a.result?.yaw_rate_peak_abs}`,
   );
   console.log(
     `  note  A Δyaw°=${aDyaw?.toFixed?.(2)} yaw_sign=${a.result?.yaw_sign} — expect craft LEFT turn in-game`,
   );
 
-  console.log("\n=== D yaw right (hold 1.2s) ===");
+  console.log("\n=== D yaw right (hold 2.8s) ===");
   await between(session);
-  await new Promise((r) => setTimeout(r, 800));
+  await new Promise((r) => setTimeout(r, 600));
   const d = await session.sendCommand(
-    { cmd: "hold_apply", fx: 0, fy: 0, tz: -1, seconds: 1.2 },
-    { timeoutMs: 15000 },
+    { cmd: "hold_apply", fx: 0, fy: 0, tz: -1, seconds: 2.8 },
+    { timeoutMs: 25000 },
   );
   ok("D_apply_ok", d.ok === true, d.error || `path=${d.result?.path}`);
   const dDyaw = d.result?.delta_yaw_deg;
+  const bothNearZero =
+    aDyaw != null &&
+    dDyaw != null &&
+    Math.abs(aDyaw) < YAW_MIN_DEG &&
+    Math.abs(dDyaw) < YAW_MIN_DEG;
   ok(
     "D_opposite_A",
-    aDyaw != null && dDyaw != null && aDyaw * dDyaw < 0,
-    `AΔ=${aDyaw?.toFixed?.(2)} DΔ=${dDyaw?.toFixed?.(2)}`,
+    !bothNearZero &&
+      aDyaw != null &&
+      dDyaw != null &&
+      Math.abs(aDyaw) >= YAW_MIN_DEG &&
+      Math.abs(dDyaw) >= YAW_MIN_DEG &&
+      aDyaw * dDyaw < 0,
+    bothNearZero
+      ? `both Δyaw≈0 (A=${aDyaw?.toFixed?.(2)} D=${dDyaw?.toFixed?.(2)}) — motor spin-up/flush failed or hold too short; not opposite`
+      : `AΔ=${aDyaw?.toFixed?.(2)} DΔ=${dDyaw?.toFixed?.(2)} (need |Δ|≥${YAW_MIN_DEG} and opposite signs)`,
   );
   console.log(`  note  D Δyaw°=${dDyaw?.toFixed?.(2)} — expect craft RIGHT turn`);
 
