@@ -1,0 +1,4 @@
+{
+  "wss": "",
+  "comment": "Set wss to your public Cloudflare tunnel URL, e.g. wss://boat.example.com. Boat agent fetches this on boot; override with /agent.json on the computer."
+}

@@ -17,44 +17,30 @@ That downloads `updater.lua`, writes a managed `startup.lua`, and opens file sel
 
 ### Reinstall / change selected files
 
-Run install again (or force setup on the updater). Previous selections are pre-checked so you can tweak them:
-
 ```text
 install
 ```
 
-Or without re-downloading install.lua:
+Or: `updater --setup` / `updater setup` / `updater reinstall`.
 
-```text
-updater --setup
-```
-
-Aliases: `updater setup`, `updater reinstall`.
-
-Refresh updater files and pull only (no selection UI):
-
-```text
-install pull
-```
+Pull only (no selection UI): `install pull`
 
 ### Setup UI
 
 | Key | Action |
 |-----|--------|
 | Up / Down | Move cursor |
-| Space | Toggle select file |
-| Enter | Open folder, toggle file, or finish on **[Done] save selection** |
+| Space | Toggle select file (or whole folder) |
+| Enter | Open folder, toggle file, or finish on **[DONE]** |
 | Backspace | Go up one folder |
 
-After **Done**, pick which downloaded program to run on boot (or `0` for none). Selection is saved to `/cc_update.json`. Empty selection cancels and keeps the previous config.
+After **Done**, pick which downloaded program to run on boot (or `0` for none). Saved to `/cc_update.json`.
 
 ### Every reboot
 
-`startup.lua` runs the updater (re-downloads your selected files and self-updates `updater.lua`), then runs the configured boot program (for example `autorun`).
+`startup.lua` runs the updater, then the configured boot program.
 
 ## Roles (cannon)
-
-The `cannon/` folder lists **3 scripts** (one per computer role). Pick the script for that machine, then choose it as the boot program:
 
 | Computer | Select | Boot program |
 |----------|--------|--------------|
@@ -62,23 +48,59 @@ The `cannon/` folder lists **3 scripts** (one per computer role). Pick the scrip
 | Fire | `fire.lua` | `fire` |
 | Ammo turtle | `ammo.lua` | `ammo` |
 
-`startup.lua` is owned by the installer (updater chain). Your role program is started via the boot choice in setup (`run` in `/cc_update.json`), not by separate autorun helper files.
+## Roles (boat)
+
+Select the whole **`boat/`** folder (or all files under it), then boot **`agent`**.
+
+| File | Role |
+|------|------|
+| `agent` | WebSocket live agent (recommended boot). Auto-reconnects, panic-stops motors on drop. |
+| `boat` | Local menu (calibrate / teleop / places) |
+| `lib/*` | Motors (±24 RPM Create Addition), Reassembly mix, calib, route, dock, UI |
+| `rendezvous.json` | Public `wss://` URL the agent fetches from GitHub |
+| `tests/live_smoke.lua` | In-game smoke checks |
+
+### Boat one-time setup
+
+1. Wire **Create Addition electric motors** to the boat computer (wired modems). Cap in software is **±24 RPM per motor**.
+2. Install updater, select `boat/`, boot `agent`.
+3. On this PC:
+
+```bash
+cd cc-scripts/tools
+npm install
+npm run agent          # listens on :8765
+# other terminal:
+cloudflared tunnel --url http://127.0.0.1:8765
+```
+
+4. Put the tunnel URL into `boat/rendezvous.json` as `"wss": "wss://...."` (use `wss://` even if cloudflared prints `https://`), commit/push, then reboot the boat computer — or write `/agent.json` on the computer:
+
+```json
+{"wss":"wss://your-tunnel.example"}
+```
+
+5. In-game: press **C** to calibrate (open water), **T** for teleop, **X** panic stop. Host can `POST /rpc` with `{"method":"pose"}` etc.
+
+### Docking
+
+Uses **`simulated:docking_connector`** on boat and shore. Lock when within **0.5 blocks** and **20°**. Thrusters cut on lock; item transfer via CC inventory APIs across the linked inventories.
+
+### Host tests
+
+```bash
+cd cc-scripts/tools && npm test
+```
 
 ## Keep scripts up to date (author)
 
-Local source of truth (this Cursor workspace):
-
-`cc-scripts/` inside the Amazeballs Minecraft instance folder.
-
-1. Edit Lua files under `cc-scripts/` (and update `catalog.json` when adding folders/files).
+1. Edit under `cc-scripts/` (update catalogs when adding files).
 2. Commit and push to `gleeglor/amazeballs-cc` (`main`).
-3. In-game: reboot the computer, or run `updater`.
-
-No extra sync daemon. Reboot (or `updater`) pulls the latest selected files from GitHub.
+3. In-game: reboot or `updater`.
 
 ## Server requirement
 
-The **multiplayer server** must allow ComputerCraft HTTP to `raw.githubusercontent.com`. If installs or pulls fail, ask an admin to enable the CC HTTP API and allow that host.
+ComputerCraft HTTP must allow `raw.githubusercontent.com`. WebSockets must be enabled (already on in this pack). Public tunnel host must not be blocked by `$private` deny (use a public hostname).
 
 ## Layout
 
@@ -86,4 +108,6 @@ The **multiplayer server** must allow ComputerCraft HTTP to `raw.githubuserconte
 catalog.json / catalog.v2.json
 install.lua / updater.lua
 cannon/
+boat/          agent, menu, lib, tests, rendezvous
+tools/         agent_host.mjs, test_host.mjs
 ```

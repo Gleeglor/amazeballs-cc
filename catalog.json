@@ -1,5 +1,5 @@
 {
-    "version": 2,
+  "version": 2,
   "base_url": "https://raw.githubusercontent.com/gleeglor/amazeballs-cc/main/",
   "tree": {
     "cannon": {
@@ -11,6 +11,42 @@
       },
       "ammo.lua": {
         "label": "ammo - reload turtle"
+      }
+    },
+    "boat": {
+      "agent.lua": {
+        "label": "agent - websocket boot (recommended)",
+        "dest": "agent"
+      },
+      "boat.lua": {
+        "label": "boat - menu",
+        "dest": "boat"
+      },
+      "calibrate.lua": {
+        "label": "calibrate - thruster ID",
+        "dest": "calibrate"
+      },
+      "rendezvous.json": {
+        "label": "rendezvous - public wss URL",
+        "dest": "rendezvous.json"
+      },
+      "lib": {
+        "util.lua": { "dest": "lib/util.lua" },
+        "motors.lua": { "dest": "lib/motors.lua" },
+        "pose.lua": { "dest": "lib/pose.lua" },
+        "wrench.lua": { "dest": "lib/wrench.lua" },
+        "calibrate.lua": { "dest": "lib/calibrate.lua" },
+        "route.lua": { "dest": "lib/route.lua" },
+        "dock.lua": { "dest": "lib/dock.lua" },
+        "ui.lua": { "dest": "lib/ui.lua" },
+        "teleop.lua": { "dest": "lib/teleop.lua" },
+        "cruise.lua": { "dest": "lib/cruise.lua" }
+      },
+      "tests": {
+        "live_smoke.lua": {
+          "label": "live smoke tests",
+          "dest": "tests/live_smoke.lua"
+        }
       }
     }
   }

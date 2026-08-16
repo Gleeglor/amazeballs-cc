@@ -1,0 +1,12 @@
+{
+  "name": "amazeballs-cc-tools",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node test_host.mjs",
+    "agent": "node agent_host.mjs"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}
