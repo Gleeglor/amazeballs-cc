@@ -1,8 +1,8 @@
 /**
- * Pure port of soft-arrive / gentle cruise math from navigation/lib/drive.lua
+ * Pure port of soft-arrive / dumb cruise math from navigation/lib/drive.lua
  * (drive.stepToward + drive.followPath waypoint advance). No peripherals.
  *
- * Keep in sync with Lua when changing RPM caps, pulse band, or surge bias.
+ * Keep in sync with Lua when changing RPM caps or cruise yaw/surge rules.
  */
 
 function clamp(v, lo, hi) {
@@ -33,16 +33,24 @@ export const SOFT_NAV = {
   midRpmCap: 28,
   creepRpmCap: 18,
   pulseRpmCap: 10,
-  /** Max wrench fraction (0.78 ≈ 19 RPM on a 24-RPM boat; old 0.55 stalled). */
+  /** Max wrench fraction (0.78 ≈ 19 RPM on a 24-RPM boat). */
   authCeil: 0.78,
-  /** Pulse only in last N blocks beyond tol (was tol+18 → stall). */
+  /** Pulse only in dock/creep last N blocks beyond tol — never on cruise. */
   pulseBand: 4,
+  /** Look-ahead when current WP within softArrive + this. */
+  lookAheadExtra: 16,
+  yawOnlyDeg: 35,
+  yawDeadbandDeg: 12,
   shoreA: { x: 341, z: 163 },
   shoreB: { x: 383, z: 285 },
 };
 
+const YAW_ONLY_RAD = (SOFT_NAV.yawOnlyDeg * Math.PI) / 180;
+const YAW_DEAD_RAD = (SOFT_NAV.yawDeadbandDeg * Math.PI) / 180;
+
 /**
  * Authority fraction from soft RPM caps (mirrors drive.stepToward).
+ * Cruise never enters the soft-arrive pulse band.
  * @returns {{ auth: number, yawAuth: number, pulsing: boolean, arrived: boolean, motorsOffPulse: boolean }}
  */
 export function softAuthority({
@@ -78,42 +86,70 @@ export function softAuthority({
 
   let pulsing = false;
   let motorsOffPulse = false;
-  if (dist <= tol + SOFT_NAV.pulseBand) {
+  // Pulse only for dock/creep near hold — cruise stays continuous.
+  if ((mode === "dock" || mode === "creep") && dist <= tol + SOFT_NAV.pulseBand) {
     auth = Math.min(auth, rpmAuth(SOFT_NAV.pulseRpmCap));
     pulsing = true;
     const phase = ((Number(clock) % 1) + 1) % 1;
     if (phase > 0.55) motorsOffPulse = true;
   }
 
-  const yawAuth = Math.min(auth * 0.55, 0.2);
+  const yawAuth =
+    mode === "cruise"
+      ? Math.min(auth * 0.4, 0.16)
+      : Math.min(auth * 0.55, 0.2);
   return { auth, yawAuth, pulsing, arrived: false, motorsOffPulse };
 }
 
 /**
- * Cruise surge bias: keep forward progress while yawing (anti yaw-only spin).
- * errForward/errRight are craft-frame target errors.
+ * Dumb cruise: |bearing| > 35° → yaw only; 12–35° → fx=0.55 + small yaw;
+ * else fx=0.75, tz=0. Never reverse. fy unused.
  */
-export function cruiseSurgeBias({
+export function cruiseCommand({
   errForward = 0,
   errRight = 0,
-  dist = 0,
-  auth = 0.4,
-  pulsing = false,
+  auth = 0.78,
 } = {}) {
-  const bearing = Math.atan2(errRight, Math.max(0.01, errForward));
-  const distScale = clamp(dist / 90, 0.4, 1.0);
-  // Keep ≥55% surge while turning.
-  const turnKeep = clamp(1.0 - Math.abs(bearing) / 2.2, 0.55, 1.0);
-  let fwdCmd = Math.max(0.55 * distScale, distScale * 0.35) * turnKeep;
-  fwdCmd = clamp(fwdCmd * auth, -auth, auth);
+  const bearing = Math.atan2(errRight, errForward !== 0 ? errForward : 0.01);
+  const absB = Math.abs(bearing);
+  const gentleYaw = Math.min(auth * 0.35, 0.14);
+  const smallYaw = Math.min(auth * 0.22, 0.08);
+  const sgn = bearing >= 0 ? 1 : -1;
+  let fwdCmd = 0;
+  let yawCmd = 0;
+  let yawOnly = false;
 
-  // Floor forward when heading roughly toward target.
-  if (!pulsing && errForward > 2) {
-    const floor = auth * 0.5;
-    if (fwdCmd < floor) fwdCmd = floor;
+  if (absB > YAW_ONLY_RAD) {
+    yawOnly = true;
+    fwdCmd = 0;
+    yawCmd = sgn * gentleYaw;
+  } else if (absB > YAW_DEAD_RAD) {
+    fwdCmd = Math.min(0.55, auth);
+    yawCmd = sgn * smallYaw;
+  } else {
+    fwdCmd = Math.min(0.75, auth);
+    yawCmd = 0;
   }
+  fwdCmd = Math.max(0, fwdCmd);
+  return {
+    bearing,
+    fwdCmd,
+    yawCmd,
+    yawOnly,
+    yawAuth: gentleYaw,
+    aligned: absB <= YAW_DEAD_RAD,
+  };
+}
 
-  return { bearing, distScale, turnKeep, fwdCmd };
+/** @deprecated Use cruiseCommand — kept as thin alias for older imports. */
+export function cruiseSurgeBias(opts = {}) {
+  const r = cruiseCommand(opts);
+  return {
+    bearing: r.bearing,
+    distScale: 1,
+    turnKeep: r.yawOnly ? 0 : 1,
+    fwdCmd: r.fwdCmd,
+  };
 }
 
 /** Horiz distance in XZ. */
@@ -139,7 +175,7 @@ export function advanceWaypointIndex(waypoints, craft, startIndex = 0, arriveDis
 }
 
 /**
- * Look-ahead when current WP is within softArrive+8.
+ * Look-ahead when current WP is within softArrive+16.
  */
 export function followPathTarget(waypoints, craft, index, arriveDist = 20, engage = 22) {
   const soft = clampSoftArrive(arriveDist);
@@ -152,7 +188,7 @@ export function followPathTarget(waypoints, craft, index, arriveDist = 20, engag
     return { index: i, target: last, mode: "cruise", arrivedSoft: true, distLast };
   }
   let target = waypoints[Math.min(i, n - 1)];
-  if (i < n - 1 && horizDist(target, craft) <= soft + 8) {
+  if (i < n - 1 && horizDist(target, craft) <= soft + SOFT_NAV.lookAheadExtra) {
     target = waypoints[Math.min(i + 1, n - 1)];
   }
   if (distLast <= engage || i >= n - 1) {

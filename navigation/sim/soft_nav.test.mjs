@@ -1,5 +1,5 @@
 /**
- * Offline unit tests for soft-arrive / gentle cruise / water-hold routing.
+ * Offline unit tests for soft-arrive / dumb cruise / water-hold routing.
  * Mirrors navigation/lib/drive.lua + ports.lua invariants (no live boat).
  */
 import { describe, it } from "node:test";
@@ -12,7 +12,7 @@ import {
   clampSoftArrive,
   clampTolPos,
   softAuthority,
-  cruiseSurgeBias,
+  cruiseCommand,
   advanceWaypointIndex,
   followPathTarget,
   waterHold,
@@ -38,73 +38,76 @@ describe("soft arrive clamps", () => {
   });
 });
 
-describe("gentle authority / pulse band", () => {
+describe("gentle authority / no cruise pulse", () => {
   it("arrived within tol → zero auth", () => {
     const a = softAuthority({ dist: 19, tolPos: 20, maxRpm: 24 });
     assert.equal(a.arrived, true);
     assert.equal(a.auth, 0);
   });
 
-  it("cruise far out uses usable but capped auth (beats old ~13–14 RPM stall)", () => {
+  it("cruise far out uses usable but capped auth", () => {
     const a = softAuthority({ dist: 120, mode: "cruise", maxRpm: 24 });
     assert.equal(a.arrived, false);
-    // On 24-RPM boats need ≥~0.7 so surge ≈17–19 RPM can beat Create drag.
     assert.ok(a.auth >= 0.7, `auth=${a.auth}`);
     assert.ok(a.auth <= SOFT_NAV.authCeil + 1e-9, `auth=${a.auth}`);
-    assert.ok(a.yawAuth < a.auth, "yaw authority below surge");
-    assert.ok(a.yawAuth <= 0.2);
     assert.equal(a.pulsing, false);
   });
 
-  it("high-max motors still soft-cap near ~36 RPM equivalent", () => {
-    const a = softAuthority({ dist: 120, mode: "cruise", maxRpm: 96 });
-    assert.ok(Math.abs(a.auth - 36 / 96) < 1e-9, `auth=${a.auth}`);
+  it("cruise near tol never pulses (no 0.2s blips)", () => {
+    const a = softAuthority({
+      dist: 23,
+      mode: "cruise",
+      tolPos: 20,
+      maxRpm: 24,
+      clock: 0.7,
+    });
+    assert.equal(a.pulsing, false);
+    assert.equal(a.motorsOffPulse, false);
   });
 
-  it("mid/creep bands taper authority", () => {
-    const far = softAuthority({ dist: 100, maxRpm: 96 });
-    const mid = softAuthority({ dist: 50, maxRpm: 96 });
-    const near = softAuthority({ dist: 25, maxRpm: 96 });
-    assert.ok(far.auth > mid.auth, `far ${far.auth} vs mid ${mid.auth}`);
-    assert.ok(mid.auth >= near.auth, `mid ${mid.auth} vs near ${near.auth}`);
-  });
-
-  it("pulse band only last ~4 beyond tol (not tol+18 stall zone)", () => {
-    const at26 = softAuthority({ dist: 26, tolPos: 20, clock: 0.1 });
-    assert.equal(at26.pulsing, false, "26 blocks should still be continuous creep");
-    const at23 = softAuthority({ dist: 23, tolPos: 20, clock: 0.1 });
+  it("dock/creep may pulse only in last ~4 beyond tol", () => {
+    const at26 = softAuthority({ dist: 26, mode: "creep", tolPos: 20, clock: 0.1 });
+    assert.equal(at26.pulsing, false);
+    const at23 = softAuthority({ dist: 23, mode: "creep", tolPos: 20, clock: 0.1 });
     assert.equal(at23.pulsing, true);
-    const off = softAuthority({ dist: 23, tolPos: 20, clock: 0.7 });
+    const off = softAuthority({ dist: 23, mode: "dock", tolPos: 20, clock: 0.7 });
     assert.equal(off.motorsOffPulse, true);
-    const on = softAuthority({ dist: 23, tolPos: 20, clock: 0.2 });
-    assert.equal(on.motorsOffPulse, false);
   });
 });
 
-describe("cruise surge bias (anti yaw-only spin)", () => {
-  it("keeps ≥55% turnKeep and floors forward when pointed at target", () => {
-    const auth = 0.5;
-    const r = cruiseSurgeBias({
-      errForward: 40,
-      errRight: 10,
-      dist: 80,
-      auth,
-      pulsing: false,
-    });
-    assert.ok(r.turnKeep >= 0.55);
-    assert.ok(r.fwdCmd >= auth * 0.5, `fwdCmd=${r.fwdCmd} floor=${auth * 0.5}`);
+describe("dumb cruise rules (lock hunting fix)", () => {
+  const auth = 0.78;
+
+  it("aligned (|bearing|≤12°) → surge dominates, zero yaw, no reverse", () => {
+    const r = cruiseCommand({ errForward: 50, errRight: 2, auth });
+    assert.ok(r.aligned);
+    assert.ok(r.fwdCmd >= 0.74, `fwdCmd=${r.fwdCmd}`);
+    assert.equal(r.yawCmd, 0);
+    assert.ok(r.fwdCmd >= 0);
+    assert.equal(r.yawOnly, false);
   });
 
-  it("still thrusts when bearing is large (no zero-fx spin)", () => {
-    const r = cruiseSurgeBias({
-      errForward: 5,
-      errRight: 60,
-      dist: 70,
-      auth: 0.45,
-      pulsing: false,
-    });
-    assert.ok(r.fwdCmd > 0.1, `fwdCmd=${r.fwdCmd}`);
-    assert.ok(r.turnKeep >= 0.55);
+  it("large bearing (>35°) → yaw only, zero surge, no reverse", () => {
+    const r = cruiseCommand({ errForward: 5, errRight: 60, auth });
+    assert.equal(r.yawOnly, true);
+    assert.equal(r.fwdCmd, 0);
+    assert.ok(r.yawCmd > 0, `yawCmd=${r.yawCmd}`);
+    assert.ok(r.fwdCmd >= 0);
+  });
+
+  it("past waypoint (negative forward) never reverses — yaw only", () => {
+    const r = cruiseCommand({ errForward: -40, errRight: 5, auth });
+    assert.ok(r.fwdCmd >= 0, `fwdCmd=${r.fwdCmd}`);
+    assert.equal(r.fwdCmd, 0);
+    assert.equal(r.yawOnly, true);
+  });
+
+  it("mid bearing (12–35°) → soft surge 0.55 + small yaw", () => {
+    // atan2(20, 50) ≈ 21.8°
+    const r = cruiseCommand({ errForward: 50, errRight: 20, auth });
+    assert.equal(r.yawOnly, false);
+    assert.ok(Math.abs(r.fwdCmd - 0.55) < 1e-9, `fwdCmd=${r.fwdCmd}`);
+    assert.ok(r.yawCmd > 0 && r.yawCmd < 0.15, `yawCmd=${r.yawCmd}`);
   });
 });
 
@@ -116,7 +119,7 @@ describe("followPath waypoint soft advance", () => {
     { x: 80, z: 0 },
   ];
 
-  it("skips waypoints already inside soft arrive", () => {
+  it("skips waypoints already inside soft arrive (≤20)", () => {
     const i = advanceWaypointIndex(wps, { x: 5, z: 0 }, 0, 20);
     assert.equal(i, 2, `expected skip past 0 and 10, got ${i}`);
   });
@@ -140,7 +143,6 @@ describe("water holds never seek shore", () => {
     assert.ok(
       Math.abs(horizDist(portA, SOFT_NAV.shoreA) - SOFT_NAV.waterStandoff) < 0.5,
     );
-    // Soft arrive of hold must not reach shore landmark.
     assert.ok(horizDist(portA, SOFT_NAV.shoreA) > SOFT_NAV.softArrive);
     assert.ok(horizDist(portB, SOFT_NAV.shoreB) > SOFT_NAV.softArrive);
   });
@@ -180,7 +182,6 @@ describe("waterHold helper matches ports.lua geometry", () => {
   it("A hold toward B / B hold toward A", () => {
     const a = waterHold(SOFT_NAV.shoreA, SOFT_NAV.shoreB, 28);
     const b = waterHold(SOFT_NAV.shoreB, SOFT_NAV.shoreA, 28);
-    // Mid-corridor between shores is closer to both holds than shores are to each other.
     const mid = {
       x: (SOFT_NAV.shoreA.x + SOFT_NAV.shoreB.x) / 2,
       z: (SOFT_NAV.shoreA.z + SOFT_NAV.shoreB.z) / 2,
