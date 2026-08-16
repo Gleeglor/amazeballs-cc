@@ -142,18 +142,63 @@ local function handleRpc(ws, msg)
             reply(ws, id, false, nil, tostring(res or "calibrate failed"))
         end
     elseif method == "go" then
-        local cruise = require("cruise")
+        local place = params.place
+        -- Reply immediately so the websocket is not held open with no traffic.
+        reply(ws, id, true, { started = true, place = place })
+        local cruise = _require("cruise")
         ui.setMode("route")
-        local ok, res = pcall(function()
-            return cruise.goPlace(params.place)
+        local finished = false
+        parallel.waitForAny(function()
+            local ok, res = pcall(function()
+                return cruise.goPlace(place)
+            end)
+            finished = true
+            motors.panicNow()
+            motors.flush(64)
+            ui.setMode("agent")
+            send(ws, {
+                type = "event",
+                name = "go_done",
+                place = place,
+                ok = ok and res and true or false,
+                result = res,
+                error = (not ok) and tostring(res) or nil,
+            })
+        end, function()
+            local hb = os.startTimer(1.5)
+            while not finished do
+                local e, a, b = os.pullEventRaw()
+                if e == "timer" and a == hb then
+                    send(ws, {
+                        type = "heartbeat",
+                        t = util.now(),
+                        pose = getPoseSnapshot(),
+                        mode = "route",
+                        place = place,
+                    })
+                    hb = os.startTimer(1.5)
+                elseif e == "websocket_message" then
+                    local raw = b or a
+                    if type(raw) == "string" then
+                        local ok, msg = pcall(textutils.unserialiseJSON, raw)
+                        if ok and type(msg) == "table" and (msg.method == "stop" or (msg.type == "rpc" and msg.method == "stop")) then
+                            motors.panicNow()
+                            motors.flush(64)
+                            if msg.id then
+                                reply(ws, msg.id, true, { stopped = true })
+                            end
+                            error("go stopped", 0)
+                        end
+                    end
+                elseif e == "websocket_closed" then
+                    motors.panicNow()
+                    return
+                elseif e == "terminate" then
+                    error("Terminated", 0)
+                end
+            end
         end)
-        motors.panic(3)
-        ui.setMode("idle")
-        if ok and res then
-            reply(ws, id, true, { arrived = true })
-        else
-            reply(ws, id, false, nil, tostring(res or "go failed"))
-        end
+        return
     elseif method == "run_tests" then
         local suite = params.suite or "all"
         local results = {}

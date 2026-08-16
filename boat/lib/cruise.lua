@@ -33,6 +33,8 @@ function cruise.followPath(path, opts)
     local map = route.loadMap()
     local stuck = 0
     local i = 1
+    local control = calibrate.load()
+    local surgeSign = (control and tonumber(control.surge_sign)) or 1
     ui.setMode("route")
     while i <= #path do
         local wp = path[i]
@@ -58,12 +60,12 @@ function cruise.followPath(path, opts)
                 local yawCmd = util.clamp(eYaw * 1.4, -1, 1)
                 local surge = 0
                 if math.abs(eYaw) < 0.6 then
-                    surge = util.clamp(0.35 + dist * 0.02, 0.2, 0.85)
+                    surge = util.clamp(0.35 + dist * 0.02, 0.2, 0.85) * surgeSign
                 end
                 applyAxes(surge, 0, yawCmd)
                 local spd = select(1, pose.speed(craft))
                 local remapped
-                remapped, stuck = route.observeCollision(map, craft, surge, spd, stuck, 10)
+                remapped, stuck = route.observeCollision(map, craft, math.abs(surge), spd, stuck, 10)
                 if remapped then
                     local newPath, err = route.astar(map, craft.x, craft.z, path[#path].x, path[#path].z)
                     if newPath then
@@ -87,7 +89,8 @@ function cruise.followPath(path, opts)
         motors.flush(8)
         sleep(0.1)
     end
-    motors.panic(3)
+    motors.panicNow()
+    motors.flush(64)
     return true
 end
 
@@ -106,16 +109,18 @@ function cruise.goPlace(placeName)
     if p and p.dock then
         ui.setMode("dock")
         local state = "approach"
-        for _ = 1, 600 do
+        for _ = 1, 200 do
             state = dock.step(p, state)
             if state == "locked" then
                 break
             end
             sleep(0.1)
         end
+        motors.panicNow()
+        motors.flush(64)
         return state == "locked", state
     end
-    return true
+    return true, "arrived"
 end
 
 return cruise
