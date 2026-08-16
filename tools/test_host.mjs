@@ -334,7 +334,7 @@ function test_agent() {
 
 // --- teleop event model (mirrors boat/lib/teleop.lua) ---
 const KEYS = { w: 17, s: 31, a: 30, d: 32, x: 45, q: 16 };
-const HOLD_TIMEOUT = 0.22;
+const HOLD_TIMEOUT = 1.0; // must exceed OS key-repeat initial delay
 
 function commandFromHeld(held, yawSign = -1) {
   let surge = 0,
@@ -348,10 +348,15 @@ function commandFromHeld(held, yawSign = -1) {
   return { surge, strafe, yaw };
 }
 
+function sameAxes(a, b) {
+  return a.surge === b.surge && a.strafe === b.strafe && a.yaw === b.yaw;
+}
+
 function simulateTeleop(events) {
   const held = {};
   const seen = {};
   const applies = [];
+  let lastCmd = { surge: 0, strafe: 0, yaw: 0 };
   let t = 0;
   let listenOnly = false; // old bug: only accept keys in post-draw window
   function expire() {
@@ -365,8 +370,12 @@ function simulateTeleop(events) {
     }
     return changed;
   }
-  function apply() {
-    applies.push({ ...commandFromHeld(held), held: { ...held }, t });
+  function syncDesired() {
+    const cmd = commandFromHeld(held);
+    if (sameAxes(cmd, lastCmd)) return false;
+    lastCmd = { ...cmd };
+    applies.push({ ...cmd, held: { ...held }, t });
+    return true;
   }
   for (const ev of events) {
     t = ev.t ?? t;
@@ -384,16 +393,22 @@ function simulateTeleop(events) {
     if (ev.type === "key") {
       held[ev.key] = true;
       seen[ev.key] = t;
-      apply();
+      if (ev.isRepeat) {
+        // keepalive only when axes unchanged
+        const cmd = commandFromHeld(held);
+        if (!sameAxes(cmd, lastCmd)) syncDesired();
+      } else {
+        syncDesired();
+      }
     } else if (ev.type === "key_up") {
       delete held[ev.key];
       delete seen[ev.key];
-      apply();
+      syncDesired();
     } else if (ev.type === "tick") {
-      if (expire()) apply();
+      if (expire()) syncDesired();
     }
   }
-  return { held, applies };
+  return { held, applies, lastCmd };
 }
 
 function test_teleop_held() {
@@ -426,13 +441,45 @@ function test_teleop_release() {
 }
 
 function test_teleop_missed_keyup() {
-  const r = simulateTeleop([
+  // Must exceed HOLD_TIMEOUT (1.0s); 0.25s must NOT clear (that was the stutter bug)
+  const early = simulateTeleop([
     { type: "key", key: KEYS.w, t: 0 },
     { type: "tick", t: 0.25 },
+  ]);
+  assert.equal(early.held[KEYS.w], true, "0.25s must not expire hold");
+
+  const r = simulateTeleop([
+    { type: "key", key: KEYS.w, t: 0 },
+    { type: "tick", t: 1.05 },
   ]);
   assert.equal(r.held[KEYS.w], undefined);
   assert.equal(r.applies.at(-1).surge, 0);
   console.log("  test_teleop_missed_keyup OK");
+}
+
+function test_teleop_hold_survives_os_delay() {
+  const r = simulateTeleop([
+    { type: "key", key: KEYS.w, t: 0 },
+    { type: "tick", t: 0.4 },
+    { type: "tick", t: 0.5 },
+  ]);
+  assert.equal(r.held[KEYS.w], true);
+  assert.equal(r.lastCmd.surge, 1);
+  assert.equal(r.applies.length, 1, "no re-apply while held through OS delay");
+  console.log("  test_teleop_hold_survives_os_delay OK");
+}
+
+function test_teleop_repeat_keepalive() {
+  const r = simulateTeleop([
+    { type: "key", key: KEYS.w, t: 0 },
+    { type: "key", key: KEYS.w, t: 0.5, isRepeat: true },
+    { type: "key", key: KEYS.w, t: 0.55, isRepeat: true },
+    { type: "tick", t: 0.6 },
+  ]);
+  assert.equal(r.held[KEYS.w], true);
+  assert.equal(r.applies.length, 1, "repeats must not invent extra applies");
+  assert.equal(r.lastCmd.surge, 1);
+  console.log("  test_teleop_repeat_keepalive OK");
 }
 
 function test_teleop_yaw_sign() {
@@ -591,6 +638,8 @@ test_agent();
 test_teleop_held();
 test_teleop_release();
 test_teleop_missed_keyup();
+test_teleop_hold_survives_os_delay();
+test_teleop_repeat_keepalive();
 test_teleop_yaw_sign();
 test_pose_quat();
 test_motors_write();

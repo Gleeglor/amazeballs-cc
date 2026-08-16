@@ -1,4 +1,5 @@
--- Held-key teleop: apply on key / key_up immediately (not after a listen window).
+-- Held-key teleop: sticky holds until key_up (or long safety timeout).
+-- Desired RPM updates on real axis change; flush + HUD only on the tick timer.
 local util = require("util")
 local motors = require("motors")
 local wrench = require("wrench")
@@ -8,7 +9,8 @@ local ui = require("ui")
 
 local teleop = {}
 
-teleop.HOLD_TIMEOUT = 0.22 -- lost key_up → release
+-- Longer than OS/Minecraft initial key-repeat delay (~0.4–0.5s).
+teleop.HOLD_TIMEOUT = 1.0 -- lost key_up → release
 teleop.TICK = 0.05
 
 local MOVE = {
@@ -70,7 +72,8 @@ function teleop.commandFromHeld(held, yawSign)
     return util.clamp(surge, -1, 1), util.clamp(strafe, -1, 1), util.clamp(yaw, -1, 1)
 end
 
-function teleop.apply(surge, strafe, yaw, thrusters)
+--- Set desired RPM from axes only (no flush / no HUD).
+function teleop.setCommand(surge, strafe, yaw, thrusters)
     local thrByName = {}
     for _, t in ipairs(thrusters) do
         thrByName[t.name] = t
@@ -78,7 +81,6 @@ function teleop.apply(surge, strafe, yaw, thrusters)
     end
     local duties = wrench.fromAxes(thrusters, surge, strafe, yaw)
     local byName = wrench.dutiesByName(thrusters, duties)
-    -- Idle: zero every thruster; else only set from map (applyDuties zeros missing names)
     if math.abs(surge) + math.abs(strafe) + math.abs(yaw) < 1e-6 then
         for name in pairs(thrByName) do
             motors.setDesired(name, 0)
@@ -86,6 +88,12 @@ function teleop.apply(surge, strafe, yaw, thrusters)
     else
         motors.applyDuties(byName, thrByName)
     end
+    return byName
+end
+
+--- Back-compat: set desired then flush once.
+function teleop.apply(surge, strafe, yaw, thrusters)
+    local byName = teleop.setCommand(surge, strafe, yaw, thrusters)
     motors.flush(24)
     return byName
 end
@@ -116,6 +124,10 @@ local function expireHolds(held, seen, t)
     return changed
 end
 
+local function sameAxes(a, b)
+    return a[1] == b[1] and a[2] == b[2] and a[3] == b[3]
+end
+
 function teleop.run()
     local thrusters, control, err = loadThrusters()
     if not thrusters then
@@ -129,6 +141,7 @@ function teleop.run()
     local held = {}
     local seen = {}
     local duties = {}
+    local lastAxes = { 0, 0, 0 }
     print("Teleop: W/S A/D Z/C  X stop  Q quit")
 
     local function redraw()
@@ -163,14 +176,22 @@ function teleop.run()
         })
     end
 
-    local function doApply()
+    --- Update desired RPM if axes changed. Returns true if command changed.
+    local function syncDesired()
         local surge, strafe, yaw = teleop.commandFromHeld(held, yawSign)
-        duties = teleop.apply(surge, strafe, yaw, thrusters)
-        redraw()
+        local axes = { surge, strafe, yaw }
+        if sameAxes(axes, lastAxes) then
+            return false
+        end
+        lastAxes = axes
+        duties = teleop.setCommand(surge, strafe, yaw, thrusters)
+        return true
     end
 
     local tick = os.startTimer(teleop.TICK)
-    doApply()
+    syncDesired()
+    motors.flush(24)
+    redraw()
 
     while true do
         local e, a, b = os.pullEvent()
@@ -184,30 +205,41 @@ function teleop.run()
             elseif key == keys.x and not isRepeat then
                 held = {}
                 seen = {}
+                lastAxes = { 999, 999, 999 } -- force sync
                 motors.panicNow()
                 motors.flush(64)
                 duties = {}
-                doApply()
+                syncDesired()
+                redraw()
             elseif MOVE[key] then
                 held[key] = true
                 seen[key] = t
-                doApply()
+                -- key_repeat with unchanged axes: keepalive only (no setDesired storm)
+                if isRepeat then
+                    local surge, strafe, yaw = teleop.commandFromHeld(held, yawSign)
+                    if sameAxes({ surge, strafe, yaw }, lastAxes) then
+                        -- seen refreshed above; wait for tick flush/redraw
+                    else
+                        syncDesired()
+                    end
+                else
+                    syncDesired()
+                end
             end
         elseif e == "key_up" then
             local key = a
             if MOVE[key] then
                 held[key] = nil
                 seen[key] = nil
-                doApply()
+                syncDesired()
             end
         elseif e == "timer" and a == tick then
             local expired = expireHolds(held, seen, t)
             if expired then
-                doApply()
-            else
-                motors.flush(16)
-                redraw()
+                syncDesired()
             end
+            motors.flush(16)
+            redraw()
             tick = os.startTimer(teleop.TICK)
         end
     end
