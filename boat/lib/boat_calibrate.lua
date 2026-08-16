@@ -179,6 +179,7 @@ function calibrate.run(opts)
     local control = {
         version = 2,
         max_rpm = motors.MAX_RPM,
+        yaw_sign = -1, -- A = turn port; flip to 1 in /boat_control.json if still inverted after recalib
         thrusters = thrusters,
         unused = unused,
         calibrated_at = tostring(os.epoch and os.epoch("utc") or os.clock()),

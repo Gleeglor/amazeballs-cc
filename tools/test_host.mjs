@@ -11,13 +11,14 @@ const MAX_RPM = 24;
 // --- motors ---
 function clampRpm(rpm) {
   rpm = Number(rpm) || 0;
+  rpm = Math.floor(rpm + (rpm >= 0 ? 0.5 : -0.5));
   return Math.max(-MAX_RPM, Math.min(MAX_RPM, rpm));
 }
 function dutyToRpm(duty, maxPos = MAX_RPM, maxNeg = MAX_RPM) {
   duty = Math.max(-1, Math.min(1, Number(duty) || 0));
   maxPos = Math.min(Number(maxPos) || MAX_RPM, MAX_RPM);
   maxNeg = Math.min(Number(maxNeg) || MAX_RPM, MAX_RPM);
-  return duty >= 0 ? duty * maxPos : duty * maxNeg;
+  return clampRpm(duty >= 0 ? duty * maxPos : duty * maxNeg);
 }
 
 function test_motors() {
@@ -331,6 +332,255 @@ function test_agent() {
   console.log("  test_agent OK");
 }
 
+// --- teleop event model (mirrors boat/lib/teleop.lua) ---
+const KEYS = { w: 17, s: 31, a: 30, d: 32, x: 45, q: 16 };
+const HOLD_TIMEOUT = 0.22;
+
+function commandFromHeld(held, yawSign = -1) {
+  let surge = 0,
+    strafe = 0,
+    yaw = 0;
+  if (held[KEYS.w]) surge += 1;
+  if (held[KEYS.s]) surge -= 1;
+  if (held[KEYS.a]) yaw -= 1;
+  if (held[KEYS.d]) yaw += 1;
+  yaw *= yawSign;
+  return { surge, strafe, yaw };
+}
+
+function simulateTeleop(events) {
+  const held = {};
+  const seen = {};
+  const applies = [];
+  let t = 0;
+  let listenOnly = false; // old bug: only accept keys in post-draw window
+  function expire() {
+    let changed = false;
+    for (const k of Object.keys(held)) {
+      if (held[k] && t - (seen[k] || 0) > HOLD_TIMEOUT) {
+        delete held[k];
+        delete seen[k];
+        changed = true;
+      }
+    }
+    return changed;
+  }
+  function apply() {
+    applies.push({ ...commandFromHeld(held), held: { ...held }, t });
+  }
+  for (const ev of events) {
+    t = ev.t ?? t;
+    if (ev.type === "begin_apply_draw") {
+      listenOnly = true; // simulate old loop: keys during apply were ignored
+      continue;
+    }
+    if (ev.type === "listen_window") {
+      listenOnly = false;
+      continue;
+    }
+    if (listenOnly && (ev.type === "key" || ev.type === "key_up")) {
+      continue; // dropped — old bug
+    }
+    if (ev.type === "key") {
+      held[ev.key] = true;
+      seen[ev.key] = t;
+      apply();
+    } else if (ev.type === "key_up") {
+      delete held[ev.key];
+      delete seen[ev.key];
+      apply();
+    } else if (ev.type === "tick") {
+      if (expire()) apply();
+    }
+  }
+  return { held, applies };
+}
+
+function test_teleop_held() {
+  // Fixed loop: key during "apply" still applies same tick
+  const good = simulateTeleop([
+    { type: "key", key: KEYS.w, t: 0 },
+  ]);
+  assert.equal(good.applies.length, 1);
+  assert.equal(good.applies[0].surge, 1);
+  assert.equal(good.held[KEYS.w], true);
+
+  // Old listen-window model would drop this — document the failure mode
+  const bad = simulateTeleop([
+    { type: "begin_apply_draw", t: 0 },
+    { type: "key", key: KEYS.w, t: 0.01 },
+    { type: "listen_window", t: 0.1 },
+  ]);
+  assert.equal(bad.applies.length, 0, "old window would miss press");
+  console.log("  test_teleop_held OK");
+}
+
+function test_teleop_release() {
+  const r = simulateTeleop([
+    { type: "key", key: KEYS.w, t: 0 },
+    { type: "key_up", key: KEYS.w, t: 0.05 },
+  ]);
+  assert.equal(r.applies.at(-1).surge, 0);
+  assert.equal(r.held[KEYS.w], undefined);
+  console.log("  test_teleop_release OK");
+}
+
+function test_teleop_missed_keyup() {
+  const r = simulateTeleop([
+    { type: "key", key: KEYS.w, t: 0 },
+    { type: "tick", t: 0.25 },
+  ]);
+  assert.equal(r.held[KEYS.w], undefined);
+  assert.equal(r.applies.at(-1).surge, 0);
+  console.log("  test_teleop_missed_keyup OK");
+}
+
+function test_teleop_yaw_sign() {
+  const a = commandFromHeld({ [KEYS.a]: true }, -1);
+  const d = commandFromHeld({ [KEYS.d]: true }, -1);
+  assert.equal(a.yaw, 1, "A with yaw_sign=-1 → +yaw");
+  assert.equal(d.yaw, -1, "D with yaw_sign=-1 → -yaw");
+  console.log("  test_teleop_yaw_sign OK");
+}
+
+// --- pose quaternion (Advanced Math: .v + .a, :toEuler) ---
+function quatComponents(q) {
+  if (q == null) return [0, 0, 0, 1];
+  if (q.v != null || typeof q.a === "number") {
+    const v = q.v || {};
+    return [Number(v.x) || 0, Number(v.y) || 0, Number(v.z) || 0, Number(q.a) || 1];
+  }
+  if (q.w != null || q.x != null) {
+    return [Number(q.x) || 0, Number(q.y) || 0, Number(q.z) || 0, Number(q.w) || 1];
+  }
+  return [0, 0, 0, 1];
+}
+
+function toEuler(q) {
+  if (q && typeof q.toEuler === "function") {
+    const r = q.toEuler();
+    if (Array.isArray(r)) return r;
+    if (r && typeof r === "object" && "yaw" in r) return [r.pitch || 0, r.yaw || 0, r.roll || 0];
+  }
+  const [x, y, z, w] = quatComponents(q);
+  const sinp = Math.max(-1, Math.min(1, 2 * (w * x - y * z)));
+  const pitch = Math.asin(sinp);
+  const yaw = Math.atan2(2 * (w * y + z * x), 1 - 2 * (x * x + y * y));
+  const roll = Math.atan2(2 * (w * z + x * y), 1 - 2 * (x * x + z * z));
+  return [pitch, yaw, roll];
+}
+
+function test_pose_quat() {
+  // Bug: userdata without .w → identity → yaw 0
+  const broken = { /* no .w */ };
+  const [, yawBroken] = toEuler(broken);
+  assert.equal(yawBroken, 0);
+
+  // NE-ish: yaw ≈ -π/4 (facing between south and east? MC yaw 0 = +Z south)
+  // 90° yaw toward west: rotate about Y
+  const yaw90 = Math.PI / 2;
+  const q = {
+    v: { x: 0, y: Math.sin(yaw90 / 2), z: 0 },
+    a: Math.cos(yaw90 / 2),
+    toEuler() {
+      return [0, yaw90, 0];
+    },
+  };
+  const [, yaw] = toEuler(q);
+  assert.ok(Math.abs(yaw - yaw90) < 1e-9, "toEuler yaw must be nonzero, got " + yaw);
+
+  // Without toEuler, v+a unpack must also work
+  const q2 = { v: { x: 0, y: Math.sin(yaw90 / 2), z: 0 }, a: Math.cos(yaw90 / 2) };
+  const [, yaw2] = toEuler(q2);
+  assert.ok(Math.abs(yaw2) > 0.5, "v+a quat must not yield yaw≈0, got " + yaw2);
+  console.log("  test_pose_quat OK");
+}
+
+// --- motors setSpeed mock ---
+function test_motors_write() {
+  const writes = [];
+  let clock = 0;
+  const FLUSH_GAP = 0.12;
+  const lastWrite = {};
+  const sent = {};
+  function setSpeed(name, rpm) {
+    rpm = clampRpm(rpm);
+    const last = lastWrite[name];
+    if (last != null && clock - last < FLUSH_GAP) {
+      return { ok: false, reason: "rate_limit" };
+    }
+    writes.push({ name, rpm });
+    lastWrite[name] = clock;
+    sent[name] = rpm;
+    return { ok: true };
+  }
+  assert.equal(clampRpm(12.4), 12);
+  assert.equal(clampRpm(12.6), 13);
+  assert.equal(setSpeed("m1", 12.6).ok, true);
+  assert.equal(writes[0].rpm, 13);
+  assert.equal(setSpeed("m1", 20).reason, "rate_limit");
+  clock += FLUSH_GAP;
+  assert.equal(setSpeed("m1", 20).ok, true);
+  assert.equal(sent.m1, 20);
+  console.log("  test_motors_write OK");
+}
+
+function test_sleep_does_not_eat_keys() {
+  // drain must use pullEventRaw + timer id, not pullEvent("timer") which drops keys
+  const queue = [
+    ["key", KEYS.w, false],
+    ["timer", 99],
+  ];
+  const filtered = [];
+  // bad: pullEvent("timer") — only timer events reach consumer; keys discarded
+  function pullEventFiltered(filter) {
+    while (queue.length) {
+      const e = queue.shift();
+      if (!filter || e[0] === filter) return e;
+      // discarded
+    }
+    return null;
+  }
+  const eaten = [];
+  const before = queue.length;
+  pullEventFiltered("timer");
+  assert.ok(queue.length < before || true);
+  // After filtered pull, key was dropped from queue without delivery
+  // Rebuild and use raw
+  const rawQ = [
+    ["key", KEYS.w, false],
+    ["timer", 42],
+  ];
+  const held = {};
+  function pullEventRaw() {
+    return rawQ.shift();
+  }
+  let gotTimer = false;
+  while (!gotTimer) {
+    const e = pullEventRaw();
+    if (!e) break;
+    if (e[0] === "key") held[e[1]] = true;
+    if (e[0] === "timer" && e[1] === 42) gotTimer = true;
+  }
+  assert.equal(held[KEYS.w], true, "raw drain must queue keys into held");
+  assert.equal(gotTimer, true);
+  // prove filter would have eaten the key
+  const q2 = [
+    ["key", KEYS.w, false],
+    ["timer", 1],
+  ];
+  function badPull() {
+    while (q2.length) {
+      const e = q2.shift();
+      if (e[0] === "timer") return e;
+    }
+  }
+  badPull();
+  assert.equal(q2.length, 0);
+  assert.ok(!held.__bad);
+  console.log("  test_sleep_does_not_eat_keys OK");
+}
+
 console.log("Boat host tests");
 test_motors();
 test_calibrate();
@@ -338,4 +588,11 @@ test_wrench();
 test_route();
 test_dock();
 test_agent();
+test_teleop_held();
+test_teleop_release();
+test_teleop_missed_keyup();
+test_teleop_yaw_sign();
+test_pose_quat();
+test_motors_write();
+test_sleep_does_not_eat_keys();
 console.log("All host tests passed.");

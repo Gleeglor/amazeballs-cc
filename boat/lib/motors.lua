@@ -10,6 +10,7 @@ motors.FLUSH_GAP = 0.12 -- seconds between writes to the same motor
 local desired = {} -- name -> rpm
 local sent = {} -- name -> last successful rpm
 local lastWrite = {} -- name -> clock time
+local lastError = {} -- name -> string
 local known = {} -- name -> true
 local clockFn = util.now
 local sleepFn = sleep
@@ -54,11 +55,15 @@ function motors.resetState()
     desired = {}
     sent = {}
     lastWrite = {}
+    lastError = {}
     known = {}
 end
 
 function motors.clampRpm(rpm)
-    return util.clamp(tonumber(rpm) or 0, -motors.MAX_RPM, motors.MAX_RPM)
+    rpm = tonumber(rpm) or 0
+    -- integer RPM for CCA
+    rpm = math.floor(rpm + (rpm >= 0 and 0.5 or -0.5))
+    return util.clamp(rpm, -motors.MAX_RPM, motors.MAX_RPM)
 end
 
 function motors.dutyToRpm(duty, maxPos, maxNeg)
@@ -66,9 +71,9 @@ function motors.dutyToRpm(duty, maxPos, maxNeg)
     maxPos = math.min(tonumber(maxPos) or motors.MAX_RPM, motors.MAX_RPM)
     maxNeg = math.min(tonumber(maxNeg) or motors.MAX_RPM, motors.MAX_RPM)
     if duty >= 0 then
-        return duty * maxPos
+        return motors.clampRpm(duty * maxPos)
     end
-    return duty * maxNeg
+    return motors.clampRpm(duty * maxNeg)
 end
 
 function motors.discover()
@@ -118,6 +123,40 @@ function motors.getSent(name)
     return sent[name]
 end
 
+function motors.getLastError(name)
+    return lastError[name]
+end
+
+function motors.getSentMap()
+    local out = {}
+    for name, rpm in pairs(sent) do
+        out[name] = rpm
+    end
+    return out
+end
+
+function motors.getDesiredMap()
+    local out = {}
+    for name, rpm in pairs(desired) do
+        out[name] = rpm
+    end
+    return out
+end
+
+function motors.readActualSpeed(name)
+    local m = wrapMotor(name)
+    if not m or not m.getSpeed then
+        return nil
+    end
+    local ok, s = pcall(function()
+        return m.getSpeed()
+    end)
+    if ok and type(s) == "number" then
+        return s
+    end
+    return nil
+end
+
 local function isRateLimitErr(err)
     return tostring(err):lower():find("too many", 1, true) ~= nil
 end
@@ -125,6 +164,7 @@ end
 local function tryWrite(name, rpm)
     local m = wrapMotor(name)
     if not m then
+        lastError[name] = "missing"
         return false, "missing"
     end
     rpm = motors.clampRpm(rpm)
@@ -135,12 +175,15 @@ local function tryWrite(name, rpm)
     if math.abs(rpm) < 1 then
         if sent[name] ~= nil and math.abs(sent[name] or 0) < 1 and gapOk then
             sent[name] = 0
+            lastError[name] = nil
             return true, "already_zero"
         end
         if not gapOk and sent[name] ~= nil and math.abs(sent[name] or 0) < 1 then
+            lastError[name] = nil
             return true, "already_zero"
         end
         if not gapOk then
+            lastError[name] = "rate_limit"
             return false, "rate_limit"
         end
         local wrote = false
@@ -151,6 +194,7 @@ local function tryWrite(name, rpm)
             if ok then
                 wrote = true
             elseif isRateLimitErr(err) then
+                lastError[name] = "rate_limit"
                 return false, "rate_limit"
             end
         end
@@ -161,8 +205,10 @@ local function tryWrite(name, rpm)
             if ok then
                 wrote = true
             elseif isRateLimitErr(err) then
+                lastError[name] = "rate_limit"
                 return false, "rate_limit"
             elseif not wrote then
+                lastError[name] = tostring(err)
                 return false, tostring(err)
             end
         elseif m.setRPM then
@@ -172,19 +218,24 @@ local function tryWrite(name, rpm)
             if ok then
                 wrote = true
             elseif isRateLimitErr(err) then
+                lastError[name] = "rate_limit"
                 return false, "rate_limit"
             elseif not wrote then
+                lastError[name] = tostring(err)
                 return false, tostring(err)
             end
         elseif not wrote then
+            lastError[name] = "no setSpeed"
             return false, "no setSpeed"
         end
         lastWrite[name] = now()
         sent[name] = 0
+        lastError[name] = nil
         return true
     end
 
     if not gapOk then
+        lastError[name] = "rate_limit"
         return false, "rate_limit"
     end
 
@@ -198,16 +249,20 @@ local function tryWrite(name, rpm)
             m.setRPM(rpm)
         end)
     else
+        lastError[name] = "no setSpeed"
         return false, "no setSpeed"
     end
     if not ok then
         if isRateLimitErr(err) then
+            lastError[name] = "rate_limit"
             return false, "rate_limit"
         end
+        lastError[name] = tostring(err)
         return false, tostring(err)
     end
     lastWrite[name] = now()
     sent[name] = rpm
+    lastError[name] = nil
     return true
 end
 
@@ -259,8 +314,9 @@ function motors.flush(maxWrites)
     return pending
 end
 
---- Drain until all desired match sent, sleeping between attempts.
-function motors.drain(timeout)
+--- Drain without sleep() — wait via timer + pullEventRaw so keys are not discarded.
+-- onEvent(e, ...) may return true to abort early.
+function motors.drain(timeout, onEvent)
     timeout = timeout or 5
     local start = now()
     while true do
@@ -271,18 +327,30 @@ function motors.drain(timeout)
         if now() - start > timeout then
             return false, pending
         end
-        doSleep(motors.FLUSH_GAP)
+        local timer = os.startTimer(motors.FLUSH_GAP)
+        while true do
+            local e = { os.pullEventRaw() }
+            local ev = e[1]
+            if onEvent and onEvent(table.unpack(e)) then
+                return false, "aborted"
+            end
+            if ev == "timer" and e[2] == timer then
+                break
+            elseif ev == "terminate" then
+                error("Terminated", 0)
+            end
+        end
     end
 end
 
-function motors.panic(timeout)
+--- Zero all motors; flush once (no blocking sleep). Call flush/drain from caller.
+function motors.panicNow()
     for name in pairs(known) do
         desired[name] = 0
     end
     for name in pairs(desired) do
         desired[name] = 0
     end
-    -- Also discover live motors
     local ok, list = pcall(motors.discover)
     if ok then
         for _, name in ipairs(list) do
@@ -290,15 +358,28 @@ function motors.panic(timeout)
             known[name] = true
         end
     end
-    return motors.drain(timeout or 5)
+    return motors.flush(64)
+end
+
+function motors.panic(timeout, onEvent)
+    motors.panicNow()
+    return motors.drain(timeout or 5, onEvent)
 end
 
 function motors.allOff()
     return motors.panic(5)
 end
 
---- Apply duty map { name = duty } using optional thruster max tables.
+--- Apply duty map { name = duty }. Zeros thrusters in thrustersByName not in duties.
 function motors.applyDuties(duties, thrustersByName)
+    duties = duties or {}
+    if thrustersByName then
+        for name in pairs(thrustersByName) do
+            if duties[name] == nil then
+                motors.setDesired(name, 0)
+            end
+        end
+    end
     for name, duty in pairs(duties) do
         local maxPos, maxNeg = motors.MAX_RPM, motors.MAX_RPM
         if thrustersByName and thrustersByName[name] then
