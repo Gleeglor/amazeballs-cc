@@ -19,6 +19,8 @@ Until a boat computer is open (chunk loaded) and `test_agent` is running, the ho
 Grapple/Sable log recently saw a craft near **~(431, 7.5, 74)** — dock is **(340, 165)** (~120 m away once control works).
 
 ## What was finished (pushed / ready)
+**Commit:** `4038e91` on `amazeballs-cc` `main` (includes bridge + yaw side fix).
+
 | Piece | Path |
 |-------|------|
 | On-computer agent | `navigation/test_agent.lua` |
