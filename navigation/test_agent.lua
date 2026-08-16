@@ -147,6 +147,35 @@ local function samplePose()
     }
 end
 
+local function dutiesList(control, duties)
+    local out = {}
+    local n = 0
+    if type(control) == "table" and type(control.thrusters) == "table" then
+        n = #control.thrusters
+    end
+    if type(duties) == "table" then
+        local m = #duties
+        if m > n then
+            n = m
+        end
+        -- Also cover sparse / object-like tables from JSON round-trips.
+        for k, v in pairs(duties) do
+            local i = tonumber(k)
+            if i and i == math.floor(i) and i > n then
+                n = i
+            end
+        end
+    end
+    for i = 1, n do
+        local d = 0
+        if type(duties) == "table" then
+            d = tonumber(duties[i]) or 0
+        end
+        out[i] = d
+    end
+    return out
+end
+
 local function thrusterRows(control, duties)
     local rows = {}
     if not control or type(control.thrusters) ~= "table" then
@@ -246,7 +275,7 @@ end
 local function doApply(control, fx, fy, tz)
     local ok, pathOrErr = drive.applyCommand(control, fx, fy, tz)
     drive.flushMotors(8)
-    local duties = drive.getLastDuties()
+    local duties = dutiesList(control, drive.getLastDuties())
     local motors = drive.getMotorSnapshot()
     return {
         apply_ok = ok and true or false,

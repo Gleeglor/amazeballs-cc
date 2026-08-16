@@ -92,6 +92,8 @@ local DEFAULT_POWER_BUDGET_RF = 0 -- 0 = off; shared RF cap is opt-in only
 local DEFAULT_FE_PER_RPM = 1 -- CCA-ish: ~1 FE/t per RPM (pack-dependent)
 local motorDesired = {}
 local motorSent = {}
+--- Last duty vector written by apply* / hard-stop (dense 1..n; empty until first apply).
+local lastDuties = {}
 local motorWrapCache = {}
 local lastMotorFlushAt = 0
 local MOTOR_FLUSH_GAP = 0.028 -- CCA anti-spam; keep short so first setRPM feels snappy
@@ -225,11 +227,16 @@ end
 function drive.forceStopAllThrusters(control)
     control = control or drive.loadControl()
     if type(control) == "table" and type(control.thrusters) == "table" then
-        for _, t in ipairs(control.thrusters) do
+        local zeros = {}
+        for i, t in ipairs(control.thrusters) do
+            zeros[i] = 0
             if t.kind ~= "motor" then
                 drive.setActuator(control, t, 0)
             end
         end
+        lastDuties = zeros
+    else
+        lastDuties = {}
     end
     local names = collectThrusterMotorNames(control)
     table.sort(names)
@@ -1104,10 +1111,7 @@ function drive.enrichControl(control)
     return control
 end
 
---- Collect duties from actuators without writing motors (sim-style). Internal.
-local lastDuties = {}
-
---- Last duty vector written by applyReassembly / teleop / cardinal (or {}).
+--- Last duty vector written by applyReassembly / teleop / cardinal / hard-stop (or {}).
 function drive.getLastDuties()
     local out = {}
     for i, d in ipairs(lastDuties) do

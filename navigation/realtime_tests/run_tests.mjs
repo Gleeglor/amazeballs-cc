@@ -25,6 +25,13 @@ function ok(name, cond, detail = "") {
   }
 }
 
+/** Lua empty `{}` / sparse tables often arrive as JSON objects, not arrays. */
+function asDutyArray(x) {
+  if (Array.isArray(x)) return x;
+  if (x == null || typeof x !== "object") return [];
+  return Object.values(x);
+}
+
 function sidesLit(thrusters) {
   let port = false;
   let stbd = false;
@@ -120,7 +127,7 @@ async function main() {
   console.log("\n=== idle stop ===");
   await between(session);
   const idle = await session.sendCommand({ cmd: "apply", fx: 0, fy: 0, tz: 0 });
-  const idleDuties = idle.result?.duties || [];
+  const idleDuties = asDutyArray(idle.result?.duties);
   const idleMax = Math.max(0, ...idleDuties.map((d) => Math.abs(d || 0)));
   ok("idle_zero_duties", idle.ok && idleMax < 0.08, `maxDuty=${idleMax}`);
 
@@ -148,8 +155,8 @@ async function main() {
   const aSides = sidesLit(a.result?.thrusters);
   ok(
     "A_both_sides_or_multi_duty",
-    aSides.port && aSides.stbd || (a.result?.duties || []).filter((d) => Math.abs(d) >= 0.08).length >= 2,
-    `port=${aSides.port} stbd=${aSides.stbd} duties=${JSON.stringify(a.result?.duties)}`,
+    aSides.port && aSides.stbd || asDutyArray(a.result?.duties).filter((d) => Math.abs(d) >= 0.08).length >= 2,
+    `port=${aSides.port} stbd=${aSides.stbd} duties=${JSON.stringify(asDutyArray(a.result?.duties))}`,
   );
   const aDyaw = a.result?.delta_yaw_deg;
   ok(
