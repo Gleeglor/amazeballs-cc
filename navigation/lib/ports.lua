@@ -14,7 +14,8 @@ ports.BOAT_DOCK = {
     kind = "docking_port",
     name = "boat_dock",
     role = "vessel",
-    note = "Stub for Create portable_storage_interface / docking port on craft",
+    block_id = "create:portable_storage_interface",
+    note = "Hull-mounted Create portable_storage_interface facing shore PSI",
 }
 
 ports.PORT_A = {
@@ -34,6 +35,8 @@ ports.PORT_A = {
         role = "shore",
         x = AX,
         z = AZ,
+        -- Place at berth facing water. Create: Portable Storage Interface.
+        block_id = "create:portable_storage_interface",
     },
 }
 
@@ -53,6 +56,7 @@ ports.PORT_B = {
         role = "shore",
         x = BX,
         z = BZ,
+        block_id = "create:portable_storage_interface",
     },
 }
 

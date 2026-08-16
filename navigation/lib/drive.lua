@@ -300,7 +300,7 @@ end
 
 --- Optional: scale queued motor RPMs so sum(|rpm|)*fe_per_rpm <= power_budget_rf.
 -- Disabled unless control.enforce_power_budget and power_budget_rf > 0.
--- Normal limit is DEFAULT_MAX_RPM (24) on each motor individually.
+-- Normal limit is DEFAULT_MAX_RPM (96) on each motor individually.
 function drive.applyPowerBudget(control)
     control = control or drive.loadControl()
     if not control or control.enforce_power_budget ~= true then
