@@ -35,9 +35,11 @@ function cruise.followPath(path, opts)
     local i = 1
     local control = calibrate.load()
     local surgeSign = (control and tonumber(control.surge_sign)) or 1
+    local yawSign = (control and tonumber(control.yaw_sign)) or 1
     ui.setMode("route")
     while i <= #path do
         local wp = path[i]
+        -- Prefer final place coords on last waypoint
         local craft = pose.get()
         if not craft then
             sleep(0.2)
@@ -49,19 +51,21 @@ function cruise.followPath(path, opts)
             if dist < arrive then
                 i = i + 1
             else
-                local desiredYaw = math.atan2(dx, dz)
-                local eYaw = desiredYaw - craft.yaw
-                while eYaw > math.pi do
-                    eYaw = eYaw - 2 * math.pi
-                end
-                while eYaw < -math.pi do
-                    eYaw = eYaw + 2 * math.pi
-                end
-                local yawCmd = util.clamp(eYaw * 1.4, -1, 1)
+                -- Steer in body frame (avoids atan2 vs toEuler yaw mismatch → driving the wrong way)
+                local inv = 1 / dist
+                local dirx, dirz = dx * inv, dz * inv
+                local align = craft.forward.x * dirx + craft.forward.z * dirz -- cos heading error
+                local side = craft.right.x * dirx + craft.right.z * dirz -- + = target to starboard
+                local yawCmd = util.clamp(side * 2.2, -1, 1) * yawSign
                 local surge = 0
-                if math.abs(eYaw) < 0.6 then
-                    surge = util.clamp(0.35 + dist * 0.02, 0.2, 0.85) * surgeSign
+                if align > 0.55 then
+                    -- Facing the waypoint: go bow-forward
+                    surge = util.clamp(0.35 + dist * 0.02, 0.25, 0.9) * surgeSign
+                elseif align < -0.35 then
+                    -- Facing away: reverse briefly while turning (helps if 180° off)
+                    surge = -0.35 * surgeSign
                 end
+                -- If nearly sideways, turn in place only (surge stays 0)
                 applyAxes(surge, 0, yawCmd)
                 local spd = select(1, pose.speed(craft))
                 local remapped
@@ -82,7 +86,13 @@ function cruise.followPath(path, opts)
                     yaw = craft.yaw,
                     speed = spd,
                     thrust = surge,
-                    waypoint = string.format("%d/%d", i, #path),
+                    waypoint = string.format(
+                        "%d/%d d=%.0f a=%.2f",
+                        i,
+                        #path,
+                        dist,
+                        align
+                    ),
                 })
             end
         end
