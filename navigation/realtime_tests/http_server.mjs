@@ -14,13 +14,75 @@ import { loadBridgeConfig } from "./discover.mjs";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const CC_SCRIPTS_ROOT = path.resolve(__dirname, "../..");
 
-/** @type {{ pending: object|null, results: Map<string, object>, status: object|null, claimedId: string|null }} */
+/** @type {{ pending: object|null, results: Map<string, object>, status: object|null, claimedId: string|null, claimedAt: number|null, enqueuedAt: number|null, hostLock: { token: string, until: number }|null }} */
 const state = {
   pending: null,
   results: new Map(),
   status: null,
   claimedId: null,
+  claimedAt: null,
+  enqueuedAt: null,
+  hostLock: null,
+  abort: false,
 };
+
+function lockExpired() {
+  if (!state.hostLock) return true;
+  if (Date.now() > state.hostLock.until) {
+    state.hostLock = null;
+    return true;
+  }
+  return false;
+}
+
+function lockTokenOk(req, body) {
+  if (lockExpired()) return true; // unlocked
+  const hdr = req.headers["x-host-lock"];
+  const token =
+    (typeof hdr === "string" && hdr.trim()) ||
+    (body && typeof body.lock_token === "string" && body.lock_token) ||
+    "";
+  return token && token === state.hostLock.token;
+}
+
+/** Drop stuck in-flight cmds so a rebooted agent is never blocked forever.
+ *  go_port soft legs can run 5–8 minutes — do NOT use a 45s claim TTL. */
+const CLAIM_STALE_MS = 600_000; // 10 min — long nav / dual-dock
+const PENDING_STALE_MS = 720_000; // 12 min enqueue ceiling
+
+function expireStalePending(reason) {
+  if (!state.pending) return false;
+  const now = Date.now();
+  // If agent is freshly heartbeating a nav leg, keep the claim alive.
+  const navFresh =
+    state.status?.nav &&
+    state.status?.recv_ts != null &&
+    now - state.status.recv_ts < 8000;
+  if (navFresh) {
+    state.claimedAt = now;
+    return false;
+  }
+  const claimedTooLong =
+    state.claimedId &&
+    state.claimedAt != null &&
+    now - state.claimedAt > CLAIM_STALE_MS;
+  const pendingTooLong =
+    state.enqueuedAt != null && now - state.enqueuedAt > PENDING_STALE_MS;
+  if (!claimedTooLong && !pendingTooLong) return false;
+  const id = state.pending.id;
+  rememberResult({
+    id,
+    ok: false,
+    error: reason || "stale_pending_cleared",
+    cmd: state.pending.cmd,
+    ts: now,
+  });
+  state.pending = null;
+  state.claimedId = null;
+  state.claimedAt = null;
+  state.enqueuedAt = null;
+  return true;
+}
 
 const MAX_RESULTS = 64;
 const MAX_ACCESS_LOG = 80;
@@ -108,10 +170,23 @@ export function hostEnqueue(cmd) {
   if (!cmd || !cmd.id || !cmd.cmd) {
     throw new Error("enqueue requires { id, cmd, ... }");
   }
+  expireStalePending("replaced_by_new_enqueue");
+  // Always displace leftover pending so host never deadlocks after a timeout.
+  if (state.pending) {
+    rememberResult({
+      id: state.pending.id,
+      ok: false,
+      error: "superseded",
+      cmd: state.pending.cmd,
+      ts: Date.now(),
+    });
+  }
   const id = String(cmd.id);
   state.results.delete(id);
   state.pending = { ...cmd, id };
   state.claimedId = null;
+  state.claimedAt = null;
+  state.enqueuedAt = Date.now();
   return state.pending;
 }
 
@@ -124,8 +199,19 @@ export function hostGetStatus() {
 }
 
 export function hostClearPending() {
+  if (state.pending?.id) {
+    rememberResult({
+      id: state.pending.id,
+      ok: false,
+      error: "host_cleared",
+      cmd: state.pending.cmd,
+      ts: Date.now(),
+    });
+  }
   state.pending = null;
   state.claimedId = null;
+  state.claimedAt = null;
+  state.enqueuedAt = null;
 }
 
 async function handle(req, res) {
@@ -136,6 +222,7 @@ async function handle(req, res) {
   try {
     // --- Agent endpoints ---
     if (req.method === "GET" && (p === "/v1/cmd" || p === "/cmd")) {
+      expireStalePending("claim_stale");
       const pending = state.pending;
       if (!pending) {
         code = 200;
@@ -144,11 +231,20 @@ async function handle(req, res) {
       }
       // Hand out once per id (agent may poll while executing).
       if (state.claimedId === pending.id) {
+        // Re-deliver if claim went stale (agent rebooted mid-cmd).
+        if (state.claimedAt != null && Date.now() - state.claimedAt > CLAIM_STALE_MS) {
+          state.claimedId = pending.id;
+          state.claimedAt = Date.now();
+          code = 200;
+          json(res, code, pending);
+          return;
+        }
         code = 200;
         json(res, code, { cmd: null, in_flight: pending.id });
         return;
       }
       state.claimedId = pending.id;
+      state.claimedAt = Date.now();
       code = 200;
       json(res, code, pending);
       return;
@@ -165,15 +261,94 @@ async function handle(req, res) {
       if (state.pending && String(state.pending.id) === String(body.id)) {
         state.pending = null;
         state.claimedId = null;
+        state.claimedAt = null;
+        state.enqueuedAt = null;
       }
       code = 200;
       json(res, code, { ok: true });
       return;
     }
 
+    if (
+      req.method === "POST" &&
+      (p === "/v1/clear" || p === "/clear" || p === "/v1/clear_pending")
+    ) {
+      const body = (await readBody(req)) || {};
+      if (!lockTokenOk(req, body)) {
+        code = 423;
+        json(res, code, {
+          ok: false,
+          error: "host_locked",
+          holder: state.hostLock?.token?.slice?.(0, 8),
+          until: state.hostLock?.until,
+        });
+        return;
+      }
+      hostClearPending();
+      code = 200;
+      json(res, code, { ok: true, cleared: true });
+      return;
+    }
+
+    if (req.method === "POST" && (p === "/v1/lock" || p === "/lock")) {
+      const body = (await readBody(req)) || {};
+      const token = String(body.token || "").trim();
+      const ttlMs = Math.min(600_000, Math.max(5_000, Number(body.ttlMs) || 120_000));
+      if (!token) {
+        code = 400;
+        json(res, code, { ok: false, error: "need token" });
+        return;
+      }
+      if (!lockExpired() && state.hostLock.token !== token) {
+        code = 423;
+        json(res, code, {
+          ok: false,
+          error: "host_locked",
+          until: state.hostLock.until,
+        });
+        return;
+      }
+      state.hostLock = { token, until: Date.now() + ttlMs };
+      code = 200;
+      json(res, code, { ok: true, token, until: state.hostLock.until, ttlMs });
+      return;
+    }
+
+    if (req.method === "POST" && (p === "/v1/unlock" || p === "/unlock")) {
+      const body = (await readBody(req)) || {};
+      const token = String(body.token || "").trim();
+      const force = body.force === true || body.force === "true";
+      if (force || (state.hostLock && state.hostLock.token === token)) {
+        state.hostLock = null;
+      }
+      code = 200;
+      json(res, code, { ok: true, unlocked: !state.hostLock, forced: force });
+      return;
+    }
+
+    if (req.method === "POST" && (p === "/v1/abort" || p === "/abort")) {
+      const body = (await readBody(req)) || {};
+      state.abort = body.abort !== false;
+      code = 200;
+      json(res, code, { ok: true, abort: !!state.abort });
+      return;
+    }
+
+    if (req.method === "GET" && (p === "/v1/abort" || p === "/abort")) {
+      code = 200;
+      json(res, code, { abort: !!state.abort });
+      // one-shot clear on read so nav resumes unless host re-asserts
+      if (state.abort) state.abort = false;
+      return;
+    }
+
     if (req.method === "POST" && (p === "/v1/status" || p === "/status")) {
       const body = (await readBody(req)) || {};
       state.status = { ...body, alive: body.alive !== false, recv_ts: Date.now() };
+      // Long go_port legs: refresh claim so health_tick does not kill the cmd at 45s.
+      if (body.nav || body.last_cmd === "go_port") {
+        if (state.claimedId) state.claimedAt = Date.now();
+      }
       code = 200;
       json(res, code, { ok: true });
       return;
@@ -188,6 +363,16 @@ async function handle(req, res) {
     // --- Host endpoints (npm test / overnight on this machine) ---
     if (req.method === "POST" && (p === "/v1/inbox" || p === "/inbox")) {
       const body = await readBody(req);
+      if (!lockTokenOk(req, body)) {
+        code = 423;
+        json(res, code, {
+          ok: false,
+          error: "host_locked",
+          holder: state.hostLock?.token?.slice?.(0, 8),
+          until: state.hostLock?.until,
+        });
+        return;
+      }
       try {
         const enq = hostEnqueue(body);
         code = 200;
@@ -225,14 +410,17 @@ async function handle(req, res) {
     }
 
     if (req.method === "GET" && (p === "/v1/health" || p === "/health" || p === "/")) {
+      expireStalePending("health_tick");
+      const age =
+        state.status?.recv_ts != null ? Date.now() - state.status.recv_ts : null;
+      const fresh = age != null && age < 8000 && !!state.status?.alive;
       code = 200;
       json(res, code, {
         ok: true,
         service: "amazeballs-realtime-http-bridge",
         pending: state.pending ? { id: state.pending.id, cmd: state.pending.cmd } : null,
-        agent_alive: !!(state.status?.alive),
-        agent_age_ms:
-          state.status?.recv_ts != null ? Date.now() - state.status.recv_ts : null,
+        agent_alive: fresh,
+        agent_age_ms: age,
         access_log_len: accessLog.length,
       });
       return;

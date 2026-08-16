@@ -94,10 +94,16 @@ async function httpJson(method, url, body, opts = {}) {
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
+    const headers = {};
+    if (body != null) headers["Content-Type"] = "application/json";
+    if (opts.lockToken) headers["X-Host-Lock"] = opts.lockToken;
+    if (opts.headers && typeof opts.headers === "object") {
+      Object.assign(headers, opts.headers);
+    }
     const init = {
       method,
       signal: ctrl.signal,
-      headers: body != null ? { "Content-Type": "application/json" } : undefined,
+      headers: Object.keys(headers).length ? headers : undefined,
       body: body != null ? JSON.stringify(body) : undefined,
     };
     const res = await fetch(url, init);
@@ -162,12 +168,57 @@ async function printHttpTimeoutDiagnostics(base) {
 
 /**
  * HTTP session: talks to local http_server (loopback). Boat polls the same server.
+ * Acquires /v1/lock so rival host clients cannot supersede mid-command.
  */
 export function createHttpSession(opts = {}) {
   const { config } = loadBridgeConfig();
   const base = normalizeBaseUrl(
     opts.baseUrl || opts.base_url || config?.base_url || "http://127.0.0.1:8765",
   );
+  const lockToken = opts.lockToken || opts.lock_token || crypto.randomUUID();
+  let lockReady = null;
+
+  async function ensureLock(ttlMs = 600_000) {
+    if (lockReady) return lockReady;
+    lockReady = (async () => {
+      const put = await httpJson(
+        "POST",
+        `${base}/v1/lock`,
+        { token: lockToken, ttlMs },
+        { timeoutMs: 5000 },
+      );
+      if (!put.ok) {
+        throw new Error(
+          `host lock failed (${put.status}): ${put.data?.error || JSON.stringify(put.data)}`,
+        );
+      }
+      return put.data;
+    })();
+    return lockReady;
+  }
+
+  async function renewLock(ttlMs = 600_000) {
+    await httpJson(
+      "POST",
+      `${base}/v1/lock`,
+      { token: lockToken, ttlMs },
+      { timeoutMs: 5000 },
+    );
+  }
+
+  async function unlock() {
+    try {
+      await httpJson(
+        "POST",
+        `${base}/v1/unlock`,
+        { token: lockToken },
+        { timeoutMs: 3000, lockToken },
+      );
+    } catch {
+      /* ignore */
+    }
+    lockReady = null;
+  }
 
   async function send(cmd, sendOpts = {}) {
     const timeoutMs = sendOpts.timeoutMs ?? 20000;
@@ -175,7 +226,13 @@ export function createHttpSession(opts = {}) {
     const id = cmd.id || crypto.randomUUID();
     const payload = { ...cmd, id };
 
-    const put = await httpJson("POST", `${base}/v1/inbox`, payload, { timeoutMs: 5000 });
+    await ensureLock(Math.max(120_000, timeoutMs + 60_000));
+    await renewLock(Math.max(120_000, timeoutMs + 60_000));
+
+    const put = await httpJson("POST", `${base}/v1/inbox`, payload, {
+      timeoutMs: 5000,
+      lockToken,
+    });
     if (!put.ok) {
       throw new Error(
         `HTTP inbox failed (${put.status}): ${put.data?.error || JSON.stringify(put.data)}. Is npm run serve running?`,
@@ -193,6 +250,18 @@ export function createHttpSession(opts = {}) {
       await sleep(pollMs);
     }
     await printHttpTimeoutDiagnostics(base);
+    // Clear stuck pending so the next command (and a reborn agent) is not blocked.
+    try {
+      await httpJson(
+        "POST",
+        `${base}/v1/result`,
+        { id, ok: false, error: "host_timeout", cmd: payload.cmd },
+        { timeoutMs: 2000 },
+      );
+      await httpJson("POST", `${base}/v1/clear`, {}, { timeoutMs: 2000, lockToken });
+    } catch {
+      /* ignore */
+    }
     throw new Error(
       `Timeout waiting for HTTP result id=${id} cmd=${payload.cmd} (${timeoutMs}ms). Is test_agent (HTTP mode) reaching this host?`,
     );
@@ -201,6 +270,7 @@ export function createHttpSession(opts = {}) {
   return {
     mode: "http",
     baseUrl: base,
+    lockToken,
     describe() {
       return `http ${base}`;
     },
@@ -208,6 +278,8 @@ export function createHttpSession(opts = {}) {
       const got = await httpJson("GET", `${base}/v1/status`, null, { timeoutMs: 4000 });
       return got.data;
     },
+    ensureLock,
+    unlock,
     sendCommand: send,
     stopMotors: (o) => send({ cmd: "stop" }, o),
     ping: (o) => send({ cmd: "ping" }, { timeoutMs: 8000, ...o }),

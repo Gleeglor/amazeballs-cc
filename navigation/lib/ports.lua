@@ -1,55 +1,80 @@
--- Dual port registry: Port A ↔ Port B with virtual docking-port blocks.
--- Shore docks and the boat each expose a stub "docking_port" (Create PSI-style).
+-- Dual port registry with WATER-SAFE soft holds (never drive onto shore coords).
+-- Shore marker XZ (341,163 / 383,285) are landmarks only — final targets stay offshore.
 local ports = {}
 
--- Corridor A → B (used for berth heading).
+-- Shore landmarks (dock blocks / PSI). NOT final nav targets.
 local AX, AZ = 341, 163
 local BX, BZ = 383, 285
 local dx, dz = BX - AX, BZ - AZ
 local yaw_a_to_b = math.atan2(dx, dz)
 local yaw_b_to_a = math.atan2(-dx, -dz)
 
---- Vessel-side docking port block (on the boat).
+-- Large offshore standoff along the A↔B corridor (toward mid-water).
+-- Soft arrival: within ~20 blocks of the WATER hold = reached (never slam shore).
+local WATER_STANDOFF = 28
+local SOFT_ARRIVE = 20
+local SOFT_TOL = 20
+
+ports.SAFETY = {
+    never_seek_shore = true,
+    water_standoff = WATER_STANDOFF,
+    soft_arrive_dist = SOFT_ARRIVE,
+    soft_tol = SOFT_TOL,
+    horiz_arrive = 20,
+    max_approach_speed = 0.15,
+    cruise_rpm_cap = 14,
+    creep_rpm_cap = 8,
+    note = "Reached if horiz ≤20 of water hold; gentle pushes only; never seek shore coords",
+}
+
 ports.BOAT_DOCK = {
     kind = "docking_port",
     name = "boat_dock",
     role = "vessel",
     block_id = "create:portable_storage_interface",
-    note = "Hull-mounted Create portable_storage_interface facing shore PSI",
+    note = "Hull PSI — align in open water; do not drive onto shore PSI coords",
 }
 
+--- Water hold for Port A: toward B / corridor center, well offshore from shore marker.
 ports.PORT_A = {
     id = "port_a",
-    label = "Port A",
-    x = AX,
+    label = "Port A (water hold)",
+    -- Landmark only (shore / PSI)
+    shore_x = AX,
+    shore_z = AZ,
+    x = AX, -- kept for id lookups; prefer holdX/holdZ / approachOf
     z = AZ,
-    -- Face open corridor toward B for clear departure.
     yaw = yaw_a_to_b,
     yaw_deg = yaw_a_to_b * 180 / math.pi,
-    standoff = 10,
-    arrive_dist = 4.5,
-    dock_tol = 2.5,
+    standoff = WATER_STANDOFF,
+    arrive_dist = SOFT_ARRIVE,
+    dock_tol = SOFT_TOL,
+    max_speed = 0.15,
+    soft_dock = true,
     dock_block = {
         kind = "docking_port",
         name = "port_a_dock",
         role = "shore",
         x = AX,
         z = AZ,
-        -- Place at berth facing water. Create: Portable Storage Interface.
         block_id = "create:portable_storage_interface",
     },
 }
 
 ports.PORT_B = {
     id = "port_b",
-    label = "Port B",
+    label = "Port B (water hold)",
+    shore_x = BX,
+    shore_z = BZ,
     x = BX,
     z = BZ,
     yaw = yaw_b_to_a,
     yaw_deg = yaw_b_to_a * 180 / math.pi,
-    standoff = 10,
-    arrive_dist = 4.5,
-    dock_tol = 2.5,
+    standoff = WATER_STANDOFF,
+    arrive_dist = SOFT_ARRIVE,
+    dock_tol = SOFT_TOL,
+    max_speed = 0.15,
+    soft_dock = true,
     dock_block = {
         kind = "docking_port",
         name = "port_b_dock",
@@ -59,6 +84,12 @@ ports.PORT_B = {
         block_id = "create:portable_storage_interface",
     },
 }
+
+-- Precompute water holds: from shore, step toward corridor partner (open water).
+ports.PORT_A.hold_x = AX + math.sin(yaw_a_to_b) * WATER_STANDOFF
+ports.PORT_A.hold_z = AZ + math.cos(yaw_a_to_b) * WATER_STANDOFF
+ports.PORT_B.hold_x = BX + math.sin(yaw_b_to_a) * WATER_STANDOFF
+ports.PORT_B.hold_z = BZ + math.cos(yaw_b_to_a) * WATER_STANDOFF
 
 ports.BY_ID = {
     port_a = ports.PORT_A,
@@ -81,23 +112,53 @@ function ports.list()
     return { ports.PORT_A, ports.PORT_B }
 end
 
---- Approach waypoint: stand off along berth heading (away from shore corridor partner).
-function ports.approachOf(port)
-    local yaw = port.yaw or 0
-    local d = port.standoff or 10
-    -- Back away opposite to berth forward (forward is toward partner).
+--- Soft water hold point (final target). NEVER the shore landmark.
+function ports.holdOf(port)
+    if not port then
+        return nil
+    end
+    local hx = port.hold_x or port.x
+    local hz = port.hold_z or port.z
+    local d = port.standoff or WATER_STANDOFF
+    if port.hold_x == nil then
+        local yaw = port.yaw or 0
+        -- Toward corridor partner = into water between A and B
+        hx = (port.shore_x or port.x) + math.sin(yaw) * d
+        hz = (port.shore_z or port.z) + math.cos(yaw) * d
+    end
     return {
-        x = port.x - math.sin(yaw) * d,
-        z = port.z - math.cos(yaw) * d,
-        yaw = yaw,
+        x = hx,
+        z = hz,
+        yaw = port.yaw,
+        soft = true,
+        shore_x = port.shore_x or port.x,
+        shore_z = port.shore_z or port.z,
     }
 end
 
---- Straight corridor waypoints between two ports (inclusive).
+--- Farther offshore approach (before soft hold). Even safer entry.
+function ports.approachOf(port)
+    local hold = ports.holdOf(port)
+    if not hold then
+        return nil
+    end
+    local yaw = port.yaw or 0
+    local extra = math.max(12, (port.standoff or WATER_STANDOFF) * 0.5)
+    return {
+        x = hold.x + math.sin(yaw) * extra,
+        z = hold.z + math.cos(yaw) * extra,
+        yaw = yaw,
+        soft = true,
+    }
+end
+
+--- Corridor waypoints stay in open water (use holds, not shore markers).
 function ports.corridorWaypoints(fromPort, toPort, spacing)
     spacing = spacing or 16
-    local x0, z0 = fromPort.x, fromPort.z
-    local x1, z1 = toPort.x, toPort.z
+    local a = ports.holdOf(fromPort)
+    local b = ports.holdOf(toPort)
+    local x0, z0 = a.x, a.z
+    local x1, z1 = b.x, b.z
     local dist = math.sqrt((x1 - x0) ^ 2 + (z1 - z0) ^ 2)
     local n = math.max(2, math.floor(dist / spacing) + 1)
     local yaw = math.atan2(x1 - x0, z1 - z0)
@@ -111,10 +172,9 @@ function ports.corridorWaypoints(fromPort, toPort, spacing)
             t = i,
         }
     end
-    -- Final berth pose uses destination heading.
     wps[#wps].yaw = toPort.yaw
-    wps[#wps].x = toPort.x
-    wps[#wps].z = toPort.z
+    wps[#wps].x = b.x
+    wps[#wps].z = b.z
     return wps
 end
 

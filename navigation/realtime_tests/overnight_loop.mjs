@@ -16,7 +16,7 @@ import { openSession, resolveBridgeMode, readStatus } from "./bridge.mjs";
 import { spawn } from "node:child_process";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const DOCK = { x: 341, z: 163 }; // Port A berth
+const DOCK = { port: "port_a" }; // soft water hold via go_port (never shore coords)
 
 const STATUS_PATH = path.join(__dirname, "overnight_status.json");
 const POLL_MS = 15000;
@@ -90,18 +90,19 @@ function runNpmTest() {
 }
 
 async function goDock(session) {
-  console.log(`\n=== navigate_to dock (${DOCK.x}, ${DOCK.z}) ===`);
+  console.log(`\n=== go_port soft water hold (${DOCK.port}) — gentle ===`);
   await session.stopMotors({ timeoutMs: 10000 });
   const res = await session.sendCommand(
     {
-      cmd: "navigate_to",
-      x: DOCK.x,
-      z: DOCK.z,
-      timeout: 120,
-      arrive_dist: 4,
-      mode: "cruise",
+      cmd: "go_port",
+      port: DOCK.port,
+      timeout: 300,
+      berth_timeout: 60,
+      approach: true,
+      arrive_dist: 20,
+      handshake: false,
     },
-    { timeoutMs: 150000 },
+    { timeoutMs: 360000 },
   );
   await session.stopMotors({ timeoutMs: 10000 });
   return res;
@@ -198,7 +199,7 @@ async function cycle(once) {
     });
     console.log(
       arrived
-        ? `Arrived near dock (${DOCK.x},${DOCK.z}) dist=${dist}`
+        ? `Soft water hold ${DOCK.port} arrived dist=${dist}`
         : `Nav incomplete dist=${dist} pose=${JSON.stringify(after)}`,
     );
     return { arrived: !!arrived, dist, after, nav };

@@ -22,6 +22,7 @@ const CC_SCRIPTS = path.resolve(NAV, "..");
 /** Same set as deploy_to_computer.mjs / test_agent WRITE_ALLOW */
 export const DEPLOY_FILES = [
   ["test_agent.lua", "test_agent.lua"],
+  ["test_agent.lua", "test_agent"],
   ["boat.lua", "boat.lua"],
   ["port.lua", "port.lua"],
   ["calibrate.lua", "calibrate.lua"],
@@ -98,8 +99,26 @@ export async function deployViaBridge(session, opts = {}) {
     throw new Error("No deploy files found under navigation/");
   }
 
+  // Critical order: test_agent (new WRITE_ALLOW) → startup → everything else.
+  // Never reboot unless startup is on the boat.
+  const byPath = new Map(files.map((f) => [f.path, f]));
+  const ordered = [];
+  const prefer = ["test_agent.lua", "startup", "startup.lua"];
+  for (const p of prefer) {
+    if (byPath.has(p)) {
+      ordered.push(byPath.get(p));
+      byPath.delete(p);
+    }
+  }
+  for (const f of files) {
+    if (byPath.has(f.path)) {
+      ordered.push(f);
+      byPath.delete(f.path);
+    }
+  }
+
   if (!opts.quiet) {
-    console.log(`Deploy ${files.length} files via ${session.describe()} (${session.mode})`);
+    console.log(`Deploy ${ordered.length} files via ${session.describe()} (${session.mode})`);
   }
 
   // Probe capability (empty sync is enough)
@@ -119,9 +138,7 @@ export async function deployViaBridge(session, opts = {}) {
     throw e;
   }
 
-  const written = [];
-  for (const file of files) {
-    // Large files: chunked append
+  async function writeOne(file) {
     if (file.content.length > CHUNK) {
       let offset = 0;
       let part = 0;
@@ -142,42 +159,86 @@ export async function deployViaBridge(session, opts = {}) {
             e.code = "NEED_BOOTSTRAP";
             throw e;
           }
+          if (/path not allowed/i.test(String(r.error || ""))) {
+            if (!opts.quiet) console.warn(`  skip ${file.path}: ${r.error}`);
+            continue;
+          }
           throw new Error(`write_file ${file.path} part ${part}: ${r.error || "failed"}`);
         }
         offset += CHUNK;
         part += 1;
       }
-      written.push({ path: file.path, size: file.bytes, chunks: part });
       if (!opts.quiet) console.log(`  wrote ${file.path} (${file.bytes} B, ${part} chunks)`);
-    } else {
-      const r = await session.sendCommand(
-        { cmd: "write_file", path: file.path, content: file.content },
-        { timeoutMs: 30000 },
-      );
-      if (!r.ok) {
-        if (/unknown cmd/i.test(String(r.error || ""))) {
-          const e = new Error(bootstrapHint(session));
-          e.code = "NEED_BOOTSTRAP";
-          throw e;
-        }
-        throw new Error(`write_file ${file.path}: ${r.error || "failed"}`);
+      return { path: file.path, size: file.bytes, chunks: part };
+    }
+    const r = await session.sendCommand(
+      { cmd: "write_file", path: file.path, content: file.content },
+      { timeoutMs: 30000 },
+    );
+    if (!r.ok) {
+      if (/unknown cmd/i.test(String(r.error || ""))) {
+        const e = new Error(bootstrapHint(session));
+        e.code = "NEED_BOOTSTRAP";
+        throw e;
       }
-      written.push({ path: file.path, size: r.result?.size ?? file.bytes });
-      if (!opts.quiet) console.log(`  wrote ${file.path} (${file.bytes} B)`);
+      if (/not allowed|path not allowed/i.test(String(r.error || ""))) {
+        // Old in-memory allowlist: skip denied paths (including startup).
+        // New test_agent.lua writes startup on boot once it is re-run.
+        if (!opts.quiet) console.warn(`  skip ${file.path}: ${r.error}`);
+        return { path: file.path, size: 0, skipped: true, error: r.error };
+      }
+      throw new Error(`write_file ${file.path}: ${r.error || "failed"}`);
+    }
+    if (!opts.quiet) console.log(`  wrote ${file.path} (${file.bytes} B)`);
+    return { path: file.path, size: r.result?.size ?? file.bytes };
+  }
+
+  const written = [];
+  let startupOk = false;
+  for (const file of ordered) {
+    const w = await writeOne(file);
+    written.push(w);
+    if (file.path === "startup" || file.path === "startup.lua") {
+      startupOk = true;
+    }
+  }
+
+  // Belt: try startup write; do not fail deploy if old agent denies it.
+  if (!startupOk) {
+    const r = await session.sendCommand(
+      { cmd: "write_file", path: "startup", content: 'shell.run("test_agent")\n' },
+      { timeoutMs: 15000 },
+    );
+    if (r.ok) {
+      written.push({ path: "startup", size: r.result?.size || 22 });
+      startupOk = true;
+      if (!opts.quiet) console.log("  wrote startup (forced)");
+    } else if (!opts.quiet) {
+      console.warn(`  startup not writable yet (${r.error}) — new test_agent writes it on boot`);
     }
   }
 
   if (opts.reboot) {
-    if (!opts.quiet) console.log("Rebooting boat computer (startup should re-run test_agent)…");
-    try {
-      await session.sendCommand({ cmd: "reboot" }, { timeoutMs: 8000 });
-    } catch {
-      // reboot may drop the result POST — expected
+    if (!startupOk) {
+      if (!opts.quiet) {
+        console.warn(
+          "Reboot requested but startup missing — skipping reboot to avoid stranding. Run: reload_libs or re-launch test_agent.",
+        );
+      }
+    } else {
+      if (!opts.quiet) {
+        console.log("Rebooting boat computer (startup will re-run test_agent)…");
+      }
+      try {
+        await session.sendCommand({ cmd: "reboot" }, { timeoutMs: 8000 });
+      } catch {
+        // reboot may drop the result POST — expected
+      }
+      await new Promise((r) => setTimeout(r, 8000));
     }
-    await new Promise((r) => setTimeout(r, 8000));
   }
 
-  return { written, files: files.length };
+  return { written, files: ordered.length, startupOk };
 }
 
 export async function deployMain(argv = process.argv.slice(2)) {

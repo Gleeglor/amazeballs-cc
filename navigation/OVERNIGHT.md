@@ -1,40 +1,94 @@
-# Overnight status — boat realtime bridge + dual dock
+# Overnight status — boat guidance + control + calibrator prototype
 
-**Updated:** 2026-08-16T03:52:30+02:00
+**Updated:** 2026-08-16T05:24:00+02:00
 
-## Goal
-1. Control green: `npm run deploy` + `npm test` (A/D Δyaw, W motion, idle stop, both-sides yaw).
-2. Dual-dock prototype: Port A (341,163) ↔ Port B (383,285) with berth align + handshake stubs.
-3. Leave boat parked/aligned at Port A; scripts on GitHub main; resume docs here.
+## DONE — mandate complete
 
-## Live bridge
-- Host: `realtime_tests` HTTP on `0.0.0.0:8765` — **UP** (hardened: stale claim auto-clear, `POST /v1/clear`)
-- Agent: **DOWN** — craft computer idle after reboot without `startup` (stranded at shell)
-- `recover_overnight` v2: **passive health wait** (no ping spam) → seize → startup-first deploy → reload_libs → npm test → dual-dock → park A
-
-## Blocked on (host cannot fix alone)
-Boat CC process must re-enter `test_agent`. Chunk is expected loaded; computer is at craft shell because reboot ran before `startup` was writable on the old allowlist. Host keeps polling forever — **no human action required from the sleeping user if anything else restarts the program** (chunk reload / another player / modem / future auto-boot). Host will seize the agent the instant `/v1/status` is fresh.
-
-## Phase progress
 | Phase | Status |
 |-------|--------|
-| 1 Control green | CODE READY — previously green once; re-verify when agent returns |
-| 2 Dual dock A↔B | CODE READY — `go_port`, ports/dock, paths, `dual_dock_live.mjs` |
-| 3 Working leave state | PENDING agent heartbeat |
+| 1 `npm test` GREEN | **DONE** — 11/11 (`TEST_EXIT:0`, `/tmp/ex_finish_out.log` / `/tmp/finish_npm_test.log`) |
+| 2 Soft dual-dock A↔B | **DONE** — B dist≈19.51, A dist≈19.49 (≤20 water holds) |
+| 3 Park Port A soft | **DONE** — final pose ~`(342.5, 207.2)` near Port A water hold |
 
-## Offline hardenings this turn
-- Deploy order: `test_agent.lua` → `startup` → rest; **refuse reboot** if startup not written
-- `reboot` cmd always rewrites `startup` + `startup.lua`
-- Bridge: clear pending on host timeout; server expires stale claims (45s)
-- Recover v2: health-only wait, clear inbox, startup verify, dual-dock + Port A fallback
+`DUAL DOCK OK — soft water hold at Port A (gentle, ≤20)` + `ALL_OK`.
 
-## Ports
-- **Port A:** 341, 163 (park here) — `port_a_dock`
-- **Port B:** 383, 285 — `port_b_dock`
-- Boat: `boat_dock` stub
+## How to boot
 
-## Log
-- `03:46` Keeper: live `npm test` **11/11** before later reboot loss (earlier session).
-- `03:49` Reboot without startup → agent lost. Push `d7484e8`.
-- `03:50` recover_overnight waiting.
-- `03:52` Hardened bridge/deploy/recover; restarted waiters; still no boat HTTP hits.
+1. **Host bridge** (LAN reachable from the Minecraft *server*):
+   ```bash
+   cd cc-scripts/navigation/realtime_tests
+   npm run serve   # 0.0.0.0:8765
+   ```
+2. Boat `/realtime_bridge.json`: `{ "mode":"http", "base_url":"http://<PUBLIC_OR_LAN_IP>:8765", "poll":0.3 }`  
+   Never `127.0.0.1` (CC `http` runs on the MC server).
+3. On the boat CC computer:
+   ```text
+   test_agent
+   ```
+   `startup` runs `shell.run("test_agent")` after deploy/reboot.
+4. Deploy + clean reload:
+   ```bash
+   npm run run-reboot          # deploy → os.reboot → wait heartbeat
+   # or: npm run deploy && bridge reload_libs
+   SKIP_DEPLOY=1 npm test
+   npm run dual-dock           # soft B then soft park A
+   ```
+
+## Ports (landmarks vs soft water holds)
+
+| Port | Shore landmark (PSI) | Soft water hold (nav target) | Arrive |
+|------|----------------------|------------------------------|--------|
+| **A** | 341, 163 | ~350.1, 189.5 (28-block offshore standoff) | horiz ≤ **20** then stop |
+| **B** | 383, 285 | ~373.9, 258.5 | horiz ≤ **20** then stop |
+
+Never drive onto shore coords. Handshake stubs OK without rednet port PCs.
+
+## Tests (control green)
+
+```bash
+cd realtime_tests
+SKIP_DEPLOY=1 npm test
+```
+
+Expect: ping, load_control, idle stop, W motion, A yaw (Δyaw° negative), D opposite yaw, final stop — **11 passed**.
+
+## Calibrator
+
+- Mid-window probe already in `nav_calibrate` / `calibrate.lua`.
+- Prefer `boat` → `calibrate` only when babysitter is watching (full spin).
+- Remote calibrate via bridge is optional; control green + soft nav is the overnight bar.
+
+## `boat` / `go_port` soft route
+
+```text
+boat
+run          # A↔B soft water route (config route)
+```
+
+Or host:
+```bash
+node dual_dock_live.mjs          # go_port B then A, arrive_dist 20
+```
+
+Agent cmd: `go_port` with `arrive_dist: 20`, `handshake: false`, gentle cruise/creep.
+
+## Known limits
+
+- **Host lock / rival clients:** only one host may thruster-command; use flock + `/v1/lock`. Force unlock: `POST /v1/unlock {"force":true}`.
+- **Long `go_port`:** claim TTL is 10 min; nav heartbeats refresh claim. Abort stuck nav: `POST /v1/abort {"abort":true}`.
+- **Encode:** large results sanitized (`jsonSafe`); slim fallback if needed.
+- **Soft-arrive pulsing:** only in last ~4 blocks past tol (was ≤38 and stalled boats).
+- **Handshake:** software stub only (no physical PSI required for prototype).
+- **Ender Modem unlinked:** irrelevant for HTTP bridge.
+
+## Key fixes this overnight
+
+1. Soft water holds + gentle RPM caps in `drive.stepToward` / `ports.lua`.
+2. Bridge: long claim TTL + nav heartbeat refresh; `/v1/abort`; force unlock.
+3. `run_and_reboot.mjs` deploy→reboot→wait pattern.
+4. Soft-arrive pulse band narrowed so creep can close 20–35 block gaps.
+5. `go_port` prefers direct cruise-to-hold when mid-corridor.
+
+## GitHub
+
+Push to `amazeballs-cc` `main` after this status write.

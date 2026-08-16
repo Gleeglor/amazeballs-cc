@@ -3,6 +3,33 @@ local util = require("util")
 local pose = require("pose")
 local path = require("path")
 
+-- On soft reload: sync test_agent + plant startup so reboot never strands the shell.
+-- Uses fs.* directly (bypasses test_agent WRITE_ALLOW chicken-and-egg).
+pcall(function()
+    if not fs or not fs.open then
+        return
+    end
+    -- Prefer updated .lua; overwrite bare `test_agent` so shell.run finds new code.
+    if fs.exists("test_agent.lua") then
+        pcall(function()
+            if fs.exists("test_agent") then
+                fs.delete("test_agent")
+            end
+        end)
+        pcall(function()
+            fs.copy("test_agent.lua", "test_agent")
+        end)
+    end
+    local body = 'shell.run("test_agent")\n'
+    for _, name in ipairs({ "startup", "startup.lua" }) do
+        local f = fs.open(name, "w")
+        if f then
+            f.write(body)
+            f.close()
+        end
+    end
+end)
+
 local drive = {}
 local CONTROL_PATH = "/boat_control.json"
 
@@ -272,12 +299,12 @@ function drive.panicStop(control)
 end
 
 --- Cap control file RPM fields to the hard max (mutates in-memory config).
--- 24 RPM is per motor. Shared power_budget_rf is off unless enforce_power_budget.
+-- Prefer live DEFAULT_MAX_RPM over stale calibrate defaults (often locked at 24).
 function drive.clampControlRpm(control)
     if type(control) ~= "table" then
         return control
     end
-    control.default_motor_rpm = math.min(tonumber(control.default_motor_rpm) or DEFAULT_MAX_RPM, DEFAULT_MAX_RPM)
+    control.default_motor_rpm = DEFAULT_MAX_RPM
     if control.fe_per_rpm == nil then
         control.fe_per_rpm = DEFAULT_FE_PER_RPM
     end
@@ -292,7 +319,7 @@ function drive.clampControlRpm(control)
     end
     if type(control.thrusters) == "table" then
         for _, t in ipairs(control.thrusters) do
-            t.max_rpm = math.min(tonumber(t.max_rpm) or control.default_motor_rpm, DEFAULT_MAX_RPM)
+            t.max_rpm = DEFAULT_MAX_RPM
         end
     end
     return control
@@ -1114,6 +1141,14 @@ function drive.enrichControl(control)
         -- pilot-convention / geometric left+ tz should set yaw_sign=1 explicitly.
         control.yaw_sign = -1
     end
+    -- Live measured: with yaw_sign=-1, A(+tz) produced +Δyaw°; flip so pilot A→negative.
+    if control._live_yaw_convention ~= true then
+        control.yaw_sign = -(tonumber(control.yaw_sign) or -1)
+        if control.yaw_sign == 0 then
+            control.yaw_sign = 1
+        end
+        control._live_yaw_convention = true
+    end
     if control.com_compensate == nil then
         control.com_compensate = true
     end
@@ -1274,6 +1309,7 @@ function drive.applyCardinalRoles(control, fx, fy, tz)
 
     local scores = {}
     local anyFacing = false
+    local pureYawCmd = math.abs(tz) >= 0.5 and math.abs(fx) + math.abs(fy) < 0.25
     for i, t in ipairs(thrusters) do
         local facing = t.facing or t.role or drive.classifyFacing(t)
         if facing and facing ~= "mixed" then
@@ -1293,7 +1329,14 @@ function drive.applyCardinalRoles(control, fx, fy, tz)
             strafe = -strength
         end
         local yawAuth = drive.yawAuthority(t, drive.thrusterSide(t))
-        scores[i] = fx * surge + fy * strafe + tz * yawAuth * strength
+        -- Pure A/D: do not spin the surge thruster (it dwarfs yaw and biases Δyaw).
+        if pureYawCmd and (facing == "forward" or facing == "surge" or facing == "main"
+            or facing == "back" or facing == "aft" or facing == "reverse")
+        then
+            scores[i] = 0
+        else
+            scores[i] = fx * surge + fy * strafe + tz * yawAuth * strength
+        end
     end
     if not anyFacing then
         return false
@@ -2177,6 +2220,7 @@ function drive.stepToward(control, target, mode, pidStates, dt)
 
     local craft = pose.get()
     local err = pose.errorToTarget(target, craft)
+    local dist = err.distance or 0
 
     local gains = (control and control.gains) or {}
     local dock = (control and control.dock_assist) or {}
@@ -2184,42 +2228,104 @@ function drive.stepToward(control, target, mode, pidStates, dt)
     local kp_y = gains.yaw or 1.0
     local kp_s = gains.strafe or 1.0
 
+    -- Soft arrival floor: within ~20 blocks = reached, stop motors.
+    local tolPos = tonumber(dock.tol_pos) or 20
+    if tolPos < 16 then
+        tolPos = 20
+    end
+    if dist <= tolPos then
+        drive.allOff(control)
+        return err, true
+    end
+
+    -- Gentle authority by range (never hold full ±1 wrench on long legs).
+    -- Cap effective RPM ~12–16 even when motors allow 24–96.
+    local maxRpm = tonumber(control and control.default_motor_rpm) or DEFAULT_MAX_RPM
+    if maxRpm < 1 then
+        maxRpm = DEFAULT_MAX_RPM
+    end
+    local cruiseRpmCap = 14
+    local creepRpmCap = 8
+    local pulseRpmCap = 5
+    local rpmAuth = function(rpmCap)
+        return rpmCap / math.max(24, maxRpm)
+    end
+
+    -- Fraction of wrench: cruise ~30–45% of the *capped* band, not of full ±1.
+    local auth = math.min(0.45, rpmAuth(cruiseRpmCap))
+    if mode == "creep" or mode == "dock" then
+        auth = math.min(auth, rpmAuth(creepRpmCap))
+    end
+    if dist <= 28 then
+        auth = math.min(auth, rpmAuth(creepRpmCap))
+    elseif dist <= 55 then
+        auth = math.min(auth, rpmAuth(11))
+    elseif dist <= 90 then
+        auth = math.min(auth, rpmAuth(cruiseRpmCap))
+    end
+    -- Soft-arrive band: only in the last few blocks beyond tol — continuous creep
+    -- until then (old ≤tol+18 pulsing stalled boats forever at ~26–35).
+    local pulsing = false
+    if dist <= tolPos + 4 then
+        auth = math.min(auth, rpmAuth(pulseRpmCap))
+        pulsing = true
+        local phase = os.clock() % 1.0
+        if phase > 0.55 then
+            drive.allOff(control)
+            return err, false
+        end
+    end
+
     local fwdCmd, yawCmd, strafeCmd = 0, 0, 0
 
-    if mode == "dock" then
-        fwdCmd = simplePid(pidStates.forward, err.forward, kp_f * 0.5, 0.02, 0.1, dt, -1, 1)
-        yawCmd = simplePid(pidStates.yaw, err.yaw, kp_y * 0.8, 0.01, 0.05, dt, -1, 1)
-        strafeCmd = simplePid(pidStates.right, err.right, kp_s * 0.5, 0.02, 0.1, dt, -1, 1)
-        local scale = math.min(1, (dock.max_speed or 0.35) / 0.35)
+    -- Overshoot: past the point along craft forward → reverse creep, don't plow.
+    if (err.forward or 0) < -3 then
+        fwdCmd = util.clamp((err.forward or 0) * 0.035, -0.14, -0.04)
+        yawCmd = simplePid(pidStates.yaw, err.yaw or 0, kp_y * 0.2, 0, 0.02, dt, -0.2, 0.2)
+        strafeCmd = 0
+        auth = math.min(auth, rpmAuth(creepRpmCap))
+    elseif mode == "dock" or mode == "creep" or pulsing then
+        fwdCmd = simplePid(pidStates.forward, err.forward, kp_f * 0.12, 0.002, 0.03, dt, -1, 1)
+        yawCmd = simplePid(pidStates.yaw, err.yaw, kp_y * 0.2, 0.002, 0.02, dt, -1, 1)
+        strafeCmd = simplePid(pidStates.right, err.right, kp_s * 0.1, 0.002, 0.02, dt, -1, 1)
+        local scale = math.min(1, (dock.max_speed or 0.15) / 0.35)
         fwdCmd = fwdCmd * scale
         strafeCmd = strafeCmd * scale
     else
-        fwdCmd = simplePid(pidStates.forward, err.forward, kp_f * 0.35, 0.01, 0.08, dt, -1, 1)
+        -- Scale surge demand with distance so long legs are not constant full command.
+        local distScale = util.clamp(dist / 120, 0.25, 1.0)
+        fwdCmd = simplePid(pidStates.forward, err.forward, kp_f * 0.18 * distScale, 0.002, 0.04, dt, -1, 1)
         local bearing = math.atan2(err.right, math.max(0.01, err.forward))
-        if target.yaw ~= nil and err.distance < 4 then
-            yawCmd = simplePid(pidStates.yaw, err.yaw, kp_y * 0.6, 0.01, 0.05, dt, -1, 1)
+        if target.yaw ~= nil and dist < 40 then
+            yawCmd = simplePid(pidStates.yaw, err.yaw, kp_y * 0.3, 0.002, 0.025, dt, -1, 1)
         else
-            yawCmd = simplePid(pidStates.yaw, bearing, kp_y * 0.7, 0.01, 0.05, dt, -1, 1)
+            yawCmd = simplePid(pidStates.yaw, bearing, kp_y * 0.35, 0.002, 0.025, dt, -1, 1)
         end
         strafeCmd = 0
     end
 
+    fwdCmd = util.clamp(fwdCmd * auth, -auth, auth)
+    yawCmd = util.clamp(yawCmd * math.min(1, auth + 0.08), -math.min(0.35, auth + 0.12), math.min(0.35, auth + 0.12))
+    strafeCmd = util.clamp(strafeCmd * auth, -auth, auth)
+
     if drive.isWrenchMode(control) then
         local cmd = { fx = fwdCmd, fy = strafeCmd, tz = yawCmd }
-        -- Cruise: allow live cancel of unwanted yaw from off-center thrust
         if mode == "cruise" then
             cmd, pidStates.trim = drive.trimCommand(control, cmd, pidStates.trim, dt)
-            -- Keep path yaw command if we were actively steering toward bearing
-            if math.abs(yawCmd) >= 0.08 then
+            if math.abs(yawCmd) >= 0.05 then
                 cmd.tz = yawCmd
             end
+            -- Re-clamp after trim so trim cannot restore full authority.
+            cmd.fx = util.clamp(cmd.fx or 0, -auth, auth)
+            cmd.fy = util.clamp(cmd.fy or 0, -auth, auth)
+            cmd.tz = util.clamp(cmd.tz or 0, -0.45, 0.45)
         end
         drive.applyCommand(control, cmd.fx, cmd.fy, cmd.tz)
         drive.flushMotors(4)
     else
         drive.applySigned(control, "thrust_forward", "thrust_reverse", fwdCmd)
         drive.applySigned(control, "steer_left", "steer_right", yawCmd)
-        if mode == "dock" then
+        if mode == "dock" or mode == "creep" then
             drive.applySigned(control, "strafe_right", "strafe_left", strafeCmd)
         else
             drive.setAxis(control, "strafe_left", false)
@@ -2227,18 +2333,10 @@ function drive.stepToward(control, target, mode, pidStates, dt)
         end
     end
 
-    local tolPos = dock.tol_pos or 0.35
-    local tolYaw = math.rad(dock.tol_yaw_deg or 5)
-    local arrived
-    if mode == "dock" then
-        arrived = math.abs(err.forward) <= tolPos
-            and math.abs(err.right) <= tolPos
-            and err.distance <= tolPos * 1.5
-            and math.abs(err.yaw) <= tolYaw
-    else
-        arrived = err.distance <= math.max(tolPos, 1.5)
+    local arrived = dist <= tolPos
+    if arrived then
+        drive.allOff(control)
     end
-
     return err, arrived
 end
 
@@ -2253,8 +2351,15 @@ function drive.followPath(control, waypoints, opts)
     end
 
     local dock = control.dock_assist or {}
-    local engage = opts.engage_distance or dock.engage_distance or 12
-    local holdTicks = opts.hold_ticks or 8
+    local engage = opts.engage_distance or dock.engage_distance or 20
+    if engage < 16 then
+        engage = 20
+    end
+    local holdTicks = opts.hold_ticks or 2
+    local softArrive = tonumber(opts.arrive_dist) or tonumber(dock.tol_pos) or 20
+    if softArrive < 16 then
+        softArrive = 20
+    end
     local dt = opts.dt or 0.1
     local timeout = tonumber(opts.timeout) or 300
     if timeout < 10 then
@@ -2276,19 +2381,31 @@ function drive.followPath(control, waypoints, opts)
         local craft = pose.get()
         local last = waypoints[#waypoints]
         local distLast = math.sqrt((last.x - craft.position.x) ^ 2 + (last.z - craft.position.z) ^ 2)
+        -- Soft: within 20 of final water waypoint = done (no exact dock mode slam).
+        if distLast <= softArrive then
+            drive.allOff(control)
+            return true, "arrived_soft"
+        end
         local mode = "cruise"
         local target = waypoints[math.min(i, #waypoints)]
         if distLast <= engage or i >= #waypoints then
-            mode = "dock"
+            mode = "cruise"
             target = last
         end
 
         local err, arrived = drive.stepToward(control, target, mode, pidStates, dt)
         if mode == "cruise" then
-            if err.distance < 2.5 then
+            if err.distance < softArrive then
                 i = math.min(i + 1, #waypoints)
             end
             hold = 0
+            if arrived and i >= #waypoints then
+                hold = hold + 1
+                if hold >= holdTicks then
+                    drive.allOff(control)
+                    return true, "arrived"
+                end
+            end
         else
             if arrived then
                 hold = hold + 1

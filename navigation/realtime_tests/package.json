@@ -14,6 +14,8 @@
     "overnight": "node overnight_loop.mjs",
     "overnight:once": "node overnight_loop.mjs --once",
     "recover": "node recover_overnight.mjs",
-    "deploy:reboot": "node deploy_http.mjs --reboot"
+    "deploy:reboot": "node deploy_http.mjs --reboot",
+    "run-reboot": "node run_and_reboot.mjs",
+    "finish": "node run_and_reboot.mjs --section dual"
   }
 }

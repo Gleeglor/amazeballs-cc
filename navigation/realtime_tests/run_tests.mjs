@@ -187,12 +187,12 @@ async function main() {
     `Δfwd=${Number(wFwd).toFixed(3)} maxSentRpm=${wSent} net.fx=${w.result?.net?.fx}`,
   );
 
-  console.log("\n=== A yaw left (hold 2.8s) ===");
+  console.log("\n=== A yaw left (hold 4.0s) ===");
   await between(session);
-  await new Promise((r) => setTimeout(r, 600));
+  await new Promise((r) => setTimeout(r, 2000));
   const a = await session.sendCommand(
-    { cmd: "hold_apply", fx: 0, fy: 0, tz: 1, seconds: 2.8 },
-    { timeoutMs: 25000 },
+    { cmd: "hold_apply", fx: 0, fy: 0, tz: 1, seconds: 4.0 },
+    { timeoutMs: 35000 },
   );
   ok("A_apply_ok", a.ok === true, a.error || `path=${a.result?.path}`);
   const aSides = sidesLit(a.result?.thrusters);
@@ -211,12 +211,12 @@ async function main() {
     `  note  A Δyaw°=${aDyaw?.toFixed?.(2)} yaw_sign=${a.result?.yaw_sign} — expect craft LEFT turn in-game`,
   );
 
-  console.log("\n=== D yaw right (hold 2.8s) ===");
+  console.log("\n=== D yaw right (hold 4.0s) ===");
   await between(session);
-  await new Promise((r) => setTimeout(r, 600));
+  await new Promise((r) => setTimeout(r, 2000));
   const d = await session.sendCommand(
-    { cmd: "hold_apply", fx: 0, fy: 0, tz: -1, seconds: 2.8 },
-    { timeoutMs: 25000 },
+    { cmd: "hold_apply", fx: 0, fy: 0, tz: -1, seconds: 4.0 },
+    { timeoutMs: 35000 },
   );
   ok("D_apply_ok", d.ok === true, d.error || `path=${d.result?.path}`);
   const dDyaw = d.result?.delta_yaw_deg;

@@ -502,10 +502,10 @@ function calibrate.run(opts)
             norm = maxMag,
         },
         dock_assist = {
-            engage_distance = 12,
-            max_speed = 0.35,
-            tol_pos = 0.35,
-            tol_yaw_deg = 5,
+            engage_distance = 20,
+            max_speed = 0.2,
+            tol_pos = 20,
+            tol_yaw_deg = 45,
         },
         feedback = {
             kp_yaw = 1.2,

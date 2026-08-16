@@ -21,6 +21,7 @@ local HOLD_MAX_SEC = 8.0
 -- Paths the host may overwrite via write_file / sync_tree (HTTP deploy).
 local WRITE_ALLOW = {
     ["test_agent.lua"] = true,
+    ["test_agent"] = true,
     ["boat.lua"] = true,
     ["calibrate.lua"] = true,
     ["stopmotors.lua"] = true,
@@ -122,13 +123,63 @@ local function httpGetJson(url)
     return data
 end
 
+--- Make values safe for textutils.serialiseJSON (rejects NaN/inf/functions/cycles).
+local function jsonSafe(v, seen, depth)
+    depth = depth or 0
+    if depth > 12 then
+        return nil
+    end
+    local t = type(v)
+    if t == "nil" or t == "boolean" or t == "string" then
+        return v
+    end
+    if t == "number" then
+        if v ~= v or v == math.huge or v == -math.huge then
+            return nil
+        end
+        return v
+    end
+    if t ~= "table" then
+        return tostring(v)
+    end
+    seen = seen or {}
+    if seen[v] then
+        return nil
+    end
+    seen[v] = true
+    local out = {}
+    for k, val in pairs(v) do
+        local kt = type(k)
+        local key = k
+        if kt ~= "string" and kt ~= "number" then
+            key = tostring(k)
+        end
+        out[key] = jsonSafe(val, seen, depth + 1)
+    end
+    seen[v] = nil
+    return out
+end
+
 local function httpPostJson(url, payload)
     if not http or not http.post then
         return false, httpFailMsg("http.post", url, "http API unavailable")
     end
-    local okEnc, encoded = pcall(textutils.serialiseJSON, payload)
+    local safe = jsonSafe(payload)
+    local okEnc, encoded = pcall(textutils.serialiseJSON, safe)
     if not okEnc then
-        return false, httpFailMsg("http.post", url, "encode failed")
+        -- Last resort: strip result body so host still gets ok/error/id.
+        local slim = {
+            id = type(payload) == "table" and payload.id or nil,
+            ok = type(payload) == "table" and payload.ok or false,
+            cmd = type(payload) == "table" and payload.cmd or nil,
+            error = (type(payload) == "table" and payload.error) or "encode failed",
+            result = { encode_fallback = true },
+            ts = os.epoch("utc"),
+        }
+        okEnc, encoded = pcall(textutils.serialiseJSON, slim)
+        if not okEnc then
+            return false, httpFailMsg("http.post", url, "encode failed")
+        end
     end
     local res, err = http.post(url, encoded, {
         ["Content-Type"] = "application/json",
@@ -679,15 +730,18 @@ local function handle(req)
     end
 
     if cmd == "reboot" or cmd == "restart_agent" then
-        -- Ensure next boot re-enters the agent (host may also write startup).
-        if not fs.exists("startup") and not fs.exists("startup.lua") then
-            local f = fs.open("startup", "w")
-            if f then
-                f.write('shell.run("test_agent")\n')
-                f.close()
-            end
+        -- ALWAYS (re)write startup before reboot — never strand at craft shell.
+        local f = fs.open("startup", "w")
+        if f then
+            f.write('shell.run("test_agent")\n')
+            f.close()
         end
-        reply(req, true, { rebooting = true, note = "os.reboot — startup runs test_agent" })
+        local f2 = fs.open("startup.lua", "w")
+        if f2 then
+            f2.write('shell.run("test_agent")\n')
+            f2.close()
+        end
+        reply(req, true, { rebooting = true, note = "os.reboot — startup/startup.lua → test_agent" })
         sleep(0.4)
         os.reboot()
         return
@@ -724,7 +778,7 @@ local function handle(req)
         return
     end
 
-    -- Navigate toward world XZ (default Port A 341,163). Uses drive.stepToward.
+    -- Navigate toward world XZ. Soft arrive ≤20. Shore landmarks remap to water holds.
     if cmd == "navigate_to" or cmd == "go_dock" then
         local control = drive.loadControl()
         if not control then
@@ -739,6 +793,22 @@ local function handle(req)
         local tx = tonumber(req.x) or 341
         local tz = tonumber(req.z) or 163
         local ty = tonumber(req.y) or before.y
+        -- SAFETY: remap shore landmarks → offshore water hold.
+        do
+            package.loaded["ports"] = nil
+            local portsMod = require("ports")
+            local sx, sz = 341, 163
+            local sx2, sz2 = 383, 285
+            if (math.abs(tx - sx) < 4 and math.abs(tz - sz) < 4)
+                or (math.abs(tx - sx2) < 4 and math.abs(tz - sz2) < 4)
+            then
+                local port = portsMod.get((math.abs(tx - sx) < 4) and "port_a" or "port_b")
+                local hold = portsMod.holdOf(port)
+                if hold then
+                    tx, tz = hold.x, hold.z
+                end
+            end
+        end
         local timeout = tonumber(req.timeout) or 180
         if timeout > 420 then
             timeout = 420
@@ -746,8 +816,14 @@ local function handle(req)
         if timeout < 5 then
             timeout = 5
         end
-        local arriveDist = tonumber(req.arrive_dist) or 3.5
+        local arriveDist = tonumber(req.arrive_dist) or 20
+        if arriveDist < 16 then
+            arriveDist = 20
+        end
         local mode = req.mode or "cruise"
+        if mode == "dock" then
+            mode = "creep"
+        end
         local target = { x = tx, y = ty, z = tz }
         if req.yaw ~= nil then
             target.yaw = tonumber(req.yaw)
@@ -759,8 +835,19 @@ local function handle(req)
         local t0 = os.clock()
         local lastErr = nil
         local arrived = false
+        local lastBeat = 0
         while os.clock() - t0 < timeout do
             lastAlive = os.clock()
+            if (os.clock() - lastBeat) >= 0.8 then
+                writeStatus({
+                    last_cmd = "navigate_to",
+                    nav = true,
+                    mode = mode,
+                    target = { x = tx, z = tz },
+                    gentle = true,
+                })
+                lastBeat = os.clock()
+            end
             local okStep, errOrMsg, arr = pcall(function()
                 return drive.stepToward(control, target, mode, pid, 0.15)
             end)
@@ -789,6 +876,7 @@ local function handle(req)
             err = lastErr,
             pose_before = before,
             pose_after = after,
+            gentle = true,
         })
         return
     end
@@ -845,7 +933,10 @@ local function handle(req)
             cruiseTimeout = 420
         end
         local berthTimeout = tonumber(req.berth_timeout) or 60
-        local arriveDist = tonumber(req.arrive_dist) or port.arrive_dist or 4.5
+        local arriveDist = tonumber(req.arrive_dist) or port.arrive_dist or 20
+        if arriveDist < 16 then
+            arriveDist = 20
+        end
         local skipHandshake = req.handshake == false or req.skip_handshake == true
         local doApproach = req.approach ~= false
 
@@ -853,9 +944,28 @@ local function handle(req)
             local pid = drive.newPidStates()
             thrusting = true
             local t0 = os.clock()
+            local lastBeat = 0
             local lastErr, arrived = nil, false
             while os.clock() - t0 < timeout do
                 lastAlive = os.clock()
+                -- Abort if host raised /v1/abort (does not claim inbox cmds).
+                do
+                    local abortFlag = httpGetJson(transport.base_url .. "/v1/abort")
+                    if type(abortFlag) == "table" and abortFlag.abort then
+                        safeStop()
+                        return false, { distance = 999, aborted = true }, os.clock() - t0
+                    end
+                end
+                -- Keep HTTP /v1/status fresh so host does not declare agent dead mid-leg.
+                if (os.clock() - lastBeat) >= 0.8 then
+                    writeStatus({
+                        last_cmd = "go_port",
+                        nav = true,
+                        mode = mode,
+                        target = { x = target.x, z = target.z },
+                    })
+                    lastBeat = os.clock()
+                end
                 local okStep, errOrMsg, arr = pcall(function()
                     return drive.stepToward(control, target, mode, pid, 0.15)
                 end)
@@ -875,35 +985,106 @@ local function handle(req)
         end
 
         local phases = {}
-        if doApproach then
-            local ap = portsMod.approachOf(port)
-            ap.y = before.y
-            local okA, errA, elA = runNav(ap, "cruise", math.min(cruiseTimeout, 240), arriveDist + 2)
-            phases[#phases + 1] = {
-                phase = "approach",
-                ok = okA,
-                elapsed = elA,
-                distance = errA and errA.distance,
-                target = ap,
-            }
+        -- SAFETY: never navigate to shore landmark. Soft hold = offshore water only.
+        -- Reached if horiz ≤ ~20 of water hold. Gentle cruise / creep only.
+        local hold = portsMod.holdOf(port)
+        local softArrive = tonumber(req.arrive_dist) or port.arrive_dist
+            or (portsMod.SAFETY and portsMod.SAFETY.soft_arrive_dist) or 20
+        local softTol = port.dock_tol or (portsMod.SAFETY and portsMod.SAFETY.soft_tol) or 20
+        if softArrive < 16 then softArrive = 20 end
+        if softTol < 16 then softTol = 20 end
+
+        local function horizToHold(pose)
+            if not pose or not hold then
+                return 999
+            end
+            local dx = (pose.x or 0) - hold.x
+            local dz = (pose.z or 0) - hold.z
+            return math.sqrt(dx * dx + dz * dz)
         end
 
-        local berth = {
-            x = port.x,
-            y = before.y,
-            z = port.z,
-            yaw = port.yaw,
-        }
-        local okB, errB, elB = runNav(berth, "dock", berthTimeout, port.dock_tol or 2.5)
-        phases[#phases + 1] = {
-            phase = "berth_align",
-            ok = okB,
-            elapsed = elB,
-            distance = errB and errB.distance,
-            yaw_err = errB and errB.yaw,
-            target = berth,
-        }
-        safeStop()
+        local okB = false
+        local errB, elB = nil, 0
+        if horizToHold(before) <= softTol then
+            safeStop()
+            okB = true
+            phases[#phases + 1] = {
+                phase = "soft_water_hold",
+                ok = true,
+                skipped = true,
+                reason = "already_within_20",
+                distance = horizToHold(before),
+                target = hold,
+            }
+        else
+            -- Prefer direct cruise to WATER HOLD. Only use farther approach when it
+            -- is clearly closer than the hold (avoids driving away from a mid-corridor boat).
+            local ap = portsMod.approachOf(port)
+            local dHold0 = horizToHold(before)
+            local dAp = 999
+            if ap then
+                local dx = (before.x or 0) - ap.x
+                local dz = (before.z or 0) - ap.z
+                dAp = math.sqrt(dx * dx + dz * dz)
+            end
+            if doApproach and ap and dAp + 10 < dHold0 then
+                ap.y = before.y
+                local okA, errA, elA = runNav(ap, "cruise", math.min(cruiseTimeout, 240), softArrive)
+                phases[#phases + 1] = {
+                    phase = "approach_water",
+                    ok = okA,
+                    elapsed = elA,
+                    distance = errA and errA.distance,
+                    target = { x = ap.x, z = ap.z },
+                }
+            end
+            local mid = samplePose()
+            if mid and horizToHold(mid) <= softTol then
+                safeStop()
+                okB = true
+                phases[#phases + 1] = {
+                    phase = "soft_water_hold",
+                    ok = true,
+                    skipped = true,
+                    reason = "within_20_after_approach",
+                    distance = horizToHold(mid),
+                }
+            else
+                local waterHold = {
+                    x = hold.x,
+                    y = before.y,
+                    z = hold.z,
+                    yaw = hold.yaw or port.yaw,
+                }
+                -- Gentle cruise toward hold, then creep polish.
+                local okC, errC, elC = runNav(waterHold, "cruise", math.min(cruiseTimeout, 300), softArrive)
+                phases[#phases + 1] = {
+                    phase = "cruise_to_hold",
+                    ok = okC,
+                    elapsed = elC,
+                    distance = errC and errC.distance,
+                    target = { x = waterHold.x, z = waterHold.z },
+                }
+                local mid2 = samplePose()
+                if mid2 and horizToHold(mid2) <= softTol then
+                    safeStop()
+                    okB = true
+                    errB, elB = errC, elC
+                else
+                    okB, errB, elB = runNav(waterHold, "creep", math.max(berthTimeout, 180), softTol)
+                    phases[#phases + 1] = {
+                        phase = "soft_water_hold",
+                        ok = okB,
+                        elapsed = elB,
+                        distance = errB and errB.distance,
+                        yaw_err = errB and errB.yaw,
+                        target = { x = waterHold.x, z = waterHold.z },
+                        shore_landmark = { x = port.shore_x or port.x, z = port.shore_z or port.z },
+                    }
+                end
+            end
+            safeStop()
+        end
 
         local handshake = nil
         if not skipHandshake then
@@ -916,59 +1097,84 @@ local function handle(req)
         end
 
         local after = samplePose()
-        local distFinal = nil
-        if after then
-            local dx = (after.x or 0) - port.x
-            local dz = (after.z or 0) - port.z
-            distFinal = math.sqrt(dx * dx + dz * dz)
+        local distFinal = horizToHold(after)
+        local arrived = okB or (distFinal <= softTol)
+        if arrived then
+            safeStop()
         end
-        local arrived = okB or (distFinal ~= nil and distFinal <= (port.dock_tol or 2.5) * 1.6)
         reply(req, true, {
-            port = port,
-            boat_dock = portsMod.BOAT_DOCK,
-            shore_dock = port.dock_block,
+            port_id = port.id,
+            soft_dock = true,
+            water_hold = { x = hold.x, z = hold.z, yaw = hold.yaw },
+            shore_landmark = { x = port.shore_x or port.x, z = port.shore_z or port.z },
             arrived = arrived and true or false,
             distance = distFinal,
+            soft_tol = softTol,
             phases = phases,
-            handshake = handshake,
+            handshake = handshake and { ok = handshake.ok, mode = handshake.mode } or nil,
             pose_before = before,
             pose_after = after,
+            safety = "soft_water_hold_horiz_le_20_gentle",
         })
         return
     end
 
-    -- Hold berth pose (position + yaw) in dock mode until aligned or timeout.
+    -- Soft water hold only (NOT exact shore coords). Optional yaw nudge in cruise.
     if cmd == "berth_align" or cmd == "hold_pose" then
         local control = drive.loadControl()
         if not control then
             reply(req, false, nil, "no boat_control.json")
             return
         end
+        package.loaded["ports"] = nil
+        local portsMod = require("ports")
         local before, berr = samplePose()
         if not before then
             reply(req, false, nil, berr or "pose failed")
             return
         end
-        local tx = tonumber(req.x) or before.x
-        local tz = tonumber(req.z) or before.z
+        -- If port id given, use water hold; else treat x/z as already a water target.
+        local hold = nil
+        if req.port or req.port_id then
+            local port = portsMod.get(req.port or req.port_id)
+            if port then
+                hold = portsMod.holdOf(port)
+            end
+        end
+        local tx = hold and hold.x or tonumber(req.x) or before.x
+        local tz = hold and hold.z or tonumber(req.z) or before.z
         local ty = tonumber(req.y) or before.y
-        local tyaw = tonumber(req.yaw)
+        local tyaw = hold and hold.yaw or tonumber(req.yaw)
         if tyaw == nil and req.yaw_deg ~= nil then
             tyaw = math.rad(tonumber(req.yaw_deg) or 0)
         end
-        local timeout = tonumber(req.timeout) or 45
-        if timeout > 120 then
-            timeout = 120
+        -- Refuse known shore landmarks as final targets (force offshore).
+        local sx, sz = 341, 163
+        local sx2, sz2 = 383, 285
+        if (math.abs(tx - sx) < 3 and math.abs(tz - sz) < 3)
+            or (math.abs(tx - sx2) < 3 and math.abs(tz - sz2) < 3)
+        then
+            local port = portsMod.get((math.abs(tx - sx) < 3) and "port_a" or "port_b")
+            hold = portsMod.holdOf(port)
+            tx, tz = hold.x, hold.z
+            tyaw = hold.yaw
+        end
+        local timeout = tonumber(req.timeout) or 40
+        if timeout > 90 then
+            timeout = 90
         end
         local target = { x = tx, y = ty, z = tz, yaw = tyaw }
         local pid = drive.newPidStates()
         thrusting = true
         local t0 = os.clock()
         local lastErr, arrived = nil, false
+        local softTol = (portsMod.SAFETY and portsMod.SAFETY.soft_tol) or 20
+        if softTol < 16 then softTol = 20 end
         while os.clock() - t0 < timeout do
             lastAlive = os.clock()
+            writeStatus({ last_cmd = "berth_align", soft = true, target = { x = tx, z = tz } })
             local okStep, errOrMsg, arr = pcall(function()
-                return drive.stepToward(control, target, "dock", pid, 0.12)
+                return drive.stepToward(control, target, "creep", pid, 0.12)
             end)
             if not okStep then
                 safeStop()
@@ -977,7 +1183,8 @@ local function handle(req)
             end
             lastErr, arrived = errOrMsg, arr
             drive.flushMotors(4)
-            if arrived then
+            if arrived or (lastErr and (lastErr.distance or 99) <= softTol) then
+                arrived = true
                 break
             end
             sleep(0.12)
@@ -985,14 +1192,16 @@ local function handle(req)
         safeStop()
         reply(req, true, {
             arrived = arrived and true or false,
+            soft_dock = true,
             target = target,
             elapsed = os.clock() - t0,
             err = lastErr,
             pose_before = before,
             pose_after = samplePose(),
+            safety = "soft_water_hold_only_never_shore",
             handshake = {
                 kind = "psi_stub",
-                note = "Create portable_storage_interface align — redstone/funnel handshake is software stub",
+                note = "No exact shore align — open-water hold only",
             },
         })
         return
@@ -1039,6 +1248,17 @@ end
 
 -- Boot: always stop motors first.
 loadBridgeConfig()
+-- Survive reboots: ensure craft shell re-enters the agent.
+pcall(function()
+    if not fs.exists("startup") and not fs.exists("startup.lua") then
+        local f = fs.open("startup", "w")
+        if f then
+            f.write('shell.run("test_agent")\n')
+            f.close()
+            print("Wrote /startup -> test_agent")
+        end
+    end
+end)
 print("Realtime test agent")
 if transport.mode == "http" then
     print("  mode    http")

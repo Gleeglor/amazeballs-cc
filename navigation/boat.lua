@@ -106,35 +106,50 @@ local function dockSession(cfg, portId)
     local berth = portsLib.get(portId)
     local control = drive.loadControl()
     if berth and control then
-        print("Aligning to berth " .. portId)
+        print("Soft water hold " .. portId .. " (≤20 blocks, gentle)")
         local craft = pose.get()
         local y = craft.position.y
+        local softTol = (portsLib.SAFETY and portsLib.SAFETY.soft_tol) or 20
+        local hold = portsLib.holdOf(berth)
+        hold.y = y
         local approach = portsLib.approachOf(berth)
         approach.y = y
-        local pid = drive.newPidStates()
-        local t0 = os.clock()
-        local timeout = (cfg.dock_timeout) or 120
-        while os.clock() - t0 < timeout * 0.55 do
-            local err, arrived = drive.stepToward(control, approach, "cruise", pid, 0.15)
-            drive.flushMotors(4)
-            if arrived or (err and err.distance and err.distance < 5) then
-                break
-            end
-            sleep(0.15)
+        local function horiz(p, t)
+            local dx = p.position.x - t.x
+            local dz = p.position.z - t.z
+            return math.sqrt(dx * dx + dz * dz)
         end
-        local berthTarget = { x = berth.x, y = y, z = berth.z, yaw = berth.yaw }
-        pid = drive.newPidStates()
-        local t1 = os.clock()
-        while os.clock() - t1 < timeout * 0.45 do
-            local err, arrived = drive.stepToward(control, berthTarget, "dock", pid, 0.12)
-            drive.flushMotors(4)
-            if arrived then
-                break
+        if horiz(craft, hold) <= softTol then
+            drive.allOff(control)
+            print("Already within soft hold")
+        else
+            local pid = drive.newPidStates()
+            local t0 = os.clock()
+            local timeout = (cfg.dock_timeout) or 120
+            while os.clock() - t0 < timeout * 0.55 do
+                local err, arrived = drive.stepToward(control, approach, "cruise", pid, 0.15)
+                drive.flushMotors(4)
+                craft = pose.get()
+                if arrived or horiz(craft, hold) <= softTol or (err and err.distance and err.distance < softTol) then
+                    break
+                end
+                sleep(0.15)
             end
-            sleep(0.12)
+            if horiz(pose.get(), hold) > softTol then
+                pid = drive.newPidStates()
+                local t1 = os.clock()
+                while os.clock() - t1 < timeout * 0.45 do
+                    local err, arrived = drive.stepToward(control, hold, "creep", pid, 0.12)
+                    drive.flushMotors(4)
+                    if arrived or (err and err.distance and err.distance <= softTol) then
+                        break
+                    end
+                    sleep(0.12)
+                end
+            end
+            drive.allOff(control)
         end
-        drive.allOff(control)
-        print("Berth align done")
+        print("Soft hold done")
     end
     announceArrived(cfg, portId)
     if cfg.docking and cfg.docking.use_stub_handshake ~= false then
