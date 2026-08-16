@@ -1229,7 +1229,8 @@ local function handle(req)
         thrusting = true
         local before = samplePose()
         local okF, reason = drive.followPath(control, data.waypoints, {
-            engage_distance = tonumber(req.engage_distance) or 12,
+            engage_distance = tonumber(req.engage_distance) or 22,
+            arrive_dist = tonumber(req.arrive_dist) or 20,
             timeout = tonumber(req.timeout) or 240,
         })
         safeStop()

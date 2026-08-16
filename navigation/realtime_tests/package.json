@@ -16,6 +16,7 @@
     "recover": "node recover_overnight.mjs",
     "deploy:reboot": "node deploy_http.mjs --reboot",
     "run-reboot": "node run_and_reboot.mjs",
-    "finish": "node run_and_reboot.mjs --section dual"
+    "finish": "node run_and_reboot.mjs --section dual",
+    "boat-run-smoke": "node boat_run_smoke.mjs"
   }
 }

@@ -21,10 +21,10 @@ ports.SAFETY = {
     soft_arrive_dist = SOFT_ARRIVE,
     soft_tol = SOFT_TOL,
     horiz_arrive = 20,
-    max_approach_speed = 0.15,
-    cruise_rpm_cap = 14,
-    creep_rpm_cap = 8,
-    note = "Reached if horiz ≤20 of water hold; gentle pushes only; never seek shore coords",
+    max_approach_speed = 0.2,
+    cruise_rpm_cap = 36,
+    creep_rpm_cap = 18,
+    note = "Reached if horiz ≤20 of water hold; surge-biased gentle cruise; never seek shore coords",
 }
 
 ports.BOAT_DOCK = {

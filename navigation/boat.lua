@@ -17,7 +17,7 @@ local function defaultConfig()
             { id = "port_a", x = 341, z = 163, yaw_deg = 0, arrival = "to_port_a", depart = "a_to_b" },
             { id = "port_b", x = 383, z = 285, yaw_deg = 180, arrival = "to_port_b", depart = "b_to_a" },
         },
-        -- Alternating A↔B logistics route
+        -- Alternating A↔B soft water corridor (holds, not shore landmarks)
         route = {
             { port_id = "port_a", path = "to_port_a" },
             { port_id = "port_b", path = "to_port_b" },

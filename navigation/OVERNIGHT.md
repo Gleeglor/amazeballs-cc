@@ -62,13 +62,16 @@ Expect: ping, load_control, idle stop, W motion, A yaw (Δyaw° negative), D opp
 
 ```text
 boat
-run          # A↔B soft water route (config route)
+run          # A↔B soft water corridor (config route → followPath)
 ```
 
 Or host:
 ```bash
+npm run boat-run-smoke           # follow_path A↔B (or --go-port)
 node dual_dock_live.mjs          # go_port B then A, arrive_dist 20
 ```
+
+Expect clear forward progress (not yaw-only spin). Soft arrive ≤20 of **water holds**.
 
 Agent cmd: `go_port` with `arrive_dist: 20`, `handshake: false`, gentle cruise/creep.
 

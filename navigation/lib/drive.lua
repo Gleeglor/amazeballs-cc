@@ -2238,28 +2238,29 @@ function drive.stepToward(control, target, mode, pidStates, dt)
         return err, true
     end
 
-    -- Gentle authority by range (never hold full ±1 wrench on long legs).
-    -- Cap effective RPM ~12–16 even when motors allow 24–96.
+    -- Gentle but usable authority: ~36 RPM cruise beats water drag; old ~14
+    -- left yaw PID spinning while surge lost to Create boat drag.
     local maxRpm = tonumber(control and control.default_motor_rpm) or DEFAULT_MAX_RPM
     if maxRpm < 1 then
         maxRpm = DEFAULT_MAX_RPM
     end
-    local cruiseRpmCap = 14
-    local creepRpmCap = 8
-    local pulseRpmCap = 5
+    local cruiseRpmCap = 36
+    local midRpmCap = 28
+    local creepRpmCap = 18
+    local pulseRpmCap = 10
     local rpmAuth = function(rpmCap)
         return rpmCap / math.max(24, maxRpm)
     end
 
-    -- Fraction of wrench: cruise ~30–45% of the *capped* band, not of full ±1.
-    local auth = math.min(0.45, rpmAuth(cruiseRpmCap))
+    -- Fraction of wrench from soft RPM caps (still far below full ±1 / 96 RPM).
+    local auth = math.min(0.55, rpmAuth(cruiseRpmCap))
     if mode == "creep" or mode == "dock" then
         auth = math.min(auth, rpmAuth(creepRpmCap))
     end
     if dist <= 28 then
         auth = math.min(auth, rpmAuth(creepRpmCap))
     elseif dist <= 55 then
-        auth = math.min(auth, rpmAuth(11))
+        auth = math.min(auth, rpmAuth(midRpmCap))
     elseif dist <= 90 then
         auth = math.min(auth, rpmAuth(cruiseRpmCap))
     end
@@ -2277,48 +2278,62 @@ function drive.stepToward(control, target, mode, pidStates, dt)
     end
 
     local fwdCmd, yawCmd, strafeCmd = 0, 0, 0
+    local bearing = math.atan2(err.right or 0, math.max(0.01, err.forward or 0))
 
     -- Overshoot: past the point along craft forward → reverse creep, don't plow.
     if (err.forward or 0) < -3 then
-        fwdCmd = util.clamp((err.forward or 0) * 0.035, -0.14, -0.04)
-        yawCmd = simplePid(pidStates.yaw, err.yaw or 0, kp_y * 0.2, 0, 0.02, dt, -0.2, 0.2)
+        fwdCmd = util.clamp((err.forward or 0) * 0.04, -0.18, -0.05)
+        yawCmd = simplePid(pidStates.yaw, err.yaw or 0, kp_y * 0.18, 0, 0.02, dt, -0.18, 0.18)
         strafeCmd = 0
         auth = math.min(auth, rpmAuth(creepRpmCap))
     elseif mode == "dock" or mode == "creep" or pulsing then
-        fwdCmd = simplePid(pidStates.forward, err.forward, kp_f * 0.12, 0.002, 0.03, dt, -1, 1)
-        yawCmd = simplePid(pidStates.yaw, err.yaw, kp_y * 0.2, 0.002, 0.02, dt, -1, 1)
-        strafeCmd = simplePid(pidStates.right, err.right, kp_s * 0.1, 0.002, 0.02, dt, -1, 1)
-        local scale = math.min(1, (dock.max_speed or 0.15) / 0.35)
+        fwdCmd = simplePid(pidStates.forward, err.forward, kp_f * 0.14, 0.002, 0.03, dt, -1, 1)
+        yawCmd = simplePid(pidStates.yaw, err.yaw, kp_y * 0.18, 0.002, 0.02, dt, -1, 1)
+        strafeCmd = simplePid(pidStates.right, err.right, kp_s * 0.08, 0.002, 0.02, dt, -1, 1)
+        local scale = math.min(1, (dock.max_speed or 0.2) / 0.35)
         fwdCmd = fwdCmd * scale
         strafeCmd = strafeCmd * scale
     else
-        -- Scale surge demand with distance so long legs are not constant full command.
-        local distScale = util.clamp(dist / 120, 0.25, 1.0)
-        fwdCmd = simplePid(pidStates.forward, err.forward, kp_f * 0.18 * distScale, 0.002, 0.04, dt, -1, 1)
-        local bearing = math.atan2(err.right, math.max(0.01, err.forward))
-        if target.yaw ~= nil and dist < 40 then
-            yawCmd = simplePid(pidStates.yaw, err.yaw, kp_y * 0.3, 0.002, 0.025, dt, -1, 1)
+        -- Cruise: bias surge so long legs make forward progress even while yawing.
+        local distScale = util.clamp(dist / 90, 0.4, 1.0)
+        fwdCmd = simplePid(pidStates.forward, math.max(err.forward, dist * 0.35), kp_f * 0.28 * distScale, 0.003, 0.04, dt, -1, 1)
+        -- Keep ≥55% surge while turning (old behavior starved fx → yaw-only spin).
+        local turnKeep = util.clamp(1.0 - math.abs(bearing) / 2.2, 0.55, 1.0)
+        fwdCmd = math.max(fwdCmd, 0.55 * distScale) * turnKeep
+        if target.yaw ~= nil and dist < 35 then
+            yawCmd = simplePid(pidStates.yaw, err.yaw, kp_y * 0.22, 0.002, 0.02, dt, -1, 1)
         else
-            yawCmd = simplePid(pidStates.yaw, bearing, kp_y * 0.35, 0.002, 0.025, dt, -1, 1)
+            yawCmd = simplePid(pidStates.yaw, bearing, kp_y * 0.28, 0.002, 0.02, dt, -1, 1)
         end
         strafeCmd = 0
     end
 
+    -- Prefer surge over yaw: yaw authority below surge so cancel/PID can't eat thrust.
+    local yawAuth = math.min(auth * 0.55, 0.2)
     fwdCmd = util.clamp(fwdCmd * auth, -auth, auth)
-    yawCmd = util.clamp(yawCmd * math.min(1, auth + 0.08), -math.min(0.35, auth + 0.12), math.min(0.35, auth + 0.12))
-    strafeCmd = util.clamp(strafeCmd * auth, -auth, auth)
+    yawCmd = util.clamp(yawCmd * yawAuth, -yawAuth, yawAuth)
+    strafeCmd = util.clamp(strafeCmd * math.min(auth, rpmAuth(creepRpmCap)), -auth, auth)
 
     if drive.isWrenchMode(control) then
         local cmd = { fx = fwdCmd, fy = strafeCmd, tz = yawCmd }
-        if mode == "cruise" then
+        -- Skip live trim on long cruise legs: yaw/strafe cancel fights weak surge.
+        if mode == "cruise" and dist <= tolPos + 12 then
             cmd, pidStates.trim = drive.trimCommand(control, cmd, pidStates.trim, dt)
-            if math.abs(yawCmd) >= 0.05 then
+            if math.abs(yawCmd) >= 0.04 then
                 cmd.tz = yawCmd
             end
-            -- Re-clamp after trim so trim cannot restore full authority.
             cmd.fx = util.clamp(cmd.fx or 0, -auth, auth)
-            cmd.fy = util.clamp(cmd.fy or 0, -auth, auth)
-            cmd.tz = util.clamp(cmd.tz or 0, -0.45, 0.45)
+            cmd.fy = util.clamp(cmd.fy or 0, -math.min(auth, 0.12), math.min(auth, 0.12))
+            cmd.tz = util.clamp(cmd.tz or 0, -yawAuth, yawAuth)
+        else
+            cmd.fy = 0
+        end
+        -- Floor forward when heading roughly toward target (clear water progress).
+        if mode == "cruise" and not pulsing and (err.forward or 0) > 2 then
+            local floor = auth * 0.5
+            if (cmd.fx or 0) < floor then
+                cmd.fx = floor
+            end
         end
         drive.applyCommand(control, cmd.fx, cmd.fy, cmd.tz)
         drive.flushMotors(4)
@@ -2351,14 +2366,18 @@ function drive.followPath(control, waypoints, opts)
     end
 
     local dock = control.dock_assist or {}
-    local engage = opts.engage_distance or dock.engage_distance or 20
+    local engage = opts.engage_distance or dock.engage_distance or 22
     if engage < 16 then
-        engage = 20
+        engage = 22
     end
     local holdTicks = opts.hold_ticks or 2
+    -- Soft waypoint / end arrive: 15–25 blocks (default 20).
     local softArrive = tonumber(opts.arrive_dist) or tonumber(dock.tol_pos) or 20
-    if softArrive < 16 then
+    if softArrive < 15 then
         softArrive = 20
+    end
+    if softArrive > 25 then
+        softArrive = 25
     end
     local dt = opts.dt or 0.1
     local timeout = tonumber(opts.timeout) or 300
@@ -2370,6 +2389,18 @@ function drive.followPath(control, waypoints, opts)
     end
     local pidStates = drive.newPidStates()
     local i = path.nearestIndex(waypoints)
+    -- Prefer progressing toward the end: if nearest is already "reached", skip ahead.
+    local function horizTo(wp, craft)
+        local dx = wp.x - craft.position.x
+        local dz = wp.z - craft.position.z
+        return math.sqrt(dx * dx + dz * dz)
+    end
+    do
+        local craft0 = pose.get()
+        while i < #waypoints and horizTo(waypoints[i], craft0) <= softArrive do
+            i = i + 1
+        end
+    end
     local hold = 0
     local t0 = os.clock()
 
@@ -2380,42 +2411,39 @@ function drive.followPath(control, waypoints, opts)
         end
         local craft = pose.get()
         local last = waypoints[#waypoints]
-        local distLast = math.sqrt((last.x - craft.position.x) ^ 2 + (last.z - craft.position.z) ^ 2)
-        -- Soft: within 20 of final water waypoint = done (no exact dock mode slam).
+        local distLast = horizTo(last, craft)
+        -- Soft: within arrive of final water waypoint = done (no exact dock slam).
         if distLast <= softArrive then
             drive.allOff(control)
             return true, "arrived_soft"
         end
+        -- Skip any waypoints already inside soft radius (don't orbit one WP forever).
+        while i < #waypoints and horizTo(waypoints[i], craft) <= softArrive do
+            i = i + 1
+        end
         local mode = "cruise"
         local target = waypoints[math.min(i, #waypoints)]
+        -- Look ahead one WP when current is close so we aim down the corridor.
+        if i < #waypoints and horizTo(target, craft) <= softArrive + 8 then
+            target = waypoints[math.min(i + 1, #waypoints)]
+        end
         if distLast <= engage or i >= #waypoints then
             mode = "cruise"
             target = last
         end
 
         local err, arrived = drive.stepToward(control, target, mode, pidStates, dt)
-        if mode == "cruise" then
-            if err.distance < softArrive then
-                i = math.min(i + 1, #waypoints)
-            end
-            hold = 0
-            if arrived and i >= #waypoints then
-                hold = hold + 1
-                if hold >= holdTicks then
-                    drive.allOff(control)
-                    return true, "arrived"
-                end
+        if err and err.distance and err.distance < softArrive then
+            i = math.min(i + 1, #waypoints)
+        end
+        if (arrived or distLast <= softArrive) and i >= #waypoints then
+            hold = hold + 1
+            if hold >= holdTicks then
+                drive.allOff(control)
+                return true, "arrived"
             end
         else
-            if arrived then
-                hold = hold + 1
-                if hold >= holdTicks then
-                    drive.allOff(control)
-                    return true, "arrived"
-                end
-            else
-                hold = 0
-            end
+            hold = 0
         end
         drive.flushMotors(2)
         sleep(dt)
