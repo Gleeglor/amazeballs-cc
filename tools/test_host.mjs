@@ -336,7 +336,7 @@ function test_agent() {
 const KEYS = { w: 17, s: 31, a: 30, d: 32, x: 45, q: 16 };
 const HOLD_TIMEOUT = 1.0; // must exceed OS key-repeat initial delay
 
-function commandFromHeld(held, yawSign = -1) {
+function commandFromHeld(held, yawSign = 1) {
   let surge = 0,
     strafe = 0,
     yaw = 0;
