@@ -46,6 +46,8 @@ export function getCom(control, opts = {}) {
 
 export function getYawSign(control) {
   const s = Number(control && control.yaw_sign);
+  // Sim fixtures use pilot/geometric left+ tz with yaw_sign=+1.
+  // In-game v8 raw-ω calib writes yaw_sign=-1 explicitly.
   return Number.isFinite(s) && s !== 0 ? Math.sign(s) : 1;
 }
 
@@ -395,6 +397,59 @@ export function thrusterSide(t) {
   return 0;
 }
 
+/** Pure A/D: light both port and starboard when LS/teleop only drove one side. */
+export function ensureYawDifferential(thrusters, duties, tzCmd, opts = {}) {
+  const deadband = opts.deadband ?? DUTY_DEADBAND;
+  if (!thrusters || !duties || Math.abs(tzCmd || 0) < 0.5) return duties;
+  const out = duties.map((d) => d || 0);
+  const portIdx = [];
+  const stbdIdx = [];
+  let portMax = 0;
+  let stbdMax = 0;
+  for (let i = 0; i < thrusters.length; i++) {
+    const s = thrusterSide(thrusters[i]);
+    if (s < -0.05) {
+      portIdx.push(i);
+      portMax = Math.max(portMax, Math.abs(out[i]));
+    } else if (s > 0.05) {
+      stbdIdx.push(i);
+      stbdMax = Math.max(stbdMax, Math.abs(out[i]));
+    }
+  }
+  if (!portIdx.length || !stbdIdx.length) return out;
+  if (portMax >= deadband && stbdMax >= deadband) return out;
+  const hotMax = Math.max(portMax, stbdMax);
+  if (hotMax < deadband) return out;
+  const cold = portMax < deadband ? portIdx : stbdIdx;
+  let bestI = -1;
+  let bestContrib = 0;
+  for (const i of cold) {
+    const t = thrusters[i];
+    const tz = Number(t.tz) || 0;
+    const auth = yawAuthority(t, thrusterSide(t));
+    const contrib = Math.max(Math.abs(tz), Math.abs(auth) * 0.35);
+    if (contrib > bestContrib) {
+      bestContrib = contrib;
+      bestI = i;
+    }
+  }
+  if (bestI < 0 || bestContrib < 1e-6) return out;
+  const t = thrusters[bestI];
+  const tz = Number(t.tz) || 0;
+  let dutySign;
+  if (Math.abs(tz) >= 0.015) {
+    dutySign = tzCmd * tz >= 0 ? 1 : -1;
+  } else {
+    const auth = yawAuthority(t, thrusterSide(t));
+    if (auth === 0) return out;
+    dutySign = tzCmd * auth >= 0 ? 1 : -1;
+  }
+  const mag = Math.max(deadband, Math.min(1, hotMax * 0.9));
+  const reversible = t.kind === "motor";
+  out[bestI] = clamp(dutySign * mag, reversible ? -1 : 0, 1);
+  return out;
+}
+
 function dutiesAlive(duties, eps = DUTY_DEADBAND) {
   return Array.isArray(duties) && duties.some((d) => Math.abs(d || 0) >= eps);
 }
@@ -647,6 +702,10 @@ export function applyCardinalRoles(control, fx = 0, fy = 0, tz = 0, opts = {}) {
 
   if (!dutiesAlive(duties)) {
     return { ok: false, duties, branch: "deadband" };
+  }
+
+  if (isPureYaw(fx, fy, tz)) {
+    duties = ensureYawDifferential(thrusters, duties, tz);
   }
 
   // Duty-space yaw null for pure surge/strafe (skipCancel path used by cancel loop).
@@ -1114,12 +1173,16 @@ export function applyTeleop(control, fx = 0, fy = 0, tz = 0, opts = {}) {
   }
 
   const scale = Math.min(1, cmdMag);
-  const duties = new Array(n);
+  let duties = new Array(n);
   for (let i = 0; i < n; i++) {
     let duty = ((scores[i] || 0) / maxAbs) * scale;
     if (Math.abs(duty) < DUTY_DEADBAND) duty = 0;
     const reversible = thrusters[i].kind === "motor";
     duties[i] = reversible ? clamp(duty, -1, 1) : clamp(duty, 0, 1);
+  }
+
+  if (pureYaw) {
+    duties = ensureYawDifferential(thrusters, duties, tz);
   }
 
   return { ok: true, duties, branch, useEqual, useCalibTz, sides, scores };
@@ -1287,6 +1350,8 @@ export function applyReassembly(control, fx = 0, fy = 0, tz = 0, opts = {}) {
     duties = ensureSurgeDuties(thrusters, duties, fx, { deadband: dutyDeadband });
   } else if (pureStrafe || (strafePriority && absTz < 0.35)) {
     duties = ensureStrafeDuties(thrusters, duties, fy, { deadband: dutyDeadband });
+  } else if (absTz >= 0.5 && absFx + absFy < 0.25) {
+    duties = ensureYawDifferential(thrusters, duties, tz, { deadband: dutyDeadband });
   }
 
   return { ok: true, duties, branch: "reassembly", axW, dutyDeadband };

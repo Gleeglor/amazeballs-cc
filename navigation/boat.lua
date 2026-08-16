@@ -187,8 +187,10 @@ local function runCalibrate(argStr)
     print()
     drive.stopAllMotors({ drain_timeout = 0.5 })
     local control, err = navCal.run({
-        pulse = 0.85,
-        settle = 0.7,
+        pulse = 2.0,
+        settle = 0.8,
+        window_start = 0.5,
+        window_end = 1.5,
         use_sides = false,
         invert_analog = opts.invert_analog,
         probe_rpm = opts.probe_rpm,

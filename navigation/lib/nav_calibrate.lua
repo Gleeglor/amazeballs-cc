@@ -53,7 +53,7 @@ local function sampleMotion()
     local vel = pose.getVelocity()
     local ang = pose.getAngularVelocity()
     local localV = pose.worldToLocal(vel, craft)
-    -- +yaw = CCW / craft-left (see pose.yawRate); raw ω·up is CW in Y-up Minecraft.
+    -- Raw ω·up (see pose.yawRate). Pilot A=left is applied once via yaw_sign.
     local yawRate = pose.yawRate(craft, ang)
     return {
         forward = localV.forward,
@@ -68,25 +68,38 @@ local function wrenchMag(w)
     return math.sqrt(w.fx * w.fx + w.fy * w.fy + w.tz * w.tz)
 end
 
-local function pulseOne(actuator, duration, control, probeRpm)
-    if actuator.kind == "motor" then
-        drive.setMotorRpmNow(actuator.name, probeRpm or actuator.max_rpm or 24)
-        sleep(duration)
-        drive.setMotorRpmNow(actuator.name, 0)
-    else
-        drive.setActuator(control, actuator, 1)
-        sleep(duration)
-        drive.setActuator(control, actuator, 0)
+--- Steady mid-window wrench while thrusting (default 2.0s pulse, sample 0.5→1.5s).
+-- Avoids startup transient and post-pulse spin-down that flipped tz signs.
+local function measureActuator(actuator, opts, control, probeRpm)
+    opts = opts or {}
+    local pulse = opts.pulse or 2.0
+    local win0 = opts.window_start or 0.5
+    local win1 = opts.window_end or 1.5
+    if win1 > pulse then
+        win1 = pulse
     end
-end
+    if win0 < 0 then
+        win0 = 0
+    end
+    if win0 >= win1 then
+        win0, win1 = 0.5, math.min(1.5, pulse)
+    end
 
-local function measureActuator(actuator, duration, control, probeRpm)
     allOff({ actuator }, control)
     sleep(0.25)
+
+    if actuator.kind == "motor" then
+        drive.setMotorRpmNow(actuator.name, probeRpm or actuator.max_rpm or 24)
+    else
+        drive.setActuator(control, actuator, 1)
+    end
+
+    sleep(win0)
     local before = sampleMotion()
-    pulseOne(actuator, duration, control, probeRpm)
-    sleep(0.25)
+    sleep(math.max(0, win1 - win0))
     local after = sampleMotion()
+    sleep(math.max(0, pulse - win1))
+
     allOff({ actuator }, control)
     local w = {
         fx = after.forward - before.forward,
@@ -96,7 +109,6 @@ local function measureActuator(actuator, duration, control, probeRpm)
     w.mag = wrenchMag(w)
     return w
 end
-
 function calibrate.describe(w)
     local af, ar, ay = math.abs(w.fx), math.abs(w.fy), math.abs(w.tz)
     local m = math.max(af, ar, ay)
@@ -245,9 +257,11 @@ end
 
 function calibrate.run(opts)
     opts = opts or {}
-    -- Longer pulse/settle so Create craft yaw rate dies between probes (cleaner facing).
-    local pulse = opts.pulse or 0.85
-    local settle = opts.settle or 0.7
+    -- 2s thrust; wrench from steady mid-window 0.5→1.5s (not pre/post pulse).
+    local pulse = opts.pulse or 2.0
+    local settle = opts.settle or 0.8
+    local win0 = opts.window_start or 0.5
+    local win1 = opts.window_end or 1.5
     local useSides = opts.use_sides == true
     local probeRpm = opts.probe_rpm or 24
     if probeRpm > 24 then
@@ -257,7 +271,11 @@ function calibrate.run(opts)
     local fePerRpm = opts.fe_per_rpm or 1
     local linFloor = (opts.thresholds and opts.thresholds.linear) or 0.03
     local yawFloor = (opts.thresholds and opts.thresholds.yaw) or 0.008
-
+    local measureOpts = {
+        pulse = pulse,
+        window_start = win0,
+        window_end = win1,
+    }
     local prev = drive.loadControl() or {}
     local invert = opts.invert_analog
     if invert == nil then
@@ -269,10 +287,15 @@ function calibrate.run(opts)
     print("Calibrate (Reassembly / wrench mode)")
     print("Actuators: Create Addition electric_motor + redstone_relay")
     print("Motors: probes +RPM and -RPM (reverse thrust)")
+    print(string.format(
+        "Pulse %.2fs; wrench window %.2f→%.2fs while thrusting (steady mid-window).",
+        pulse,
+        win0,
+        win1
+    ))
     print("Motion vs CoM → force + torque (no modem GPS needed).")
     print(string.format("Motor probe/max RPM: %s  |  power budget: %s RF/t (≈%s FE per RPM)",
-        tostring(probeRpm), tostring(powerBudget), tostring(fePerRpm)))
-    if invert then
+        tostring(probeRpm), tostring(powerBudget), tostring(fePerRpm)))    if invert then
         print("Relay invert ON (motors ignore this — 0 RPM is always off)")
     end
     print("Motor probe RPM: " .. tostring(probeRpm))
@@ -330,13 +353,12 @@ function calibrate.run(opts)
 
         if a.kind == "motor" then
             print("  +RPM ...")
-            local wPlus = measureActuator(a, pulse, probeControl, probeRpm)
+            local wPlus = measureActuator(a, measureOpts, probeControl, probeRpm)
             print(string.format("    +  fx=%.3f fy=%.3f tz=%.3f", wPlus.fx, wPlus.fy, wPlus.tz))
-            sleep(math.max(0.7, settle)) -- let yaw rate die before reverse probe
+            sleep(math.max(0.8, settle)) -- let yaw rate die before reverse probe
             print("  -RPM ...")
-            local wMinus = measureActuator(a, pulse, probeControl, -probeRpm)
+            local wMinus = measureActuator(a, measureOpts, probeControl, -probeRpm)
             print(string.format("    -  fx=%.3f fy=%.3f tz=%.3f", wMinus.fx, wMinus.fy, wMinus.tz))
-
             local plusOk = wPlus.mag >= linFloor or math.abs(wPlus.tz) >= yawFloor
             local minusOk = wMinus.mag >= linFloor or math.abs(wMinus.tz) >= yawFloor
 
@@ -394,21 +416,10 @@ function calibrate.run(opts)
             end
             w.mag = wrenchMag(w)
         else
-            allOff(actuators, probeControl)
-            sleep(settle)
-            local before = sampleMotion()
-            pulseOne(a, pulse, probeControl, probeRpm)
-            sleep(settle)
-            local after = sampleMotion()
-            allOff(actuators, probeControl)
-            w = {
-                name = a.name,
-                kind = a.kind,
-                fx = after.forward - before.forward,
-                fy = after.right - before.right,
-                tz = after.yaw - before.yaw,
-            }
-            w.mag = wrenchMag(w)
+            print("  relay pulse ...")
+            w = measureActuator(a, measureOpts, probeControl, probeRpm)
+            w.name = a.name
+            w.kind = a.kind
         end
 
         local fHoriz = math.sqrt(w.fx * w.fx + w.fy * w.fy)
@@ -457,12 +468,13 @@ function calibrate.run(opts)
     end
 
     local control = {
-        version = 7,
+        version = 8,
         mode = "wrench",
         alloc_mode = "reassembly",
-        -- +tz = CCW from above = A / craft-left (pose.yawRate negates Minecraft ω·up).
-        -- Override to -1 only if motors are wired backwards after a fresh recalibrate.
-        yaw_sign = 1,
+        -- Measured tz uses raw ω·up (Minecraft Y-up ≈ CW+/right+). Pilot +tz = A/left
+        -- is applied once here — do NOT also negate pose.yawRate (that double-flipped v7).
+        -- Set to +1 only if A still turns right after a fresh v8 recalibrate.
+        yaw_sign = -1,
         com_compensate = true,
         invert_analog = invert,
         default_motor_rpm = probeRpm,

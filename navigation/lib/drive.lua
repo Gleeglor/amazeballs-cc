@@ -94,7 +94,7 @@ local motorDesired = {}
 local motorSent = {}
 local motorWrapCache = {}
 local lastMotorFlushAt = 0
-local MOTOR_FLUSH_GAP = 0.06 -- Create Addition global anti-spam is picky
+local MOTOR_FLUSH_GAP = 0.028 -- CCA anti-spam; keep short so first setRPM feels snappy
 
 local function clampMotorRpm(rpm, maxRpm)
     maxRpm = math.min(math.abs(tonumber(maxRpm) or DEFAULT_MAX_RPM), DEFAULT_MAX_RPM)
@@ -346,6 +346,7 @@ function drive.setMotorRpmNow(name, rpm, timeout)
 end
 
 --- Push pending motor targets. budget = max peripheral calls this invoke.
+-- Stops first (bypass anti-spam gap), then largest |RPM| so main surge/yaw leaders fire ASAP.
 function drive.flushMotors(budget)
     budget = budget or 2
     local now = os.clock()
@@ -368,7 +369,7 @@ function drive.flushMotors(budget)
         end
         local want = motorDesired[name]
         local isStop = (want or 0) == 0
-        -- Stops bypass anti-spam gap so all stabilizer motors zero on release
+        -- Stops bypass anti-spam gap so release/X feel immediate
         if not isStop then
             if (now - lastMotorFlushAt) < MOTOR_FLUSH_GAP and sent == 0 then
                 return false
@@ -396,12 +397,20 @@ function drive.flushMotors(budget)
             end
         end
     end
-    for name, _ in pairs(motorDesired) do
-        if pending(name) then
-            tryFlush(name)
-            if sent >= budget then
-                return sent
-            end
+    -- Then largest |RPM| pending (primary surge / yaw leaders before tiny cancel nudges)
+    local ranked = {}
+    for name, want in pairs(motorDesired) do
+        if pending(name) and (want or 0) ~= 0 then
+            ranked[#ranked + 1] = { name = name, abs = math.abs(want or 0) }
+        end
+    end
+    table.sort(ranked, function(a, b)
+        return a.abs > b.abs
+    end)
+    for _, row in ipairs(ranked) do
+        tryFlush(row.name)
+        if sent >= budget then
+            return sent
         end
     end
     return sent
@@ -559,13 +568,14 @@ local function facingToUnit(facing)
     return nil, nil
 end
 
---- Sign convention: +tz = CCW = A / craft-left. boat_control.yaw_sign flips once.
+--- Sign convention: pilot +tz = A / craft-left. boat_control.yaw_sign flips once
+-- so measured (raw ω·up) wrenches match that pilot axis.
 function drive.getYawSign(control)
     local s = tonumber(control and control.yaw_sign)
     if s and s ~= 0 then
         return (s > 0) and 1 or -1
     end
-    return 1
+    return -1
 end
 
 function drive.getCom(control)
@@ -879,6 +889,75 @@ end
 local function isPureStrafe(fx, fy, tz)
     return math.abs(fy) >= 0.5 and math.abs(fx) + math.abs(tz) < 0.25
 end
+local function isPureYaw(fx, fy, tz)
+    return math.abs(tz) >= 0.5 and math.abs(fx) + math.abs(fy) < 0.25
+end
+
+--- Pure A/D: ensure both port and starboard contribute (differential), not one side only.
+function drive.ensureYawDifferential(thrusters, duties, tzCmd, opts)
+    opts = opts or {}
+    local deadband = opts.deadband or 0.08
+    if not thrusters or not duties or math.abs(tzCmd or 0) < 0.5 then
+        return duties
+    end
+    local out = {}
+    for i, d in ipairs(duties) do
+        out[i] = d or 0
+    end
+    local portIdx, stbdIdx = {}, {}
+    local portMax, stbdMax = 0, 0
+    for i, t in ipairs(thrusters) do
+        local s = drive.thrusterSide(t)
+        if s < -0.05 then
+            portIdx[#portIdx + 1] = i
+            portMax = math.max(portMax, math.abs(out[i]))
+        elseif s > 0.05 then
+            stbdIdx[#stbdIdx + 1] = i
+            stbdMax = math.max(stbdMax, math.abs(out[i]))
+        end
+    end
+    if #portIdx == 0 or #stbdIdx == 0 then
+        return out
+    end
+    if portMax >= deadband and stbdMax >= deadband then
+        return out
+    end
+    local hotMax = math.max(portMax, stbdMax)
+    if hotMax < deadband then
+        return out
+    end
+    local cold = (portMax < deadband) and portIdx or stbdIdx
+    local bestI, bestContrib = nil, 0
+    for _, i in ipairs(cold) do
+        local t = thrusters[i]
+        local tz = tonumber(t.tz) or 0
+        local auth = drive.yawAuthority(t, drive.thrusterSide(t))
+        local contrib = math.max(math.abs(tz), math.abs(auth) * 0.35)
+        if contrib > bestContrib then
+            bestContrib = contrib
+            bestI = i
+        end
+    end
+    if not bestI or bestContrib < 1e-6 then
+        return out
+    end
+    local t = thrusters[bestI]
+    local tz = tonumber(t.tz) or 0
+    local dutySign
+    if math.abs(tz) >= 0.015 then
+        dutySign = ((tzCmd * tz) >= 0) and 1 or -1
+    else
+        local auth = drive.yawAuthority(t, drive.thrusterSide(t))
+        if auth == 0 then
+            return out
+        end
+        dutySign = ((tzCmd * auth) >= 0) and 1 or -1
+    end
+    local mag = math.max(deadband, math.min(1, hotMax * 0.9))
+    local lo = (t.kind == "motor") and -1 or 0
+    out[bestI] = util.clamp(dutySign * mag, lo, 1)
+    return out
+end
 
 --- Classify cardinal facing from wrench when facing/role missing.
 function drive.classifyFacing(t)
@@ -954,32 +1033,46 @@ function drive.enrichControl(control)
     if not control or type(control.thrusters) ~= "table" then
         return control
     end
-    -- Pre-v7 boat_control.json used raw Minecraft ω·up as tz (CW+ / right-positive)
-    -- when levers were absent. Teleop A is +tz = left; flip yaw_sign so old calib
-    -- still turns correctly until recalibrate (v7+ writes CCW+ tz via pose.yawRate).
-    -- If lx/ly exist, syncThrusterFacing already rebuilds CCW+ geometric tz — leave sign.
+    -- Yaw polarity (single flip — never also negate pose.yawRate):
+    --   v8+ fresh calib: raw ω·up tz + yaw_sign=-1 → A=left
+    --   v7: pose.yawRate was negated + yaw_sign=+1 (double-flip after recalibrate).
+    --       Convert: undo stored negate (tz = -tz) and set yaw_sign=-1.
+    --   pre-v7 raw CW+ tables: yaw_sign=-1 until recalibrate
     local ver = tonumber(control.version) or 0
-    if ver > 0 and ver < 7 and control._yaw_migrated ~= true then
-        local anyLever = false
-        for _, t in ipairs(control.thrusters) do
-            local lx = tonumber(t.lx) or 0
-            local ly = tonumber(t.ly) or 0
-            local lz = tonumber(t.lz) or 0
-            if math.sqrt(lx * lx + ly * ly + lz * lz) >= 1e-4 then
-                anyLever = true
-                break
+    if control._yaw_migrated ~= true then
+        if ver == 7 then
+            for _, t in ipairs(control.thrusters) do
+                t.tz = -(tonumber(t.tz) or 0)
+                if t.mag then
+                    t.mag = math.sqrt((t.fx or 0) ^ 2 + (t.fy or 0) ^ 2 + (t.tz or 0) ^ 2)
+                end
             end
-        end
-        if not anyLever then
-            local ys = tonumber(control.yaw_sign)
-            if ys == nil or ys == 0 or ys == 1 then
-                control.yaw_sign = -1
+            control.yaw_sign = -1
+            control.version = 8
+        elseif ver > 0 and ver < 7 then
+            local anyLever = false
+            for _, t in ipairs(control.thrusters) do
+                local lx = tonumber(t.lx) or 0
+                local ly = tonumber(t.ly) or 0
+                local lz = tonumber(t.lz) or 0
+                if math.sqrt(lx * lx + ly * ly + lz * lz) >= 1e-4 then
+                    anyLever = true
+                    break
+                end
+            end
+            if not anyLever then
+                local ys = tonumber(control.yaw_sign)
+                if ys == nil or ys == 0 or ys == 1 then
+                    control.yaw_sign = -1
+                end
             end
         end
         control._yaw_migrated = true
     end
     if control.yaw_sign == nil then
-        control.yaw_sign = 1
+        -- Default matches v8 Minecraft raw-ω calib (A=left). Sim fixtures that use
+        -- pilot-convention / geometric left+ tz should set yaw_sign=1 explicitly.
+        control.yaw_sign = -1
     end
     if control.com_compensate == nil then
         control.com_compensate = true
@@ -1127,6 +1220,9 @@ function drive.applyCardinalRoles(control, fx, fy, tz)
 
     local scale = math.min(1, cmdMag)
     local duties = readBackDuties(control, scores, maxAbs, scale)
+    if math.abs(tz) >= 0.5 and math.abs(fx) + math.abs(fy) < 0.25 then
+        duties = drive.ensureYawDifferential(thrusters, duties, tz, {})
+    end
     if isPureSurge(fx, fy, 0) or isPureStrafe(fx, fy, 0) then
         if control.com_compensate ~= false then
             duties = drive.nullResidualYaw(thrusters, duties, {
@@ -1448,6 +1544,8 @@ function drive.applyReassembly(control, fx, fy, tz)
         duties = ensureSurgeDuties(thrusters, duties, fx, { deadband = dutyDeadband })
     elseif pureStrafe or (strafePriority and absTz < 0.35) then
         duties = ensureStrafeDuties(thrusters, duties, fy, { deadband = dutyDeadband })
+    elseif absTz >= 0.5 and absFx + absFy < 0.25 then
+        duties = drive.ensureYawDifferential(thrusters, duties, tz, { deadband = dutyDeadband })
     end
 
     -- CoM couple polish on pure surge/strafe (protect primary force)
@@ -1485,11 +1583,10 @@ function drive.applyReassembly(control, fx, fy, tz)
     return true
 end
 
---- Write every pending motor RPM now (retries once on anti-spam).
--- Never sleeps: filtered sleep drops key/key_up and leaves thrusters stuck after quick taps.
+--- Write every pending motor RPM now (retries; time-gap only, never sleep).
+-- First keypress path: push stops + largest RPM targets before returning to the event loop.
 function drive.commitMotorsNow()
-    -- Several single flushes; gap is time-based without yielding the event loop away.
-    for _ = 1, 12 do
+    for _ = 1, 16 do
         if drive.flushMotors(1) < 1 then
             break
         end
@@ -1737,6 +1834,9 @@ function drive.applyTeleop(control, fx, fy, tz)
 
     local scale = math.min(1, cmdMag)
     local duties = readBackDuties(control, scores, maxAbs, scale)
+    if pureYaw then
+        duties = drive.ensureYawDifferential(thrusters, duties, tz, {})
+    end
     if control.com_compensate ~= false and (pureSurge or pureStrafe) then
         duties = drive.nullResidualYaw(thrusters, duties, {
             cmdFx = fx,
@@ -1889,14 +1989,15 @@ function drive.trimCommand(control, command, trimState, dt)
     local vel = pose.getVelocity()
     local ang = pose.getAngularVelocity()
     local localV = pose.worldToLocal(vel, craft)
-    -- +yawRate = CCW / left (matches +tz); see pose.yawRate.
-    local yawRate = pose.yawRate(craft, ang)
+    -- pose.yawRate is raw ω·up (MC ≈ right+). Pilot command space is left+ = −raw.
+    local rawYaw = pose.yawRate(craft, ang)
+    local yawRate = -rawYaw
 
     local fx = command.fx or 0
     local fy = command.fy or 0
     local tz = command.tz or 0
 
-    -- If pilot/autopilot isn't commanding yaw, kill measured yaw rate
+    -- If pilot/autopilot isn't commanding yaw, kill measured yaw rate (pilot axis)
     if math.abs(tz) < 0.08 then
         local corr = -kpYaw * yawRate
         tz = util.clamp(corr, -maxTrim, maxTrim)
@@ -2179,6 +2280,8 @@ function drive.manualLoop(control, opts)
         if wrenchMode then
             -- Reassembly LS over facing/wrench thrusters; teleop if alloc_mode=teleop
             drive.applyCommand(control, cmd.fx, cmd.fy, cmd.tz)
+            -- Extra flush burst on edge (press/release already forced realloc)
+            drive.flushMotors(6)
         else
             drive.setAxis(control, "thrust_forward", cmd.fx > 0)
             drive.setAxis(control, "thrust_reverse", cmd.fx < 0)

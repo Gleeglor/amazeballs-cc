@@ -2,6 +2,9 @@
  * Watercraft physics: buoyancy, offset CoM, hull drag, thruster τ = (r − r_com) × F.
  * Body frame: +x forward (surge), +y starboard (strafe), +z up.
  * World: +X east, +Y north, +Z up; yaw 0 faces +Y (north) for top-down viz.
+ *
+ * Planar yaw is right-hand about +Z = CCW from above = craft-left (matches +tz / A).
+ * Do not use a CW heading embedding — that makes A look inverted while +Tz tests still pass.
  */
 
 export function createBody(opts = {}) {
@@ -195,8 +198,9 @@ export function bodyToWorld(body, bx, by, bz) {
   const x2 = x1 * cp + z1 * sp;
   const y2 = y1;
   const z2 = -x1 * sp + z1 * cp;
-  const wx = x2 * sy + y2 * cy;
-  const wy = x2 * cy - y2 * sy;
+  // Yaw CCW from +Y (north): +yaw → nose toward −X (west / screen-left).
+  const wx = -x2 * sy + y2 * cy;
+  const wy = x2 * cy + y2 * sy;
   const wz = z2;
   return { x: wx, y: wy, z: wz };
 }
@@ -208,8 +212,9 @@ export function worldToBody(body, wx, wy, wz) {
   const sp = Math.sin(body.pitch);
   const cr = Math.cos(body.roll);
   const sr = Math.sin(body.roll);
-  const x2 = wx * sy + wy * cy;
-  const y2 = wx * cy - wy * sy;
+  // Inverse of bodyToWorld yaw (CCW from +Y).
+  const x2 = -wx * sy + wy * cy;
+  const y2 = wx * cy + wy * sy;
   const z2 = wz;
   const x1 = x2 * cp - z2 * sp;
   const y1 = y2;

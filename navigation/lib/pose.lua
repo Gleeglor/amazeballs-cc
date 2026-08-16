@@ -44,15 +44,14 @@ function pose.getAngularVelocity()
     return sublevel.getAngularVelocity()
 end
 
---- Yaw rate with + = CCW from above = craft-left (matches teleop +tz / A).
--- Minecraft / CC:Sable are Y-up: raw ω·up is CW-positive when viewed from above
--- (right-hand about +Y looks clockwise from above). We negate so calib +tz and
--- command A both mean turn left — without this, Reassembly A spins the wrong way.
+--- Yaw rate for calib / trim: ω·up as reported (no extra negate).
+-- Teleop pilot convention is +tz = craft-left (A). That mapping is applied
+-- once via boat_control.yaw_sign (and measured mid-window wrenches), not here.
+-- v7 negated this and wrote yaw_sign=+1 → double-flip after recalibrate.
 function pose.yawRate(craft, ang)
     craft = craft or pose.get()
     ang = ang or pose.getAngularVelocity()
-    local raw = (ang.x or 0) * craft.up.x + (ang.y or 0) * craft.up.y + (ang.z or 0) * craft.up.z
-    return -raw
+    return (ang.x or 0) * craft.up.x + (ang.y or 0) * craft.up.y + (ang.z or 0) * craft.up.z
 end
 
 --- Project a world-space vector into craft-local forward/right/up scalars.

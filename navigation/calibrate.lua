@@ -25,8 +25,10 @@ end
 print()
 
 local control, err = calibrate.run({
-    pulse = 0.7,
-    settle = 0.4,
+    pulse = 2.0,
+    settle = 0.8,
+    window_start = 0.5,
+    window_end = 1.5,
     use_sides = false,
     invert_analog = opts.invert_analog,
     probe_rpm = opts.probe_rpm,

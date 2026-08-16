@@ -14,13 +14,21 @@ import {
   getYawSign,
   healYawThrusters,
   syncWrenchFromFacing,
+  thrusterSide,
+  ensureYawDifferential,
 } from "./allocation.mjs";
 import {
   loadFixture,
   fixtureCardinal5OffsetCom,
   fixtureLuaLikeCardinal5,
 } from "./fixtures.mjs";
-import { geometricFromDuties, createBody, defaultPhysicsParams, step } from "./physics.mjs";
+import {
+  geometricFromDuties,
+  createBody,
+  defaultPhysicsParams,
+  step,
+  bodyToWorld,
+} from "./physics.mjs";
 
 const GEOM = (comY = 0, comX = 0) => ({
   geometricForceScale: 1,
@@ -75,6 +83,7 @@ describe("sign convention: A = left (+tz = +Tz)", () => {
       });
       let yawU = 0;
       let prev = body.yaw;
+      let noseLeftOk = false;
       for (let i = 0; i < 90; i++) {
         body = step(body, control.thrusters, a.duties, params, 1 / 60).body;
         body.roll = 0;
@@ -86,12 +95,70 @@ describe("sign convention: A = left (+tz = +Tz)", () => {
         if (dy < -Math.PI) dy += 2 * Math.PI;
         yawU += dy;
         prev = body.yaw;
+        // Check early (before ±π wrap) that +yaw swings nose to screen-left (−X).
+        if (i === 20) {
+          const nose = bodyToWorld({ ...body, pitch: 0, roll: 0 }, 1.2, 0, 0);
+          noseLeftOk = nose.x < -0.05;
+          assert.ok(
+            noseLeftOk,
+            `${name} A must swing nose left (−X) early, got nose.x=${nose.x} yaw=${body.yaw}`,
+          );
+        }
       }
       assert.ok(
         yawU > 0.12 && body.wz > 0.05,
         `${name} A planar Δyaw=${((yawU * 180) / Math.PI).toFixed(1)}° wz=${body.wz} (want + / left)`,
       );
     }
+  });
+
+  it("pilot-convention tz table works with yaw_sign=+1 (no extra flip)", () => {
+    // Mid-window / geometric left+ wrenches: A must turn left without yaw_sign=-1.
+    const control = fixtureLuaLikeCardinal5();
+    control.yaw_sign = 1;
+    assert.equal(getYawSign(control), 1);
+    const a = applyCommand(control, 0, 0, 1);
+    const w = netWrench(control.thrusters, a.duties);
+    assert.ok(w.Tz > 0.02, `pilot-convention A Tz=${w.Tz}`);
+  });
+
+  it("pure A/D lights both port and starboard (differential)", () => {
+    for (const name of ["cardinal_5_boat", "asymmetric_cardinal"]) {
+      for (const tz of [1, -1]) {
+        const control = loadFixture(name);
+        // One-sided start: zero duties then force only starboard via broken alloc — use applyCommand
+        const r = applyCommand(JSON.parse(JSON.stringify(control)), 0, 0, tz);
+        let portLit = false;
+        let stbdLit = false;
+        control.thrusters.forEach((t, i) => {
+          if (Math.abs(r.duties[i] || 0) < 0.08) return;
+          const s = thrusterSide(t);
+          if (s < -0.05) portLit = true;
+          if (s > 0.05) stbdLit = true;
+        });
+        assert.ok(
+          portLit && stbdLit,
+          `${name} tz=${tz} need port+stbd lit (port=${portLit} stbd=${stbdLit}) duties=${r.duties}`,
+        );
+      }
+    }
+  });
+
+  it("ensureYawDifferential repairs one-sided yaw duties", () => {
+    const control = loadFixture("cardinal_5_boat");
+    const duties = control.thrusters.map((t) =>
+      thrusterSide(t) > 0.05 ? 1 : 0,
+    );
+    const fixed = ensureYawDifferential(control.thrusters, duties, 1);
+    let portLit = false;
+    let stbdLit = false;
+    control.thrusters.forEach((t, i) => {
+      if (Math.abs(fixed[i] || 0) < 0.08) return;
+      const s = thrusterSide(t);
+      if (s < -0.05) portLit = true;
+      if (s > 0.05) stbdLit = true;
+    });
+    assert.ok(portLit && stbdLit, `repaired port=${portLit} stbd=${stbdLit}`);
   });
 
   it("yaw_sign: −1 flips A/D", () => {
