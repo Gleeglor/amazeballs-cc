@@ -39,8 +39,8 @@ export const SOFT_NAV = {
   pulseBand: 4,
   /** Look-ahead when current WP within softArrive + this. */
   lookAheadExtra: 16,
-  yawOnlyDeg: 35,
-  yawDeadbandDeg: 12,
+  yawOnlyDeg: 55,
+  yawDeadbandDeg: 22,
   shoreA: { x: 341, z: 163 },
   shoreB: { x: 383, z: 285 },
 };
@@ -102,8 +102,8 @@ export function softAuthority({
 }
 
 /**
- * Dumb cruise: |bearing| > 35° → yaw only; 12–35° → fx=0.55 + small yaw;
- * else fx=0.75, tz=0. Never reverse. fy unused.
+ * Point-and-go cruise: |bearing| > 55° → yaw + tiny fx; 22–55° → fx=0.70 + small yaw;
+ * else fx=0.90, tz=0. Never reverse. fy unused.
  */
 export function cruiseCommand({
   errForward = 0,
@@ -112,8 +112,8 @@ export function cruiseCommand({
 } = {}) {
   const bearing = Math.atan2(errRight, errForward !== 0 ? errForward : 0.01);
   const absB = Math.abs(bearing);
-  const gentleYaw = Math.min(auth * 0.35, 0.14);
-  const smallYaw = Math.min(auth * 0.22, 0.08);
+  const gentleYaw = Math.min(auth * 0.4, 0.16);
+  const smallYaw = Math.min(auth * 0.18, 0.07);
   const sgn = bearing >= 0 ? 1 : -1;
   let fwdCmd = 0;
   let yawCmd = 0;
@@ -121,13 +121,13 @@ export function cruiseCommand({
 
   if (absB > YAW_ONLY_RAD) {
     yawOnly = true;
-    fwdCmd = 0;
+    fwdCmd = Math.min(0.18, auth * 0.25);
     yawCmd = sgn * gentleYaw;
   } else if (absB > YAW_DEAD_RAD) {
-    fwdCmd = Math.min(0.55, auth);
+    fwdCmd = Math.min(0.7, auth);
     yawCmd = sgn * smallYaw;
   } else {
-    fwdCmd = Math.min(0.75, auth);
+    fwdCmd = Math.min(0.9, auth);
     yawCmd = 0;
   }
   fwdCmd = Math.max(0, fwdCmd);

@@ -317,6 +317,13 @@ local function writeStatus(extra)
             st[k] = v
         end
     end
+    -- Always attach pose so host can smoke-test nav without superseding the cmd.
+    if st.pose == nil then
+        local p = samplePose()
+        if p then
+            st.pose = p
+        end
+    end
     if transport.mode == "http" then
         local ok, err = httpPostJson(transport.base_url .. "/v1/status", st)
         if not ok then

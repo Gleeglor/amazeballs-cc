@@ -2212,10 +2212,11 @@ function drive.newPidStates()
     return { forward = {}, yaw = {}, right = {}, trim = {} }
 end
 
--- Dumb cruise: yaw-or-surge (no PID hunting, no reverse, no trim cancel).
--- |bearing| > 35° → gentle yaw only; else steady surge + small yaw outside ~12° deadband.
-local CRUISE_YAW_ONLY_RAD = 35 * math.pi / 180
-local CRUISE_YAW_DEAD_RAD = 12 * math.pi / 180
+-- Dumb cruise: point-and-go (no PID, no reverse, no trim).
+-- |bearing| > 55° → yaw-biased (tiny fx keep); else high sustained surge.
+-- Deadband 22° so CoM residual yaw during surge does not kill thrust every tick.
+local CRUISE_YAW_ONLY_RAD = 55 * math.pi / 180
+local CRUISE_YAW_DEAD_RAD = 22 * math.pi / 180
 
 function drive.stepToward(control, target, mode, pidStates, dt)
     control = control or drive.loadControl()
@@ -2287,19 +2288,19 @@ function drive.stepToward(control, target, mode, pidStates, dt)
     local absBearing = math.abs(bearing)
 
     if mode == "cruise" then
-        -- Exact dumb rules (no PID, no reverse, no trim, no pulse):
-        --   |b|>35° → yaw only; 12–35° → fx=0.55 + small yaw; else fx=0.75, tz=0
-        local gentleYaw = math.min(auth * 0.35, 0.14)
-        local smallYaw = math.min(auth * 0.22, 0.08)
+        -- Point-and-go (no PID, no reverse, no trim, no pulse):
+        --   |b|>55° → yaw + tiny fx; 22–55° → fx=0.70 + gentle yaw; else fx=0.90, tz=0
+        local gentleYaw = math.min(auth * 0.40, 0.16)
+        local smallYaw = math.min(auth * 0.18, 0.07)
         local sgn = bearing >= 0 and 1 or -1
         if absBearing > CRUISE_YAW_ONLY_RAD then
-            fwdCmd = 0
+            fwdCmd = math.min(0.18, auth * 0.25) -- keep a whisper of surge (no spin-in-place)
             yawCmd = sgn * gentleYaw
         elseif absBearing > CRUISE_YAW_DEAD_RAD then
-            fwdCmd = math.min(0.55, auth)
+            fwdCmd = math.min(0.70, auth)
             yawCmd = sgn * smallYaw
         else
-            fwdCmd = math.min(0.75, auth)
+            fwdCmd = math.min(0.90, auth)
             yawCmd = 0
         end
         fwdCmd = math.max(0, fwdCmd)
@@ -2349,8 +2350,11 @@ function drive.stepToward(control, target, mode, pidStates, dt)
             cmd.tz = util.clamp(cmd.tz or 0, -yawAuth, yawAuth)
         end
         drive.applyCommand(control, cmd.fx, cmd.fy, cmd.tz)
-        -- Sustained duty: flush enough setRPMs that CCA anti-spam doesn't stutter.
-        drive.flushMotors(mode == "cruise" and 8 or 4)
+        -- Sustained duty: longer flush so cruise RPM sticks through CCA anti-spam.
+        drive.flushMotors(mode == "cruise" and 12 or 4)
+        if mode == "cruise" then
+            drive.flushMotors(8)
+        end
     else
         drive.applySigned(control, "thrust_forward", "thrust_reverse", fwdCmd)
         drive.applySigned(control, "steer_left", "steer_right", yawCmd)

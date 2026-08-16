@@ -78,35 +78,36 @@ describe("gentle authority / no cruise pulse", () => {
 describe("dumb cruise rules (lock hunting fix)", () => {
   const auth = 0.78;
 
-  it("aligned (|bearing|≤12°) → surge dominates, zero yaw, no reverse", () => {
+  it("aligned (|bearing|≤22°) → surge dominates, zero yaw, no reverse", () => {
     const r = cruiseCommand({ errForward: 50, errRight: 2, auth });
     assert.ok(r.aligned);
-    assert.ok(r.fwdCmd >= 0.74, `fwdCmd=${r.fwdCmd}`);
+    // authCeil 0.78 caps fx below the 0.90 wish
+    assert.ok(r.fwdCmd >= Math.min(0.9, auth) - 1e-9, `fwdCmd=${r.fwdCmd}`);
     assert.equal(r.yawCmd, 0);
     assert.ok(r.fwdCmd >= 0);
     assert.equal(r.yawOnly, false);
   });
 
-  it("large bearing (>35°) → yaw only, zero surge, no reverse", () => {
+  it("large bearing (>55°) → yaw-biased tiny surge, no reverse", () => {
     const r = cruiseCommand({ errForward: 5, errRight: 60, auth });
     assert.equal(r.yawOnly, true);
-    assert.equal(r.fwdCmd, 0);
+    assert.ok(r.fwdCmd > 0 && r.fwdCmd <= 0.18, `fwdCmd=${r.fwdCmd}`);
     assert.ok(r.yawCmd > 0, `yawCmd=${r.yawCmd}`);
     assert.ok(r.fwdCmd >= 0);
   });
 
-  it("past waypoint (negative forward) never reverses — yaw only", () => {
+  it("past waypoint (negative forward) never reverses — yaw-biased", () => {
     const r = cruiseCommand({ errForward: -40, errRight: 5, auth });
     assert.ok(r.fwdCmd >= 0, `fwdCmd=${r.fwdCmd}`);
-    assert.equal(r.fwdCmd, 0);
+    assert.ok(r.fwdCmd <= 0.18);
     assert.equal(r.yawOnly, true);
   });
 
-  it("mid bearing (12–35°) → soft surge 0.55 + small yaw", () => {
-    // atan2(20, 50) ≈ 21.8°
-    const r = cruiseCommand({ errForward: 50, errRight: 20, auth });
+  it("mid bearing (22–55°) → soft surge 0.70 + small yaw", () => {
+    // atan2(30, 50) ≈ 31°
+    const r = cruiseCommand({ errForward: 50, errRight: 30, auth });
     assert.equal(r.yawOnly, false);
-    assert.ok(Math.abs(r.fwdCmd - 0.55) < 1e-9, `fwdCmd=${r.fwdCmd}`);
+    assert.ok(Math.abs(r.fwdCmd - 0.7) < 1e-9, `fwdCmd=${r.fwdCmd}`);
     assert.ok(r.yawCmd > 0 && r.yawCmd < 0.15, `yawCmd=${r.yawCmd}`);
   });
 });
