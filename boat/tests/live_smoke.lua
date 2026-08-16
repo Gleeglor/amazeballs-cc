@@ -1,5 +1,5 @@
 -- In-game smoke tests (run via agent run_tests or: tests/live_smoke).
-package.path = package.path .. ";/lib/?.lua;/lib/?/init.lua;./lib/?.lua;./?.lua"
+package.path = "/lib/?.lua;/lib/?/init.lua;./lib/?.lua;" .. package.path
 
 local motors = require("motors")
 local pose = require("pose")

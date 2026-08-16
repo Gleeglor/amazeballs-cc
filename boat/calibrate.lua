@@ -1,6 +1,6 @@
--- CLI: calibrate
-package.path = package.path .. ";/lib/?.lua;/lib/?/init.lua;./lib/?.lua;./?.lua"
-local calibrate = require("calibrate")
+-- CLI: calibrate (must not be require()'d as module "calibrate")
+package.path = "/lib/?.lua;/lib/?/init.lua;./lib/?.lua;" .. package.path
+local calibrate = require("boat_calibrate")
 local motors = require("motors")
 local args = { ... }
 local opts = {}

@@ -2,7 +2,7 @@
 local util = require("util")
 local motors = require("motors")
 local wrench = require("wrench")
-local calibrate = require("calibrate")
+local calibrate = require("boat_calibrate")
 local pose = require("pose")
 local ui = require("ui")
 

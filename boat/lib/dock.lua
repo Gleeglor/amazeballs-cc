@@ -4,7 +4,7 @@ local util = require("util")
 local pose = require("pose")
 local motors = require("motors")
 local wrench = require("wrench")
-local calibrate = require("calibrate")
+local calibrate = require("boat_calibrate")
 
 local dock = {}
 

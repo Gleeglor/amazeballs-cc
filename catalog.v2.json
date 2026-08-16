@@ -35,7 +35,7 @@
         "motors.lua": { "dest": "lib/motors.lua" },
         "pose.lua": { "dest": "lib/pose.lua" },
         "wrench.lua": { "dest": "lib/wrench.lua" },
-        "calibrate.lua": { "dest": "lib/calibrate.lua" },
+        "boat_calibrate.lua": { "dest": "lib/boat_calibrate.lua" },
         "route.lua": { "dest": "lib/route.lua" },
         "dock.lua": { "dest": "lib/dock.lua" },
         "ui.lua": { "dest": "lib/ui.lua" },

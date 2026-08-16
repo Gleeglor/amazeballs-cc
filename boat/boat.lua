@@ -1,8 +1,8 @@
 -- Boat menu entry (optional boot). Prefer agent.lua for live work.
-package.path = package.path .. ";/lib/?.lua;/lib/?/init.lua;./lib/?.lua;./?.lua"
+package.path = "/lib/?.lua;/lib/?/init.lua;./lib/?.lua;" .. package.path
 
 local motors = require("motors")
-local calibrate = require("calibrate")
+local calibrate = require("boat_calibrate")
 local teleop = require("teleop")
 local dock = require("dock")
 local route = require("route")
