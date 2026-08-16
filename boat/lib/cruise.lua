@@ -76,16 +76,28 @@ function cruise.followPath(path, opts)
                 local dirx, dirz = dx * inv, dz * inv
                 local align = craft.forward.x * dirx + craft.forward.z * dirz
                 local side = craft.right.x * dirx + craft.right.z * dirz
-                local yawCmd = util.clamp(side * 2.2, -1, 1) * yawSign
+                -- If target is nearly dead ahead/astern, side≈0 — force a spin so we don't reverse forever.
+                local yawCmd
+                if math.abs(side) < 0.12 then
+                    yawCmd = ((side >= 0) and 1 or -1) * yawSign
+                    if align < 0 then
+                        yawCmd = yawCmd -- keep spinning while astern
+                    elseif align > 0.85 then
+                        yawCmd = 0
+                    end
+                else
+                    yawCmd = util.clamp(side * 2.2, -1, 1) * yawSign
+                end
                 local surge = 0
                 if opticalHit then
-                    -- Obstacle ahead: turn hard, little reverse, then replan.
-                    yawCmd = util.clamp((side >= 0 and 1 or -1) * yawSign, -1, 1)
-                    surge = -0.3 * surgeSign
+                    yawCmd = ((side >= 0) and 1 or -1) * yawSign
+                    surge = -0.25 * surgeSign
                 elseif align > 0.55 then
-                    surge = util.clamp(0.35 + dist * 0.02, 0.25, 0.9) * surgeSign
-                elseif align < -0.35 then
-                    surge = -0.35 * surgeSign
+                    -- Bow toward waypoint: drive forward
+                    surge = util.clamp(0.4 + dist * 0.02, 0.35, 0.95) * surgeSign
+                else
+                    -- Not aligned: turn in place (do not reverse-drive the whole trip)
+                    surge = 0
                 end
                 applyAxes(surge, 0, yawCmd)
                 local spd = select(1, pose.speed(craft))
