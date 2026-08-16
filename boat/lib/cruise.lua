@@ -69,6 +69,9 @@ function cruise.followPath(path, opts)
     local goalX, goalZ = path[#path].x, path[#path].z
     path = route.simplifyPath(path, 4)
     ui.setMode("route")
+    -- When target is behind, side≈0 flips sign every tick and bang-bang yaw cancels itself.
+    -- Latch a spin direction until the bow faces the chase point.
+    local spinDir = nil
 
     while true do
         local craft = pose.get()
@@ -93,9 +96,17 @@ function cruise.followPath(path, opts)
             local side = craft.right.x * dirx + craft.right.z * dirz
 
             local yawCmd
-            if align < 0 and math.abs(side) < 0.2 then
-                yawCmd = 1 * yawSign -- target behind: spin
+            if align < 0.25 then
+                if not spinDir then
+                    if math.abs(side) < 0.05 then
+                        spinDir = 1
+                    else
+                        spinDir = (side >= 0) and 1 or -1
+                    end
+                end
+                yawCmd = spinDir * yawSign
             else
+                spinDir = nil
                 yawCmd = util.clamp(side * 2.8, -1, 1) * yawSign
             end
 
@@ -103,14 +114,10 @@ function cruise.followPath(path, opts)
             if opticalHit then
                 yawCmd = ((side >= 0) and 1 or -1) * yawSign
                 surge = -0.25 * surgeSign
-            elseif align > 0.15 then
-                -- Move whenever bow has any component toward target (don't wait for perfect align)
-                surge = util.clamp(0.35 + 0.65 * align, 0.35, 1.0) * surgeSign
-            elseif align > -0.35 then
-                -- Mostly sideways: creep while turning so we don't sit forever
-                surge = 0.2 * surgeSign
+            elseif align > 0.2 then
+                surge = util.clamp(0.4 + 0.6 * align, 0.4, 1.0) * surgeSign
             end
-            -- else deeply astern: yaw only until we swing around
+            -- else: spin in place until facing (latched yaw)
 
             applyAxes(surge, 0, yawCmd)
             local spd = select(1, pose.speed(craft))
