@@ -466,6 +466,305 @@ export function fixtureAsymmetricNearCom() {
   };
 }
 
+/**
+ * Asymmetric cardinal: strong port / weak starboard, forward off centerline,
+ * CoM offset starboard — classic “W doesn’t go forward / drifts off center”.
+ */
+export function fixtureAsymmetricCardinal(opts = {}) {
+  const comY = opts.comY ?? 0.4;
+  const comX = opts.comX ?? 0;
+  const thrusters = [
+    {
+      name: "fwd_portish",
+      kind: "motor",
+      max_rpm: 24,
+      facing: "forward",
+      role: "forward",
+      max_force: 1.2,
+      lx: -0.9,
+      ly: -0.5,
+      lz: -0.05,
+    },
+    {
+      name: "bow_port",
+      kind: "motor",
+      max_rpm: 24,
+      facing: "left",
+      role: "left",
+      max_force: 0.9,
+      lx: 0.5,
+      ly: -0.9,
+      lz: -0.05,
+    },
+    {
+      name: "bow_stbd",
+      kind: "motor",
+      max_rpm: 24,
+      facing: "right",
+      role: "right",
+      max_force: 0.25,
+      lx: 0.5,
+      ly: 0.7,
+      lz: -0.05,
+    },
+    {
+      name: "stern_port",
+      kind: "motor",
+      max_rpm: 24,
+      facing: "back",
+      role: "back",
+      max_force: 0.8,
+      lx: -0.7,
+      ly: -0.7,
+      lz: -0.05,
+    },
+    {
+      name: "stern_stbd",
+      kind: "motor",
+      max_rpm: 24,
+      facing: "back",
+      role: "back",
+      max_force: 0.25,
+      lx: -0.5,
+      ly: 0.5,
+      lz: -0.05,
+    },
+  ].map((t) => withMag(syncWrenchFromFacing(t)));
+
+  const control = {
+    version: 6,
+    mode: "wrench",
+    alloc_mode: "reassembly",
+    default_motor_rpm: 24,
+    gains: { norm: 1 },
+    yaw_sign: 1,
+    com_compensate: true,
+    com_x: comX,
+    com_y: comY,
+    com_z: -0.05,
+    comX: comX,
+    comY: comY,
+    comZ: -0.05,
+    thrusters,
+    description:
+      "Asymmetric cardinal: strong port, weak stbd, fwd off-centerline, CoM offset.",
+  };
+  for (const t of control.thrusters) syncWrenchFromFacing(t, control);
+  return control;
+}
+
+/**
+ * Weird non-rectangle mounts: diagonal bow, far port lever, close starboard,
+ * skewed aft — different lever arms, not a neat box.
+ */
+export function fixtureWeirdPositions(opts = {}) {
+  const comY = opts.comY ?? 0.2;
+  const comX = opts.comX ?? 0.1;
+  const thrusters = [
+    {
+      name: "diag_bow",
+      kind: "motor",
+      max_rpm: 24,
+      facing: "forward",
+      role: "forward",
+      max_force: 0.85,
+      lx: 0.95,
+      ly: -0.55,
+      lz: -0.05,
+    },
+    {
+      name: "far_port",
+      kind: "motor",
+      max_rpm: 24,
+      facing: "left",
+      role: "left",
+      max_force: 0.7,
+      lx: -0.2,
+      ly: -1.2,
+      lz: -0.05,
+    },
+    {
+      name: "close_stbd",
+      kind: "motor",
+      max_rpm: 24,
+      facing: "right",
+      role: "right",
+      max_force: 0.55,
+      lx: 0.15,
+      ly: 0.25,
+      lz: -0.05,
+    },
+    {
+      name: "aft_skew",
+      kind: "motor",
+      max_rpm: 24,
+      facing: "back",
+      role: "back",
+      max_force: 0.65,
+      lx: -1.1,
+      ly: 0.15,
+      lz: -0.05,
+    },
+  ].map((t) => withMag(syncWrenchFromFacing(t)));
+
+  const control = {
+    version: 6,
+    mode: "wrench",
+    alloc_mode: "reassembly",
+    default_motor_rpm: 24,
+    gains: { norm: 1 },
+    yaw_sign: 1,
+    com_compensate: true,
+    com_x: comX,
+    com_y: comY,
+    com_z: -0.05,
+    comX: comX,
+    comY: comY,
+    comZ: -0.05,
+    thrusters,
+    description: "Weird thruster positions (diagonal / unequal levers).",
+  };
+  for (const t of control.thrusters) syncWrenchFromFacing(t, control);
+  return control;
+}
+
+/**
+ * Missing/mirrored faces: 1 forward + uneven L/R strengths + single back.
+ * CoM offset port or starboard.
+ */
+export function fixtureMissingMirroredFaces(opts = {}) {
+  const comY = opts.comY ?? 0.3;
+  const comX = opts.comX ?? -0.1;
+  const thrusters = [
+    {
+      name: "only_fwd",
+      kind: "motor",
+      max_rpm: 24,
+      facing: "forward",
+      role: "forward",
+      max_force: 1.0,
+      lx: -0.8,
+      ly: 0.1,
+      lz: -0.05,
+    },
+    {
+      name: "port_strong",
+      kind: "motor",
+      max_rpm: 24,
+      facing: "left",
+      role: "left",
+      max_force: 0.95,
+      lx: 0.4,
+      ly: -0.8,
+      lz: -0.05,
+    },
+    {
+      name: "stbd_weak",
+      kind: "motor",
+      max_rpm: 24,
+      facing: "right",
+      role: "right",
+      max_force: 0.3,
+      lx: 0.5,
+      ly: 0.6,
+      lz: -0.05,
+    },
+    {
+      name: "one_back",
+      kind: "motor",
+      max_rpm: 24,
+      facing: "back",
+      role: "back",
+      max_force: 0.5,
+      lx: -0.6,
+      ly: -0.3,
+      lz: -0.05,
+    },
+  ].map((t) => withMag(syncWrenchFromFacing(t)));
+
+  const control = {
+    version: 6,
+    mode: "wrench",
+    alloc_mode: "reassembly",
+    default_motor_rpm: 24,
+    gains: { norm: 1 },
+    yaw_sign: 1,
+    com_compensate: true,
+    com_x: comX,
+    com_y: comY,
+    com_z: -0.05,
+    comX: comX,
+    comY: comY,
+    comZ: -0.05,
+    thrusters,
+    description: "Missing/mirrored faces: 1 fwd + uneven L/R + one back.",
+  };
+  for (const t of control.thrusters) syncWrenchFromFacing(t, control);
+  return control;
+}
+
+/**
+ * Off-center mass combined with asymmetric thrust strengths / positions.
+ */
+export function fixtureOffCenterMassAsym(opts = {}) {
+  return fixtureAsymmetricCardinal({
+    comX: opts.comX ?? -0.2,
+    comY: opts.comY ?? -0.35,
+  });
+}
+
+/**
+ * Seeded pseudo-random weird layout (deterministic). Always has ≥1 forward.
+ * @param {number} [seed]
+ */
+export function fixtureSeededWeird(seed = 42) {
+  let s = (seed >>> 0) || 1;
+  const rnd = () => {
+    s = (Math.imul(s, 1664525) + 1013904223) >>> 0;
+    return s / 0x100000000;
+  };
+  const faces = ["forward", "left", "right", "back", "forward"];
+  const thrusters = faces.map((facing, i) => {
+    const max_force = 0.35 + rnd() * 0.9;
+    const lx = (rnd() - 0.5) * 2.2;
+    const ly = (rnd() - 0.5) * 2.0;
+    return withMag(
+      syncWrenchFromFacing({
+        name: `rand_${i}_${facing}`,
+        kind: "motor",
+        max_rpm: 24,
+        facing,
+        role: facing,
+        max_force,
+        lx,
+        ly,
+        lz: -0.05,
+      }),
+    );
+  });
+  const comX = (rnd() - 0.5) * 0.5;
+  const comY = (rnd() - 0.5) * 0.6;
+  const control = {
+    version: 6,
+    mode: "wrench",
+    alloc_mode: "reassembly",
+    default_motor_rpm: 24,
+    gains: { norm: 1 },
+    yaw_sign: 1,
+    com_compensate: true,
+    com_x: comX,
+    com_y: comY,
+    com_z: -0.05,
+    comX,
+    comY,
+    comZ: -0.05,
+    thrusters,
+    description: `Seeded weird layout (seed=${seed}).`,
+  };
+  for (const t of control.thrusters) syncWrenchFromFacing(t, control);
+  return control;
+}
+
 export const FIXTURES = {
   cardinal_5_boat: fixtureCardinal5Boat,
   cardinal_5_sized: fixtureCardinal5Sized,
@@ -477,6 +776,12 @@ export const FIXTURES = {
   symmetric_surge: fixtureSymmetricSurge,
   near_com_strafe: fixtureSymmetricStrafeNearCom,
   asymmetric_near_com: fixtureAsymmetricNearCom,
+  asymmetric_cardinal: () => fixtureAsymmetricCardinal(),
+  weird_positions: () => fixtureWeirdPositions(),
+  missing_mirrored_faces: () => fixtureMissingMirroredFaces(),
+  offcenter_mass_asym: () => fixtureOffCenterMassAsym(),
+  seeded_weird_42: () => fixtureSeededWeird(42),
+  seeded_weird_99: () => fixtureSeededWeird(99),
 };
 
 export const DEFAULT_FIXTURE = "cardinal_5_boat";

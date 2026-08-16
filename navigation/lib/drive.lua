@@ -610,41 +610,250 @@ function drive.yawAuthority(t, sideFallback)
 end
 
 --- Duty-space yaw null for pure surge/strafe (CoM couple cancel).
-function drive.nullResidualYaw(thrusters, duties)
+-- Never drives commanded primary (Fx surge / Fy strafe) below minPrimaryFraction
+-- of the pre-null baseline — yaw cancel must not kill forward surge.
+-- opts: cmdFx, cmdFy, minPrimaryFraction, targetRatio, targetAbs, steps
+function drive.nullResidualYaw(thrusters, duties, opts)
+    opts = opts or {}
     local out = {}
     for i, d in ipairs(duties) do
         out[i] = d or 0
     end
-    for _ = 1, 10 do
+    local maxSteps = math.max(1, tonumber(opts.steps) or 10)
+    local targetRatio = tonumber(opts.targetRatio) or 0.12
+    local targetAbs = tonumber(opts.targetAbs) or 0.06
+    local minFrac = tonumber(opts.minPrimaryFraction) or 0.55
+    local cmdFx = tonumber(opts.cmdFx)
+    local cmdFy = tonumber(opts.cmdFy)
+    local baseline = drive.netWrench(thrusters, out)
+    local surgeIntent = false
+    if cmdFx and math.abs(cmdFx) >= 0.5 and math.abs(cmdFy or 0) < 0.25 then
+        surgeIntent = true
+    elseif math.abs(baseline.fx) >= math.abs(baseline.fy) and math.abs(baseline.fx) >= 0.05 then
+        surgeIntent = true
+    end
+    local function primaryOf(w)
+        if surgeIntent then
+            return w.fx
+        end
+        return w.fy
+    end
+    local basePrimary = primaryOf(baseline)
+    local minPrimary = 0
+    if math.abs(basePrimary) >= 1e-6 then
+        minPrimary = (basePrimary >= 0 and 1 or -1) * math.abs(basePrimary) * minFrac
+    end
+    local lateralCap = math.max(math.abs(basePrimary) * 0.22, 0.1)
+    if surgeIntent then
+        lateralCap = lateralCap + math.abs(baseline.fy) * 0.5
+    else
+        lateralCap = lateralCap + math.abs(baseline.fx) * 0.5
+    end
+
+    for _ = 1, maxSteps do
         local w = drive.netWrench(thrusters, out)
-        local primary = math.max(math.abs(w.fx), math.abs(w.fy), 1e-3)
-        if math.abs(w.tz) < 0.06 and math.abs(w.tz) / primary < 0.12 then
+        local primary = math.max(math.abs(primaryOf(w)), 1e-3)
+        if math.abs(w.tz) < targetAbs and math.abs(w.tz) / primary < targetRatio then
             break
         end
-        local bestI, bestScore = nil, 0
+        local bestI, bestScore, bestDelta = nil, 0, 0
         for i, t in ipairs(thrusters) do
             local tz = tonumber(t.tz) or 0
             if math.abs(tz) >= 0.01 then
-                local couple = math.abs(tz) / (0.15 + math.abs(t.fx or 0) + math.abs(t.fy or 0))
-                if couple > bestScore then
-                    bestScore = couple
-                    bestI = i
+                local reversible = t.kind == "motor"
+                local delta = (-w.tz / tz) * 0.55
+                local lo, hi = reversible and -1 or 0, 1
+                local nextDuty = util.clamp((out[i] or 0) + delta, lo, hi)
+                delta = nextDuty - (out[i] or 0)
+                if math.abs(delta) >= 1e-4 then
+                    local trial = {}
+                    for j = 1, #out do
+                        trial[j] = out[j]
+                    end
+                    trial[i] = nextDuty
+                    local tw = drive.netWrench(thrusters, trial)
+                    local trialPrimary = primaryOf(tw)
+                    local accept = true
+                    if math.abs(basePrimary) >= 1e-4 then
+                        if (trialPrimary >= 0) ~= (basePrimary >= 0) and math.abs(trialPrimary) > 1e-4 then
+                            accept = false
+                        elseif math.abs(trialPrimary) + 1e-9 < math.abs(minPrimary) then
+                            local p0 = primaryOf(w)
+                            local dP = trialPrimary - p0
+                            if math.abs(dP) < 1e-9 then
+                                accept = false
+                            else
+                                local need = minPrimary - p0
+                                local scale = util.clamp(need / dP, 0, 1)
+                                if scale < 0.05 then
+                                    accept = false
+                                else
+                                    delta = delta * scale
+                                    trial[i] = util.clamp((out[i] or 0) + delta, lo, hi)
+                                    tw = drive.netWrench(thrusters, trial)
+                                    if math.abs(primaryOf(tw)) + 1e-9 < math.abs(minPrimary) then
+                                        accept = false
+                                    end
+                                end
+                            end
+                        end
+                    end
+                    local lat = surgeIntent and math.abs(tw.fy) or math.abs(tw.fx)
+                    if accept and lat > lateralCap + 0.05 then
+                        accept = false
+                    end
+                    if accept then
+                        local couple = math.abs(tz) / (0.15 + math.abs(t.fx or 0) + math.abs(t.fy or 0))
+                        local twFinal = drive.netWrench(thrusters, trial)
+                        local tzDrop = math.abs(w.tz) - math.abs(twFinal.tz)
+                        local latBleed = surgeIntent and math.abs(twFinal.fy) or math.abs(twFinal.fx)
+                        local primaryKeep = math.abs(primaryOf(twFinal)) / math.max(math.abs(basePrimary), 1e-3)
+                        local score = couple * 0.35 + math.max(0, tzDrop) * 3 - latBleed * 2.5 + primaryKeep * 0.4
+                        if score > bestScore then
+                            bestScore = score
+                            bestI = i
+                            bestDelta = trial[i] - (out[i] or 0)
+                        end
+                    end
                 end
             end
         end
         if not bestI then
             break
         end
+        local prev = out[bestI]
         local t = thrusters[bestI]
-        local tz = tonumber(t.tz) or 0
-        local delta = (-w.tz / tz) * 0.55
         local lo, hi = (t.kind == "motor") and -1 or 0, 1
-        out[bestI] = util.clamp((out[bestI] or 0) + delta, lo, hi)
+        out[bestI] = util.clamp((out[bestI] or 0) + bestDelta, lo, hi)
+        if math.abs(out[bestI] - prev) < 1e-4 then
+            break
+        end
     end
+
+    local beforeScrub = drive.netWrench(thrusters, out)
     for i = 1, #out do
         if math.abs(out[i] or 0) < 0.08 then
             out[i] = 0
         end
+    end
+    local afterScrub = drive.netWrench(thrusters, out)
+    if math.abs(basePrimary) >= 0.1
+        and math.abs(primaryOf(afterScrub)) + 1e-9 < math.abs(minPrimary)
+        and math.abs(primaryOf(beforeScrub)) >= math.abs(minPrimary) * 0.9
+    then
+        for i = 1, #duties do
+            local d = duties[i] or 0
+            if math.abs(out[i] or 0) < 0.08 and math.abs(d) >= 0.08 then
+                local s = (d >= 0) and 1 or -1
+                out[i] = s * math.max(0.08, math.abs(d) * 0.5)
+            end
+        end
+    end
+    return out
+end
+
+--- Boost surge-facing thrusters when pure-W left almost no Fx (weighted by max_force).
+local function ensureSurgeDuties(thrusters, duties, fxCmd, opts)
+    opts = opts or {}
+    local deadband = opts.deadband or 0.08
+    local minFx = opts.minFx or 0.35
+    local out = {}
+    for i, d in ipairs(duties) do
+        out[i] = d or 0
+    end
+    local w = drive.netWrench(thrusters, out)
+    local sign = (fxCmd >= 0) and 1 or -1
+    if (w.fx >= 0) == (fxCmd >= 0) and math.abs(w.fx) >= minFx then
+        return out
+    end
+    local scores = {}
+    local maxScore = 0
+    for i, t in ipairs(thrusters) do
+        local facing = t.facing or t.role or ""
+        local strength = tonumber(t.max_force) or tonumber(t.strength)
+            or math.max(math.abs(t.fx or 0), 0.25)
+        local s = 0
+        if facing == "forward" or facing == "surge" or facing == "main" then
+            s = sign * strength
+        elseif facing == "back" or facing == "aft" or facing == "reverse" then
+            s = -sign * strength
+        elseif math.abs(t.fx or 0) >= 0.05 and math.abs(t.fx or 0) >= math.abs(t.fy or 0) * 0.75 then
+            s = sign * (t.fx or 0)
+        end
+        scores[i] = s
+        maxScore = math.max(maxScore, math.abs(s))
+    end
+    if maxScore < 1e-8 then
+        return out
+    end
+    for i, t in ipairs(thrusters) do
+        if math.abs(scores[i] or 0) >= 1e-8 then
+            local duty = (scores[i] / maxScore) * math.min(1, math.abs(fxCmd))
+            if math.abs(duty) < deadband then
+                duty = 0
+            end
+            local lo = (t.kind == "motor") and -1 or 0
+            duty = util.clamp(duty, lo, 1)
+            local cur = out[i] or 0
+            if not ((duty >= 0) == (cur >= 0) and math.abs(cur) >= math.abs(duty)) then
+                out[i] = duty
+            end
+        end
+    end
+    w = drive.netWrench(thrusters, out)
+    if (w.fx >= 0) ~= (fxCmd >= 0) or math.abs(w.fx) < minFx * 0.5 then
+        for i, t in ipairs(thrusters) do
+            local facing = t.facing or t.role or ""
+            if facing == "forward" or facing == "surge" or facing == "main" then
+                out[i] = (t.kind == "motor") and sign or math.max(0, sign)
+            elseif facing == "back" or facing == "aft" or facing == "reverse" then
+                out[i] = (t.kind == "motor") and -sign or 0
+            end
+        end
+    end
+    return out
+end
+
+local function ensureStrafeDuties(thrusters, duties, fyCmd, opts)
+    opts = opts or {}
+    local deadband = opts.deadband or 0.08
+    local minFy = opts.minFy or 0.2
+    local out = {}
+    for i, d in ipairs(duties) do
+        out[i] = d or 0
+    end
+    local w = drive.netWrench(thrusters, out)
+    local sign = (fyCmd >= 0) and 1 or -1
+    if (w.fy >= 0) == (fyCmd >= 0) and math.abs(w.fy) >= minFy then
+        return out
+    end
+    local scores = {}
+    local maxScore = 0
+    for i, t in ipairs(thrusters) do
+        local facing = t.facing or t.role or ""
+        local strength = tonumber(t.max_force) or tonumber(t.strength)
+            or math.max(math.abs(t.fy or 0), 0.25)
+        local s = 0
+        if facing == "right" or facing == "starboard" or facing == "stbd" then
+            s = sign * strength
+        elseif facing == "left" or facing == "port" then
+            s = -sign * strength
+        elseif math.abs(t.fy or 0) >= 0.02 then
+            s = sign * (t.fy or 0)
+        end
+        scores[i] = s
+        maxScore = math.max(maxScore, math.abs(s))
+    end
+    if maxScore < 1e-8 then
+        return out
+    end
+    for i, t in ipairs(thrusters) do
+        local duty = (scores[i] / maxScore) * math.min(1, math.abs(fyCmd))
+        if math.abs(duty) < deadband then
+            duty = 0
+        end
+        local lo = (t.kind == "motor") and -1 or 0
+        out[i] = util.clamp(duty, lo, 1)
     end
     return out
 end
@@ -848,19 +1057,21 @@ function drive.applyCardinalRoles(control, fx, fy, tz)
         if facing and facing ~= "mixed" then
             anyFacing = true
         end
+        local strength = tonumber(t.max_force) or tonumber(t.strength)
+            or math.max(math.abs(t.fx or 0), math.abs(t.fy or 0), 0.5)
         local surge, strafe = 0, 0
         if facing == "forward" or facing == "surge" or facing == "main" then
-            surge = 1
+            surge = strength
         elseif facing == "back" or facing == "aft" or facing == "reverse" then
-            surge = -1
+            surge = -strength
         end
         if facing == "right" or facing == "starboard" or facing == "stbd" then
-            strafe = 1
+            strafe = strength
         elseif facing == "left" or facing == "port" then
-            strafe = -1
+            strafe = -strength
         end
         local yawAuth = drive.yawAuthority(t, drive.thrusterSide(t))
-        scores[i] = fx * surge + fy * strafe + tz * yawAuth
+        scores[i] = fx * surge + fy * strafe + tz * yawAuth * strength
     end
     if not anyFacing then
         return false
@@ -879,7 +1090,14 @@ function drive.applyCardinalRoles(control, fx, fy, tz)
     local duties = readBackDuties(control, scores, maxAbs, scale)
     if isPureSurge(fx, fy, 0) or isPureStrafe(fx, fy, 0) then
         if control.com_compensate ~= false then
-            duties = drive.nullResidualYaw(thrusters, duties)
+            duties = drive.nullResidualYaw(thrusters, duties, {
+                cmdFx = fx,
+                cmdFy = fy,
+                minPrimaryFraction = 0.55,
+            })
+        end
+        if isPureSurge(fx, fy, 0) then
+            duties = ensureSurgeDuties(thrusters, duties, fx, {})
         end
     end
 
@@ -1079,19 +1297,21 @@ function drive.applyReassembly(control, fx, fy, tz)
     if gain < 1e-6 then
         gain = 1
     end
-    -- Cost weights (sqrt applied below). Autopilot path — teleop uses applyTeleop.
+    -- Cost weights (sqrt applied below). Surge-first so yaw-null does not kill Fx.
     local axW = { 1.0, 1.0, 1.0 }
     local dutyDeadband = 0.08
-    if math.abs(fy) >= 0.5 and math.abs(fx) + math.abs(tz) < 0.25 then
-        -- Strafe: kill CoM yaw couple
-        axW = { 2.8, 1.0, 6.0 }
+    local absFx, absFy, absTz = math.abs(fx), math.abs(fy), math.abs(tz)
+    local pureSurge = absFx >= 0.5 and absFy + absTz < 0.25
+    local pureStrafe = absFy >= 0.5 and absFx + absTz < 0.25
+    local surgePriority = absFx >= 0.5 and absFx >= absFy and absTz < 0.85
+    local strafePriority = absFy >= 0.5 and absFy >= absFx and absTz < 0.85
+    if pureStrafe or (strafePriority and not surgePriority) then
+        axW = { 2.2, 3.0, 2.5 }
         dutyDeadband = 0.10
-    elseif math.abs(fx) >= 0.5 and math.abs(fy) + math.abs(tz) < 0.25 then
-        -- Surge: null yaw hard so path-follow doesn't spin
-        axW = { 1.0, 2.2, 5.0 }
+    elseif pureSurge or surgePriority then
+        axW = { 4.0, 1.5, 0.9 }
         dutyDeadband = 0.10
-    elseif math.abs(tz) >= 0.5 and math.abs(fx) + math.abs(fy) < 0.25 then
-        -- Yaw: allow translation residual (near-CoM thrusters always couple)
+    elseif absTz >= 0.5 and absFx + absFy < 0.25 then
         axW = { 0.8, 0.8, 1.0 }
         dutyDeadband = 0.06
     end
@@ -1152,9 +1372,17 @@ function drive.applyReassembly(control, fx, fy, tz)
         return drive.applyWrench(control, fx, fy, tz)
     end
     if maxAbs > 1 then
-        local u2, m2 = dutiesFor(1.0 / maxAbs)
-        if u2 then
-            u, maxAbs = u2, m2
+        if surgePriority or strafePriority then
+            -- Clamp instead of rescaling target — keep surge/strafe when saturated.
+            for i, t in ipairs(thrusters) do
+                local lo = (t.kind == "motor") and -1 or 0
+                u[i] = util.clamp(u[i] or 0, lo, 1)
+            end
+        else
+            local u2, m2 = dutiesFor(1.0 / maxAbs)
+            if u2 then
+                u, maxAbs = u2, m2
+            end
         end
     end
 
@@ -1176,9 +1404,22 @@ function drive.applyReassembly(control, fx, fy, tz)
         return false
     end
 
-    -- CoM couple polish on pure surge/strafe
+    if pureSurge or (surgePriority and absTz < 0.35) then
+        duties = ensureSurgeDuties(thrusters, duties, fx, { deadband = dutyDeadband })
+    elseif pureStrafe or (strafePriority and absTz < 0.35) then
+        duties = ensureStrafeDuties(thrusters, duties, fy, { deadband = dutyDeadband })
+    end
+
+    -- CoM couple polish on pure surge/strafe (protect primary force)
     if control.com_compensate ~= false and (isPureSurge(fx, fy, 0) or isPureStrafe(fx, fy, 0)) then
-        duties = drive.nullResidualYaw(thrusters, duties)
+        duties = drive.nullResidualYaw(thrusters, duties, {
+            cmdFx = fx,
+            cmdFy = fy,
+            minPrimaryFraction = 0.55,
+        })
+        if isPureSurge(fx, fy, 0) then
+            duties = ensureSurgeDuties(thrusters, duties, fx, { deadband = dutyDeadband })
+        end
     end
 
     applyDutiesToActuators(control, duties)
@@ -1387,12 +1628,12 @@ function drive.applyTeleop(control, fx, fy, tz)
     local pureStrafe = isPureStrafe(fx, fy, tz)
 
     if pureSurge then
-        -- Forward/back only: use calibrated fx. If calib is all-strafe, push every motor equally
-        -- (symmetric boat → net surge, not a forced differential turn).
+        -- Forward/back only: use calibrated fx. If calib is all-strafe, push weighted by max_force.
         local useEqual = maxFx < math.max(0.04, maxFy * 0.35, maxTz * 0.35)
         for i, t in ipairs(thrusters) do
             if useEqual then
-                scores[i] = fx
+                local strength = tonumber(t.max_force) or tonumber(t.strength) or 1
+                scores[i] = fx * strength
             else
                 scores[i] = fx * (t.fx or 0)
             end
@@ -1457,7 +1698,14 @@ function drive.applyTeleop(control, fx, fy, tz)
     local scale = math.min(1, cmdMag)
     local duties = readBackDuties(control, scores, maxAbs, scale)
     if control.com_compensate ~= false and (pureSurge or pureStrafe) then
-        duties = drive.nullResidualYaw(thrusters, duties)
+        duties = drive.nullResidualYaw(thrusters, duties, {
+            cmdFx = fx,
+            cmdFy = fy,
+            minPrimaryFraction = 0.55,
+        })
+        if pureSurge then
+            duties = ensureSurgeDuties(thrusters, duties, fx, {})
+        end
     end
     applyDutiesToActuators(control, duties)
 

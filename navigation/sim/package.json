@@ -4,7 +4,7 @@
   "type": "module",
   "description": "Boat thruster allocation + 3D physics sim (ports CC drive.applyReassembly / applyTeleop)",
   "scripts": {
-    "test": "node --test allocation.test.mjs physics.test.mjs com_bugs.test.mjs",
+    "test": "node --test allocation.test.mjs physics.test.mjs com_bugs.test.mjs asymmetric.test.mjs",
     "sim": "echo 'Open index.html in a browser (file:// or npx serve .) — see README.md'"
   },
   "engines": {

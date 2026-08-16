@@ -23,6 +23,15 @@ Physics is a **boat on water**: multi-point buoyancy, gravity at offset CoM, hul
 
 Offset-CoM fixtures: `cardinal_5_com_stbd`, `cardinal_5_com_port`, `cardinal_5_com_aft`.
 
+Asymmetric / weird layouts (forward surge + bounded yaw/lateral):
+- `asymmetric_cardinal` — strong port / weak stbd, fwd off-centerline, CoM offset
+- `weird_positions` — diagonal / unequal lever arms (not a neat rectangle)
+- `missing_mirrored_faces` — 1 forward + uneven L/R + one back
+- `offcenter_mass_asym` — off-center CoM + asymmetric thrust
+- `seeded_weird_42` / `seeded_weird_99` — deterministic adversarial layouts
+
+**Surge priority:** pure W clamps saturated LS (does not rescale target to zero yaw), then duty-space `nullResidualYaw` never drives Fx below ~55% of baseline. Teleop/cardinal weight unequal `max_force`.
+
 ## Open the sim
 
 ```bash
