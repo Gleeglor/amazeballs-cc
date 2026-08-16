@@ -490,6 +490,30 @@ function test_teleop_yaw_sign() {
   console.log("  test_teleop_yaw_sign OK");
 }
 
+function test_teleop_fallback_when_mix_zero() {
+  // When mix returns all zeros but surge commanded, fallback drives all motors
+  function fallbackDuties(names, surge, yaw) {
+    const byName = {};
+    if (Math.abs(surge) > 0.1) {
+      for (const n of names) byName[n] = surge;
+    } else if (Math.abs(yaw) > 0.1) {
+      const sorted = [...names].sort();
+      const mid = Math.ceil(sorted.length / 2);
+      sorted.forEach((n, i) => {
+        byName[n] = i < mid ? yaw : -yaw;
+      });
+    }
+    return byName;
+  }
+  const fb = fallbackDuties(["a", "b"], 1, 0);
+  assert.equal(fb.a, 1);
+  assert.equal(fb.b, 1);
+  const yawFb = fallbackDuties(["a", "b"], 0, 1);
+  assert.equal(yawFb.a, 1);
+  assert.equal(yawFb.b, -1);
+  console.log("  test_teleop_fallback_when_mix_zero OK");
+}
+
 // --- pose quaternion (Advanced Math: .v + .a, :toEuler) ---
 function quatComponents(q) {
   if (q == null) return [0, 0, 0, 1];
@@ -641,6 +665,7 @@ test_teleop_missed_keyup();
 test_teleop_hold_survives_os_delay();
 test_teleop_repeat_keepalive();
 test_teleop_yaw_sign();
+test_teleop_fallback_when_mix_zero();
 test_pose_quat();
 test_motors_write();
 test_sleep_does_not_eat_keys();

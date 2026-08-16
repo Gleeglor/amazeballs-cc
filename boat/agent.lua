@@ -186,9 +186,51 @@ local function agentLoop(ws)
     ui.setMode("agent")
     send(ws, { type = "hello", role = "boat", version = 1 })
     local heartbeat = os.startTimer(2)
+    local teleopSession = nil
     while true do
         local e, a, b = os.pullEvent()
-        if e == "timer" and a == heartbeat then
+        -- Teleop is non-blocking: handle its keys/timer first, keep WS alive.
+        if teleopSession then
+            if e == "timer" and a == heartbeat then
+                send(ws, {
+                    type = "heartbeat",
+                    t = util.now(),
+                    pose = getPoseSnapshot(),
+                    mode = "teleop",
+                    held = ui.status,
+                })
+                heartbeat = os.startTimer(2)
+            elseif e == "websocket_message" then
+                local raw = b or a
+                if type(raw) == "string" then
+                    local ok, msg = pcall(textutils.unserialiseJSON, raw)
+                    if ok and type(msg) == "table" then
+                        if msg.type == "rpc" or msg.method then
+                            -- stop/panic must work during teleop
+                            if msg.method == "stop" then
+                                teleop.stop(teleopSession)
+                                teleopSession = nil
+                            end
+                            local ok2, err = pcall(handleRpc, ws, msg)
+                            if not ok2 then
+                                reply(ws, msg.id, false, nil, tostring(err))
+                            end
+                        end
+                    end
+                end
+            elseif e == "websocket_closed" then
+                teleop.stop(teleopSession)
+                teleopSession = nil
+                return "closed"
+            else
+                local action = teleop.onEvent(teleopSession, e, a, b)
+                if action == "quit" then
+                    teleop.stop(teleopSession)
+                    teleopSession = nil
+                    ui.setMode("agent")
+                end
+            end
+        elseif e == "timer" and a == heartbeat then
             send(ws, { type = "heartbeat", t = util.now(), pose = getPoseSnapshot() })
             heartbeat = os.startTimer(2)
             local craft = pose.get()
@@ -216,24 +258,31 @@ local function agentLoop(ws)
             end
         elseif e == "websocket_closed" then
             return "closed"
-        elseif e == "key" and a == keys.x then
-            motors.panic(3)
+        elseif e == "key" and a == keys.x and not b then
+            motors.panicNow()
+            motors.flush(64)
         elseif e == "key" and a == keys.t and not b then
-            -- local teleop interrupt
-            pcall(teleop.run)
-            ui.setMode("agent")
+            local session, err = teleop.begin()
+            if session then
+                teleopSession = session
+            else
+                ui.setStatus(tostring(err or "teleop failed"))
+                print(tostring(err))
+            end
         elseif e == "key" and a == keys.c and not b then
             pcall(function()
                 calibrate.run({})
             end)
-            motors.panic(3)
+            motors.panicNow()
+            motors.flush(64)
         end
     end
 end
 
 local function main()
     print("Boat agent starting...")
-    motors.panic(5)
+    motors.panicNow()
+    motors.flush(64)
     ui.setMode("agent")
     while true do
         local url = resolveWsUrl()
@@ -252,11 +301,13 @@ local function main()
                     pcall(function()
                         calibrate.run({})
                     end)
-                    motors.panic(3)
+                    motors.panicNow()
+                    motors.flush(64)
                 elseif e == "key" and a == keys.t and not b then
                     pcall(teleop.run)
-                elseif e == "key" and a == keys.x then
-                    motors.panic(3)
+                elseif e == "key" and a == keys.x and not b then
+                    motors.panicNow()
+                    motors.flush(64)
                 end
             end
         else
@@ -271,7 +322,8 @@ local function main()
                 if not ws then
                     print("WS fail: " .. tostring(err))
                     ui.setWs("fail")
-                    motors.panic(3)
+                    motors.panicNow()
+                    motors.flush(64)
                     sleep(2)
                 else
                     print("WS connected")
@@ -279,7 +331,8 @@ local function main()
                     pcall(function()
                         ws.close()
                     end)
-                    motors.panic(5)
+                    motors.panicNow()
+                    motors.flush(64)
                     ui.setWs("down")
                     print("WS ended: " .. tostring(reason or ok))
                     sleep(2)
